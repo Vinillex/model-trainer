@@ -45,12 +45,17 @@ class SerpApiClient:
     def __init__(self, api_key: str, url: str | None = None, http: httpx.Client | None = None):
         self.api_key = api_key
         self.url = url or settings.serpapi_url
-        self.http = http or httpx.Client(timeout=30)
+        # SerpAPI can take over a minute on a slow search (one real search took 82s) and still charges for it,
+        # so a short client timeout turns a paid search into a failed job.
+        self.http = http or httpx.Client(timeout=httpx.Timeout(180, connect=10))
 
     def search(self, query: str, page: int) -> list[SearchResult]:
         params = {"engine": "google_images", "q": query, "ijn": page, "api_key": self.api_key}
         try:
             resp = self.http.get(self.url, params=params)
+        except httpx.TimeoutException:
+            raise SearchError("SerpAPI timed out. The search may still have been counted; repeating the identical "
+                              "search within an hour is served from SerpAPI's cache at no cost") from None
         except httpx.HTTPError as e:
             # Don't chain or print `e`: some httpx errors embed the full URL, including the key.
             raise SearchError(f"SerpAPI request failed ({type(e).__name__})") from None

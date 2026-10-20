@@ -60,6 +60,19 @@ def test_serpapi_errors_never_leak_the_key():
         serp(lambda r: httpx.Response(500, text="<html>oops</html>")).search("q", 0)
 
 
+def test_serpapi_timeout_says_the_search_may_have_been_charged():
+    def slow(request):
+        raise httpx.ReadTimeout(f"timed out reading {request.url}")  # embeds the URL with the key
+
+    with pytest.raises(SearchError, match="may still have been counted") as e:
+        serp(slow).search("q", 0)
+    assert SECRET not in str(e.value) and SECRET not in repr(e.value.__cause__)
+
+
+def test_serpapi_default_client_waits_long_enough_for_slow_searches():
+    assert SerpApiClient(SECRET).http.timeout.read >= 120
+
+
 # ---------- image download / SSRF guard ----------
 
 def fetcher(handler) -> httpx.Client:
