@@ -2,14 +2,21 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
-import { SOURCES, api, imageUrl, type DetClass, type ImageRow, type Source } from "@/lib/api";
+import { SOURCES, api, imageUrl, type DetClass, type ImageRow, type ReviewStatus, type Source } from "@/lib/api";
 
 const PAGE = 48;
 const STATUS_STYLE = { pending: "text-amber-500", reviewed: "text-green-500", rejected: "text-red-500" } as const;
+// "pending" is shown as "not reviewed": it means nobody has looked at the image yet.
+const REVIEW_FILTERS: { value: ReviewStatus; label: string }[] = [
+  { value: "reviewed", label: "Reviewed" },
+  { value: "pending", label: "Not reviewed" },
+  { value: "rejected", label: "Rejected" },
+];
 
 export default function Gallery({ projectId, classes, refreshKey, onChanged }: { projectId: number; classes: DetClass[]; refreshKey: number; onChanged: () => void }) {
   const [classId, setClassId] = useState<number | undefined>();
   const [source, setSource] = useState<Source | undefined>();
+  const [reviewStatus, setReviewStatus] = useState<ReviewStatus | undefined>();
   const [images, setImages] = useState<ImageRow[]>([]);
   const [more, setMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -19,7 +26,7 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
   const load = useCallback(
     async (offset: number) => {
       try {
-        const rows = await api.listImages(projectId, { classId, source, limit: PAGE, offset });
+        const rows = await api.listImages(projectId, { classId, source, reviewStatus, limit: PAGE, offset });
         setImages((prev) => (offset === 0 ? rows : [...prev, ...rows]));
         setMore(rows.length === PAGE);
         setError(null);
@@ -27,7 +34,7 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
         setError((e as Error).message);
       }
     },
-    [projectId, classId, source],
+    [projectId, classId, source, reviewStatus],
   );
   useEffect(() => {
     load(0);
@@ -63,6 +70,19 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
             </option>
           ))}
         </select>
+        <select
+          className="input"
+          value={reviewStatus ?? ""}
+          onChange={(e) => setReviewStatus((e.target.value || undefined) as ReviewStatus | undefined)}
+          aria-label="Review status"
+        >
+          <option value="">Reviewed or not</option>
+          {REVIEW_FILTERS.map((f) => (
+            <option key={f.value} value={f.value}>
+              {f.label}
+            </option>
+          ))}
+        </select>
       </div>
       {error && <p className="text-sm text-red-600">{error}</p>}
       {images.length === 0 && !error && <p className="text-sm text-neutral-500">No images match.</p>}
@@ -77,7 +97,7 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
               <span>
                 {className(img.class_id)} · {img.source}
               </span>
-              <span className={STATUS_STYLE[img.review_status]}>{img.review_status}</span>
+              <span className={STATUS_STYLE[img.review_status]}>{img.review_status === "pending" ? "not reviewed" : img.review_status}</span>
             </figcaption>
             {/* Sibling of the link, so clicking it never navigates. Stays visible while confirming. */}
             <div className={`absolute right-1 top-1 gap-1 ${confirming === img.id ? "flex" : "hidden group-hover:flex"}`}>
