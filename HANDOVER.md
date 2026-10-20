@@ -87,7 +87,7 @@ export is Linux-only. If this machine is already native Linux, ignore the WSL no
 5. **Run the tests first.** `python -m pytest -q` from `backend/` should say **119 passed**. If not, stop and tell Vinit.
    (The tests are isolated from real data by `tests/conftest.py`; see gotchas.)
 6. **Restore the data.** From `backend/`: `python -m scripts.bundle import`. It needs an **empty** database and prints
-   counts only. Expect: project `drone-detector` with 13 classes, 52 images, 8 boxes, 57 remembered scrape URLs.
+   counts only. Expect: project `drone-detector` with 13 classes, 52 images (6 reviewed), 8 box rows, 57 remembered scrape URLs.
 7. **Start the app and look at it.**
    ```
    cd backend && uvicorn app.main:app --port 8000          # no --reload; restart after code changes
@@ -194,7 +194,8 @@ the current schema doesn't know are skipped and counted. To refresh: `python -m 
 - Project 1 `drone-detector`, 13 classes: positives `multirotor`, `fixed-wing`, `shahed`, `vtol`, `quad-copter`,
   `flying-wing`; hard negatives `birds`, `aircraft`, `helicopters`, `balloons`, `empty-sky`, `drones-in-fog`, `smoke`.
 - **52 images, all in `multirotor`**: 2 uploaded + 50 scraped (one real SerpAPI search, "DJI Quadcopter", 50 of 100
-  results kept). **Only 6 are reviewed (8 boxes); 46 are pending.** No other class has any image.
+  results kept). **Only 6 are reviewed, carrying 6 boxes.** 46 are pending; 2 of those already have a box drawn but were never marked
+  reviewed, so a dataset version would leave them out until they are. (The database holds 8 box rows in total.) No other class has any image.
 - **There are 0 dataset versions and nothing is trainable yet.** A run needs a version with validation images and boxes;
   six boxed images of one class won't do. Don't create a dataset version from them.
 - Many scraped images are product shots (white background, packaging). Expect to reject a good share.
