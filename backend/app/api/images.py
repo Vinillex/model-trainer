@@ -10,8 +10,8 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
-from ..models import DetClass, Image, Source
-from ..schemas import ImageOut, UploadResult
+from ..models import DetClass, Image, ReviewStatus, Source
+from ..schemas import ImageDetail, ImageOut, UploadResult
 from ..storage import get_storage
 from .projects import get_project
 
@@ -45,7 +45,8 @@ def ingest_image(db: Session, project_id: int, cls: DetClass, source: Source, da
     key = f"projects/{project_id}/raw/{cls.name}/{source.value}/{sha}.{EXT_BY_FORMAT[fmt]}"
     get_storage().put(key, data)
     image = Image(project_id=project_id, class_id=cls.id, source=source, storage_key=key, sha256=sha,
-                  width=width, height=height, group_key=group_key)
+                  width=width, height=height, group_key=group_key,
+                  review_status=ReviewStatus.reviewed if cls.is_negative else ReviewStatus.pending)
     db.add(image)
     db.flush()
     return image
@@ -77,14 +78,24 @@ def upload_images(project_id: int, class_id: int, files: list[UploadFile] = File
 
 @router.get("/projects/{project_id}/images", response_model=list[ImageOut])
 def list_images(project_id: int, class_id: int | None = None, source: Source | None = None,
-                limit: int = Query(50, le=500), offset: int = 0, db: Session = Depends(get_db)):
+                review_status: ReviewStatus | None = None, limit: int = Query(50, le=500), offset: int = 0, db: Session = Depends(get_db)):
     get_project(db, project_id)
     q = select(Image).where(Image.project_id == project_id)
     if class_id is not None:
         q = q.where(Image.class_id == class_id)
     if source is not None:
         q = q.where(Image.source == source)
+    if review_status is not None:
+        q = q.where(Image.review_status == review_status)
     return db.scalars(q.order_by(Image.id.desc()).limit(limit).offset(offset)).all()
+
+
+@router.get("/images/{image_id}", response_model=ImageDetail)
+def read_image(image_id: int, db: Session = Depends(get_db)):
+    image = db.get(Image, image_id)
+    if image is None:
+        raise HTTPException(404, "image not found")
+    return image
 
 
 @router.get("/images/{image_id}/file")

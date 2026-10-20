@@ -1,11 +1,14 @@
+import re
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import DetClass, Image, Project
-from ..schemas import ClassCreate, ClassOut, ProjectCreate, ProjectOut, StatRow
+from ..models import DetClass, Image, Project, ReviewStatus
+from ..schemas import (NAME_PATTERN, BulkClassCreate, BulkClassResult, ClassCreate, ClassOut, ProjectCreate,
+                       ProjectOut, StatRow)
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -25,6 +28,10 @@ def add_class(db: Session, project: Project, name: str, is_negative: bool) -> De
     db.add(cls)
     db.flush()
     return cls
+
+
+def normalize_class_name(raw: str) -> str:
+    return re.sub(r"\s+", "-", raw.strip().lower())
 
 
 def get_project(db: Session, project_id: int) -> Project:
@@ -75,6 +82,30 @@ def create_class(project_id: int, body: ClassCreate, db: Session = Depends(get_d
     return cls
 
 
+@router.post("/{project_id}/classes/bulk", response_model=BulkClassResult)
+def create_classes_bulk(project_id: int, body: BulkClassCreate, db: Session = Depends(get_db)):
+    """Add many classes at once. Names that already exist (in either category) are skipped, not changed."""
+    project = get_project(db, project_id)
+    existing = {c.name for c in project.classes}
+    result = BulkClassResult(added=[], skipped=[], invalid=[])
+    seen: set[str] = set()
+    for raw in body.names:
+        name = normalize_class_name(raw)
+        if not name:
+            continue  # blank entries from trailing commas / empty lines
+        if name in seen:
+            continue
+        seen.add(name)
+        if len(name) > 64 or not re.match(NAME_PATTERN, name):
+            result.invalid.append(raw.strip())
+        elif name in existing:
+            result.skipped.append(name)
+        else:
+            result.added.append(ClassOut.model_validate(add_class(db, project, name, body.is_negative)))
+    db.commit()
+    return result
+
+
 @router.get("/{project_id}/stats", response_model=list[StatRow])
 def project_stats(project_id: int, db: Session = Depends(get_db)):
     project = get_project(db, project_id)
@@ -88,4 +119,11 @@ def project_stats(project_id: int, db: Session = Depends(get_db)):
     )
     for class_id, source, n in counts:
         setattr(rows[class_id], source.value, n)
+    by_review = db.execute(
+        select(Image.class_id, Image.review_status, func.count())
+        .where(Image.project_id == project_id, Image.review_status != ReviewStatus.reviewed)
+        .group_by(Image.class_id, Image.review_status)
+    )
+    for class_id, status, n in by_review:
+        setattr(rows[class_id], status.value, n)
     return list(rows.values())

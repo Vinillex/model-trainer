@@ -24,6 +24,12 @@ class AnnotationStatus(str, enum.Enum):
     rejected = "rejected"
 
 
+class ReviewStatus(str, enum.Enum):
+    pending = "pending"
+    reviewed = "reviewed"
+    rejected = "rejected"  # image unusable; excluded from dataset exports
+
+
 class Project(Base):
     __tablename__ = "projects"
 
@@ -65,6 +71,10 @@ class Image(Base):
     sha256: Mapped[str] = mapped_column(String(64))
     width: Mapped[int] = mapped_column(Integer)
     height: Mapped[int] = mapped_column(Integer)
+    # Negative-category images need no boxes, so they start out reviewed.
+    review_status: Mapped[ReviewStatus] = mapped_column(
+        Enum(ReviewStatus), default=ReviewStatus.pending, server_default=ReviewStatus.pending.name, index=True
+    )
     # Images from the same video/scene share a group so splits don't leak near-duplicates.
     group_key: Mapped[str | None] = mapped_column(String(200), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
