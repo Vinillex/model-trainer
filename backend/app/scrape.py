@@ -180,14 +180,15 @@ def run_scrape(db: Session, job: Job, search: Callable[[str, int], list[SearchRe
         publish()
 
         chunk_size = settings.scrape_download_workers * 2
-        with ThreadPoolExecutor(settings.scrape_download_workers) as pool:
+        pool = ThreadPoolExecutor(settings.scrape_download_workers)
+        try:
             for i in range(0, len(todo), chunk_size):
                 if counters["added"] >= max_images or cancelled():
                     break
                 chunk = todo[i:i + chunk_size]
                 futures = [pool.submit(fetch, r.original) for r in chunk]  # download in parallel, ingest in order
                 for r, future in zip(chunk, futures):
-                    if counters["added"] >= max_images:
+                    if counters["added"] >= max_images or cancelled():  # checked per image so Cancel takes effect promptly
                         break
                     try:
                         data = future.result()
@@ -213,6 +214,9 @@ def run_scrape(db: Session, job: Job, search: Callable[[str, int], list[SearchRe
                             hashes.append(int(image.hash.dhash, 16))
                             counters["added"] += 1
                     publish()
+        finally:
+            # Don't wait for downloads we no longer want (stop, cancel, or reached max_images).
+            pool.shutdown(wait=False, cancel_futures=True)
     publish()  # flush counters changed after the last in-loop publish (e.g. the empty page that ended the search)
 
 

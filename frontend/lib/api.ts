@@ -73,6 +73,31 @@ export interface StatRow {
   rejected: number;
 }
 
+export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+export interface ScrapeParams {
+  class_id: number;
+  query: string;
+  max_images: number;
+  max_pages: number;
+  min_side: number;
+  near_dup_distance: number;
+}
+
+export interface Job {
+  id: number;
+  project_id: number;
+  type: string;
+  status: JobStatus;
+  params: Partial<ScrapeParams>;
+  progress: Partial<Record<string, number>>;
+  error: string | null;
+  cancel_requested: boolean;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(API + path, init);
   if (!res.ok) {
@@ -115,5 +140,9 @@ export const api = {
   getImage: (id: number) => req<ImageDetail>(`/images/${id}`),
   putAnnotations: (id: number, boxes: BoxIn[], reviewStatus?: ReviewStatus) =>
     req<ImageDetail>(`/images/${id}/annotations`, json("PUT", { boxes, review_status: reviewStatus ?? null })),
+  createScrapeJob: (projectId: number, p: Partial<ScrapeParams> & Pick<ScrapeParams, "class_id" | "query">) =>
+    req<Job>(`/projects/${projectId}/jobs/scrape`, json("POST", p)),
+  listJobs: (projectId: number) => req<Job[]>(`/projects/${projectId}/jobs?limit=10`),
+  cancelJob: (id: number) => req<Job>(`/jobs/${id}/cancel`, { method: "POST" }),
   deleteImage: (id: number) => req<void>(`/images/${id}`, { method: "DELETE" }),
 };

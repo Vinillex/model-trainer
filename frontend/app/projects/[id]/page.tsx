@@ -5,6 +5,7 @@ import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import Gallery from "@/components/Gallery";
 import ClassForm from "@/components/ClassForm";
+import ScrapePanel from "@/components/ScrapePanel";
 import StatsTable from "@/components/StatsTable";
 import UploadBox from "@/components/UploadBox";
 import { api, type Project, type StatRow } from "@/lib/api";
@@ -15,6 +16,8 @@ export default function ProjectPage() {
   const [stats, setStats] = useState<StatRow[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
+
+  const bumpRefresh = useCallback(() => setRefreshKey((k) => k + 1), []);
 
   const loadProject = useCallback(() => {
     api.getProject(projectId).then(setProject).catch((e) => setError(e.message));
@@ -48,6 +51,11 @@ export default function ProjectPage() {
       <section className="space-y-3">
         <h2 className="text-lg font-medium">Upload images</h2>
         <UploadBox projectId={projectId} classes={project.classes} onDone={() => setRefreshKey((k) => k + 1)} />
+      </section>
+
+      <section className="space-y-3">
+        <h2 className="text-lg font-medium">Scrape images</h2>
+        <ScrapePanel projectId={projectId} classes={project.classes} onImagesChanged={bumpRefresh} />
       </section>
 
       <section className="space-y-3">

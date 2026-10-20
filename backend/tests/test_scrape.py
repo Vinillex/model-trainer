@@ -264,6 +264,25 @@ def test_run_scrape_honours_cancel(client, project):
         assert db.get(Job, job_id).progress["added"] == 0  # stopped before downloading anything
 
 
+def test_run_scrape_cancel_takes_effect_between_images_not_batches(client, project):
+    pid, ids = project
+    job_id = make_job(client, pid, ids["multirotor"], max_images=50)
+    urls = [f"https://h{i}.test/x.jpg" for i in range(12)]  # all in one download batch
+    downloads = {u: photo(200 + i) for i, u in enumerate(urls)}
+
+    def fetch(url):
+        with client.session_factory() as other:  # the user presses Cancel as soon as downloading starts
+            other.get(Job, job_id).cancel_requested = True
+            other.commit()
+        return downloads[url]
+
+    with client.session_factory() as db:
+        run_scrape(db, db.get(Job, job_id), lambda q, p: [sr(u) for u in urls] if p == 0 else [], fetch)
+    with client.session_factory() as db:
+        added = db.get(Job, job_id).progress["added"]
+    assert added <= 1, f"{added} of 12 images were ingested after Cancel"
+
+
 def test_deleting_a_scraped_image_removes_its_hash_and_record(client, project):
     pid, ids = project
     job_id = make_job(client, pid, ids["multirotor"])
