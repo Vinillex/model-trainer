@@ -1,3 +1,11 @@
+import os
+import tempfile
+
+# Tests must never touch the real database, storage or API keys from backend/.env, even if one starts the app's
+# lifespan (which creates tables, fails "running" jobs and starts the background worker). Set before `app` is imported.
+os.environ.update(MT_DATABASE_URL="sqlite://", MT_LOCAL_STORAGE_DIR=tempfile.mkdtemp(prefix="mt-test-storage-"), MT_RUN_WORKER="false",
+                  MT_SERPAPI_KEY="", MT_RUNPOD_API_KEY="", MT_WORKER_TOKEN="")
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine

@@ -1,0 +1,2 @@
+# Install inside WSL2 Ubuntu (a venv is recommended). The CUDA build of torch comes with the default Linux wheel.
+ultralytics
