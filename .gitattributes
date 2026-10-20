@@ -1,0 +1,11 @@
+# Keep LF line endings on every OS (Windows git would otherwise convert and break shell scripts and checksums),
+# and never touch image bytes: handover-data/ is verified against SHA-256 checksums on import.
+* text=auto eol=lf
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.webp binary
+*.gif binary
+*.pt binary
+*.zip binary
+*.rpk binary
