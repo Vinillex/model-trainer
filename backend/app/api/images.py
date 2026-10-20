@@ -1,5 +1,6 @@
 import hashlib
 import io
+from collections.abc import Callable
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
@@ -10,7 +11,8 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
-from ..models import DetClass, Image, ReviewStatus, Source
+from .. import imagehash
+from ..models import DetClass, Image, ImageHash, ReviewStatus, Source
 from ..schemas import ImageDetail, ImageOut, UploadResult
 from ..storage import get_storage
 from .projects import get_project
@@ -20,33 +22,45 @@ router = APIRouter(tags=["images"])
 EXT_BY_FORMAT = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp"}
 
 
-def ingest_image(db: Session, project_id: int, cls: DetClass, source: Source, data: bytes,
-                 group_key: str | None = None) -> Image | None:
-    """Validate and store one image. Returns None if it duplicates an existing one.
+class NearDuplicate(ValueError):
+    """The image is a re-encoded/resized copy of one the caller already has."""
 
-    Raises ValueError for undecodable, unsupported or too-small images.
+
+def ingest_image(db: Session, project_id: int, cls: DetClass, source: Source, data: bytes,
+                 group_key: str | None = None, min_side: int | None = None,
+                 is_near_duplicate: Callable[[int], bool] | None = None) -> Image | None:
+    """Validate and store one image. Returns None if its bytes duplicate an existing image.
+
+    Raises ValueError for undecodable, unsupported or too-small images, and NearDuplicate if
+    `is_near_duplicate(dhash)` says so. Only the caller knows whether near-duplicates matter
+    (scraping: yes; a deliberate upload: no).
     """
+    min_side = settings.min_image_side if min_side is None else min_side
     try:
         with PILImage.open(io.BytesIO(data)) as im:
             im.verify()
         with PILImage.open(io.BytesIO(data)) as im:
             fmt, (width, height) = im.format, im.size
+        dhash = imagehash.dhash(data)
     except (UnidentifiedImageError, OSError) as e:
         raise ValueError("not a decodable image") from e
     if fmt not in EXT_BY_FORMAT:
         raise ValueError(f"unsupported format {fmt}")
-    if min(width, height) < settings.min_image_side:
-        raise ValueError(f"image smaller than {settings.min_image_side}px")
+    if min(width, height) < min_side:
+        raise ValueError(f"image smaller than {min_side}px")
 
     sha = hashlib.sha256(data).hexdigest()
     if db.scalar(select(Image.id).where(Image.project_id == project_id, Image.sha256 == sha)):
         return None
+    if is_near_duplicate is not None and is_near_duplicate(dhash):
+        raise NearDuplicate("near-duplicate of an existing image")
 
     key = f"projects/{project_id}/raw/{cls.name}/{source.value}/{sha}.{EXT_BY_FORMAT[fmt]}"
     get_storage().put(key, data)
     image = Image(project_id=project_id, class_id=cls.id, source=source, storage_key=key, sha256=sha,
                   width=width, height=height, group_key=group_key,
-                  review_status=ReviewStatus.reviewed if cls.is_negative else ReviewStatus.pending)
+                  review_status=ReviewStatus.reviewed if cls.is_negative else ReviewStatus.pending,
+                  hash=ImageHash(dhash=imagehash.to_hex(dhash)))
     db.add(image)
     db.flush()
     return image

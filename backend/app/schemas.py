@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import AnnotationStatus, ReviewStatus, Source
+from .models import AnnotationStatus, JobStatus, ReviewStatus, Source
 
 NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
 
@@ -109,3 +109,29 @@ class AnnotationsPut(BaseModel):
 
 class ImageDetail(ImageOut):
     annotations: list[AnnotationOut]
+
+
+class ScrapeJobCreate(BaseModel):
+    class_id: int  # images are filed under this class (a hard-negative category is fine, e.g. birds)
+    query: str = Field(min_length=1, max_length=300)
+    max_images: int = Field(50, ge=1, le=500)
+    # Each page is one SerpAPI search (~100 results). This caps how many searches a job can spend.
+    max_pages: int = Field(3, ge=1, le=20)
+    min_side: int = Field(200, ge=32, le=4000)  # skip images whose shorter side is smaller, in pixels
+    near_dup_distance: int = Field(4, ge=0, le=16)  # dHash bits; 0 keeps near-duplicates
+
+
+class JobOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    project_id: int
+    type: str
+    status: JobStatus
+    params: dict
+    progress: dict
+    error: str | None
+    cancel_requested: bool
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None

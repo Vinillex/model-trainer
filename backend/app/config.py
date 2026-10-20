@@ -17,5 +17,17 @@ class Settings(BaseSettings):
 
     min_image_side: int = 32
 
+    # Background jobs run on a worker thread inside the API process.
+    run_worker: bool = True
+    worker_poll_seconds: float = 1.0
+
+    # Scraping (SerpAPI Google Images). Set MT_SERPAPI_KEY in backend/.env.
+    serpapi_key: str | None = None
+    serpapi_url: str = "https://serpapi.com/search"
+    scrape_max_bytes: int = 15 * 1024 * 1024
+    scrape_download_workers: int = 8
+    # Dev/test only: allow fetching images from loopback/private addresses (normally blocked as SSRF).
+    scrape_allow_private_hosts: bool = False
+
 
 settings = Settings()
