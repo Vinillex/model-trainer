@@ -76,7 +76,7 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
           onChange={(e) => setReviewStatus((e.target.value || undefined) as ReviewStatus | undefined)}
           aria-label="Review status"
         >
-          <option value="">Reviewed or not</option>
+          <option value="">All images</option>
           {REVIEW_FILTERS.map((f) => (
             <option key={f.value} value={f.value}>
               {f.label}
