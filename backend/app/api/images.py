@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
-from .. import imagehash
+from .. import imagehash, refile as refile_mod
 from ..models import DetClass, Image, ImageHash, ReviewStatus, Source
+from ..refile import storage_key_for
 from ..schemas import ImageDetail, ImageOut, UploadResult
 from ..storage import get_storage
 from .projects import get_project
@@ -55,7 +56,7 @@ def ingest_image(db: Session, project_id: int, cls: DetClass, source: Source, da
     if is_near_duplicate is not None and is_near_duplicate(dhash):
         raise NearDuplicate("near-duplicate of an existing image")
 
-    key = f"projects/{project_id}/raw/{cls.name}/{source.value}/{sha}.{EXT_BY_FORMAT[fmt]}"
+    key = storage_key_for(project_id, cls.name, source.value, sha, EXT_BY_FORMAT[fmt])
     get_storage().put(key, data)
     image = Image(project_id=project_id, class_id=cls.id, source=source, storage_key=key, sha256=sha,
                   width=width, height=height, group_key=group_key,
@@ -73,6 +74,8 @@ def upload_images(project_id: int, class_id: int, files: list[UploadFile] = File
     cls = db.get(DetClass, class_id)
     if cls is None or cls.project_id != project_id:
         raise HTTPException(404, "class not found")
+    if cls.is_mixed:
+        raise HTTPException(422, "'mixed' is filled automatically when a reviewed image shows several classes; pick another class")
 
     result = UploadResult(added=[], duplicates=[], rejected=[])
     for f in files:
@@ -88,6 +91,13 @@ def upload_images(project_id: int, class_id: int, files: list[UploadFile] = File
             result.added.append(ImageOut.model_validate(image))
     db.commit()
     return result
+
+
+@router.post("/projects/{project_id}/images/refile")
+def refile_images(project_id: int, dry_run: bool = True, db: Session = Depends(get_db)):
+    """Apply the folder rule to reviewed images (those reviewed before it existed). Dry run by default: it only reports."""
+    get_project(db, project_id)
+    return refile_mod.refile_project(db, project_id, dry_run)
 
 
 @router.get("/projects/{project_id}/images", response_model=list[ImageOut])

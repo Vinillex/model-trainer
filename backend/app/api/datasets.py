@@ -62,7 +62,7 @@ def zip_response(db: Session, version: DatasetVersion) -> FileResponse:
     """The version as a YOLO-format zip (images/, labels/, data.yaml), built from the frozen manifest."""
     storage = get_storage()
     try:
-        path = make_zip_file(datasets.load_manifest(version), storage.get)
+        path = make_zip_file(datasets.resolve_manifest(db, datasets.load_manifest(version)), storage.get)
     except MissingImages as e:
         raise HTTPException(409, f"{e} Images deleted after a version was created can't be exported; create a new version.")
     filename = re.sub(r"[^A-Za-z0-9._-]+", "-", f"{get_project(db, version.project_id).name}-{version.name}") + ".zip"

@@ -20,6 +20,7 @@ class ClassOut(BaseModel):
     name: str
     is_negative: bool
     index: int | None
+    is_mixed: bool = False  # the auto-managed folder for images showing several classes; never a label
 
 
 class ProjectCreate(BaseModel):
@@ -61,6 +62,7 @@ class StatRow(BaseModel):
     class_id: int
     class_name: str
     is_negative: bool
+    is_mixed: bool = False
     uploaded: int = 0
     scraped: int = 0
     generated: int = 0

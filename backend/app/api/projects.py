@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import Annotation, DetClass, Image, Job, JobStatus, Project, ReviewStatus
+from ..models import MIXED, Annotation, DetClass, Image, Job, JobStatus, Project, ReviewStatus
 from ..schemas import (NAME_PATTERN, BulkClassCreate, BulkClassResult, ClassCreate, ClassOut, ProjectCreate,
                        ProjectOut, StatRow)
 
@@ -73,6 +73,8 @@ def read_project(project_id: int, db: Session = Depends(get_db)):
 @router.post("/{project_id}/classes", response_model=ClassOut, status_code=201)
 def create_class(project_id: int, body: ClassCreate, db: Session = Depends(get_db)):
     project = get_project(db, project_id)
+    if body.name == MIXED:
+        raise HTTPException(422, "'mixed' is reserved: it is the folder for reviewed images whose boxes show several classes")
     try:
         cls = add_class(db, project, body.name, body.is_negative)
         db.commit()
@@ -96,7 +98,7 @@ def create_classes_bulk(project_id: int, body: BulkClassCreate, db: Session = De
         if name in seen:
             continue
         seen.add(name)
-        if len(name) > 64 or not re.match(NAME_PATTERN, name):
+        if len(name) > 64 or not re.match(NAME_PATTERN, name) or name == MIXED:  # "mixed" is reserved
             result.invalid.append(raw.strip())
         elif name in existing:
             result.skipped.append(name)
@@ -129,7 +131,7 @@ def delete_class(project_id: int, class_id: int, db: Session = Depends(get_db)):
 def project_stats(project_id: int, db: Session = Depends(get_db)):
     project = get_project(db, project_id)
     rows = {
-        c.id: StatRow(class_id=c.id, class_name=c.name, is_negative=c.is_negative) for c in project.classes
+        c.id: StatRow(class_id=c.id, class_name=c.name, is_negative=c.is_negative, is_mixed=c.is_mixed) for c in project.classes
     }
     counts = db.execute(
         select(Image.class_id, Image.source, func.count())

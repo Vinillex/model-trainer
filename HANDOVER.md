@@ -127,6 +127,15 @@ Also `image_hashes`, `scrape_records` (provenance: query, original URL, page URL
 `backend/data/storage/projects/<id>/raw/<class>/<source>/<sha256>.<ext>` (the per-class `uploaded/scraped/generated`
 layout the user asked for); the DB is `backend/data/model_trainer.db`.
 
+**Filing and the `mixed` folder.** The class chosen at scrape/upload time is only a first guess (one search returns many kinds
+of drone). When an image is saved as **reviewed**, it is re-filed by what its boxes show (`app/refile.py`): one box class means it
+moves to that class's folder (file and `class_id`); two or more classes mean the `mixed` folder; no boxes, pending or rejected
+means no move. Editing a reviewed image re-evaluates it, so it can move back out of `mixed`. `mixed` is a **reserved class name**
+auto-created per project (`index` is `None`; `DetClass.is_mixed` / `is_trainable`): it is never a label, never in `data.yaml`,
+and nothing is scraped, uploaded or boxed into it by hand. The move is the last step and never raises: the boxes are committed
+first, then the file is copied, the row switched, and the old copy deleted, so a failed move leaves the image where it was.
+`POST /projects/{id}/images/refile?dry_run=false` applies the rule to images reviewed before it existed (dry run by default).
+
 **Removing a class** (`DELETE /projects/{id}/classes/{class_id}`, the Remove button in the class table) is allowed only when
 nothing uses it: no images, no boxes drawn with it on any image, and no queued/running scrape job aimed at it. Dataset
 versions are self-contained snapshots, so existing ones are unaffected. New positive classes get `index = max + 1`, never a
@@ -157,6 +166,9 @@ generated images are train-only. Warnings are attached (empty val/test, class wi
 Download gives a standard Ultralytics folder: `data.yaml`, `images/{train,val,test}`, `labels/...`.
 **Trap:** `data.yaml` says `path: .`, which Ultralytics resolves against *its own datasets directory*, not the yaml's
 folder. `agents/gpu_agent.py` rewrites it to the absolute extract path; do the same if you ever train by hand.
+Because reviewed images can move folders after a version is frozen, the download resolves each manifest item to its image's
+*current* storage key by image id **and SHA-256** (`datasets.resolve_manifest`; the SHA check matters because SQLite reuses the
+id of a deleted image). Never rely on a manifest's recorded `key` alone.
 A dataset version used by a training run can't be deleted. If images are deleted after a version was made, its zip fails
 with a clear message (create a new version).
 
@@ -203,10 +215,11 @@ the current schema doesn't know are skipped and counted. **It is a snapshot, not
    keeping, export from there *before* replacing, and don't let two machines add data independently.
 3. There is **no merge import** (matching images by SHA-256 and remapping ids, since dataset manifests reference image ids).
    Build one if two machines ever need to add data in parallel.
-4. `export` copies *every* file under storage, including training artifacts (`projects/<id>/training/<run>/`: `best.pt`
+4. Moved images (re-filed after review) show up in git as renames of files under `handover-data/storage/`.
+5. `export` copies *every* file under storage, including training artifacts (`projects/<id>/training/<run>/`: `best.pt`
    about 5 MB, `packerOut.zip`, the `.rpk`). Delete runs you don't need in the UI (that removes their files) before
    exporting, or the weights go into the public history.
-5. **Size.** 21 MB for 52 images (the 12 MB one is a single PNG). Plain git is fine up to roughly a thousand images; GitHub
+6. **Size.** 21 MB for 52 images (the 12 MB one is a single PNG). Plain git is fine up to roughly a thousand images; GitHub
    rejects any file over 100 MB, warns over 50 MB, and recommends keeping a repo under about 1 GB. Beyond that, move images
    out of git (a bucket, rsync, or Git LFS, whose free bandwidth is small) and commit only `db.json`.
 

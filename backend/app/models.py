@@ -43,6 +43,9 @@ class Project(Base):
     )
 
 
+MIXED = "mixed"  # reserved class name: the folder for reviewed images whose boxes show two or more classes
+
+
 class DetClass(Base):
     """A detection class, or a hard-negative category (is_negative) that has images but no boxes."""
 
@@ -57,6 +60,15 @@ class DetClass(Base):
     index: Mapped[int | None] = mapped_column(Integer, default=None)
 
     project: Mapped[Project] = relationship(back_populates="classes")
+
+    @property
+    def is_mixed(self) -> bool:
+        return self.name == MIXED
+
+    @property
+    def is_trainable(self) -> bool:
+        """A real detection class: not a hard-negative category and not the `mixed` folder."""
+        return not self.is_negative and not self.is_mixed
 
 
 class Image(Base):

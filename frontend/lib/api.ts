@@ -8,6 +8,7 @@ export interface DetClass {
   name: string;
   is_negative: boolean;
   index: number | null;
+  is_mixed: boolean; // the auto-managed folder for reviewed images showing several classes; never a label
 }
 
 export interface Project {
@@ -66,6 +67,7 @@ export interface StatRow {
   class_id: number;
   class_name: string;
   is_negative: boolean;
+  is_mixed: boolean;
   uploaded: number;
   scraped: number;
   generated: number;

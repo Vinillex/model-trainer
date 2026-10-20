@@ -42,9 +42,10 @@ export default function ReviewScreen() {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const jumped = useRef(false);
 
-  const targets = useMemo(() => (project?.classes ?? []).filter((c) => !c.is_negative), [project]);
+  const targets = useMemo(() => (project?.classes ?? []).filter((c) => !c.is_negative && !c.is_mixed), [project]);
   const classById = useMemo(() => new Map((project?.classes ?? []).map((c) => [c.id, c])), [project]);
   const colorFor = useCallback((id: number) => PALETTE[(classById.get(id)?.index ?? id) % PALETTE.length], [classById]);
   const nameFor = useCallback((id: number) => classById.get(id)?.name ?? String(id), [classById]);
@@ -104,7 +105,7 @@ export default function ReviewScreen() {
         setError(null);
         setActiveClass((prev) => {
           const own = classById.get(d.class_id);
-          if (own && !own.is_negative) return own.id; // default to the folder the image was filed under
+          if (own && !own.is_negative && !own.is_mixed) return own.id; // default to the folder the image was filed under
           return prev ?? targets[0]?.id ?? null;
         });
       })
@@ -128,8 +129,16 @@ export default function ReviewScreen() {
         const out = await api.putAnnotations(detail.id, boxes.map(toBoxIn), newStatus);
         setDetail(out);
         setDirty(false);
-        setQueue((q) => q && q.map((r) => (r.id === out.id ? { ...r, review_status: out.review_status } : r)));
+        setQueue((q) => q && q.map((r) => (r.id === out.id ? { ...r, review_status: out.review_status, class_id: out.class_id } : r)));
         setError(null);
+        // A reviewed image moves to the folder its boxes show (or "mixed"); that class may be new, so reload the class list.
+        if (out.class_id !== detail.class_id) {
+          const p = classById.has(out.class_id) ? project : await api.getProject(projectId);
+          if (p && p !== project) setProject(p);
+          setNotice(`Moved to the ${p?.classes.find((c) => c.id === out.class_id)?.name ?? "new"} folder`);
+        } else {
+          setNotice(null);
+        }
         return true;
       } catch (e) {
         setError((e as Error).message);
@@ -138,7 +147,7 @@ export default function ReviewScreen() {
         setSaving(false);
       }
     },
-    [detail, boxes],
+    [detail, boxes, classById, project, projectId],
   );
 
   /** Move to another image, saving unsaved edits first so nothing drawn is lost. */
@@ -235,6 +244,7 @@ export default function ReviewScreen() {
       </div>
 
       {error && <p className="text-sm text-red-600">{error}</p>}
+      {notice && !error && <p className="text-sm text-neutral-400" data-testid="moved-notice">{notice}</p>}
       {queue === null && !error && <p className="text-sm text-neutral-500">Loading…</p>}
       {queue?.length === 0 && (
         <p className="text-neutral-500">

@@ -19,6 +19,8 @@ def create_scrape_job(project_id: int, body: ScrapeJobCreate, db: Session = Depe
     cls = db.get(DetClass, body.class_id)
     if cls is None or cls.project_id != project_id:
         raise HTTPException(404, "class not found")
+    if cls.is_mixed:
+        raise HTTPException(422, "'mixed' is filled automatically when a reviewed image shows several classes; pick another class")
     if not settings.serpapi_key:
         # Fail now rather than queue a job that is certain to fail.
         raise HTTPException(503, "SerpAPI is not configured: set MT_SERPAPI_KEY in backend/.env and restart the backend")

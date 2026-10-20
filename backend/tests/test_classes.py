@@ -55,9 +55,10 @@ def test_a_class_with_images_is_refused(client, project):
 
 def test_a_class_used_only_by_boxes_on_other_images_is_refused(client, project):
     pid, ids = project
-    add(client, pid, ids["multirotor"], [box(ids["fixed-wing"])])      # a multirotor image holding a fixed-wing box
+    # Two classes on one image: it moves to the `mixed` folder, so fixed-wing and shahed have boxes but no images of their own.
+    add(client, pid, ids["multirotor"], [box(ids["fixed-wing"], 0.3), box(ids["shahed"], 0.7)])
     stats = {r["class_name"]: r for r in client.get(f"/projects/{pid}/stats").json()}
-    assert stats["fixed-wing"]["boxes"] == 1 and stats["fixed-wing"]["uploaded"] == 0 and stats["shahed"]["boxes"] == 0
+    assert stats["fixed-wing"]["boxes"] == 1 and stats["fixed-wing"]["uploaded"] == 0 and stats["mixed"]["uploaded"] == 1
     r = client.delete(f"/projects/{pid}/classes/{ids['fixed-wing']}")
     assert r.status_code == 409 and "1 boxes" in r.json()["detail"]
 

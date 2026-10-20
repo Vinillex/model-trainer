@@ -43,6 +43,11 @@ export default function StatsTable({ projectId, rows, onChanged }: { projectId: 
               <td className="py-1.5 pr-4">
                 {r.class_name}
                 {r.is_negative && <span className="ml-2 rounded bg-neutral-200 px-1.5 py-0.5 text-xs dark:bg-neutral-800">negative</span>}
+                {r.is_mixed && (
+                  <span className="ml-2 rounded bg-neutral-200 px-1.5 py-0.5 text-xs dark:bg-neutral-800" title="Reviewed images whose boxes show two or more classes are moved here automatically. It is a folder, not a class the model learns.">
+                    mixed folder
+                  </span>
+                )}
               </td>
               {SOURCES.map((s) => (
                 <td key={s} className="px-2 text-right tabular-nums">

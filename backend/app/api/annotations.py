@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from .. import refile
 from ..db import get_db
 from ..models import Annotation, AnnotationStatus, DetClass, Image
 from ..schemas import AnnotationsPut, ImageDetail
@@ -24,6 +25,8 @@ def put_annotations(image_id: int, body: AnnotationsPut, db: Session = Depends(g
             raise HTTPException(422, f"box {i}: class {box.class_id} is not in this project")
         if cls.is_negative:
             raise HTTPException(422, f"box {i}: '{cls.name}' is a negative category and cannot have boxes")
+        if cls.is_mixed:
+            raise HTTPException(422, f"box {i}: '{cls.name}' is a folder, not a class; give the box its real class")
         if box.cx - box.w / 2 < -EPS or box.cx + box.w / 2 > 1 + EPS or box.cy - box.h / 2 < -EPS or box.cy + box.h / 2 > 1 + EPS:
             raise HTTPException(422, f"box {i}: extends outside the image")
 
@@ -34,5 +37,7 @@ def put_annotations(image_id: int, body: AnnotationsPut, db: Session = Depends(g
     if body.review_status is not None:
         image.review_status = body.review_status
     db.commit()
+    db.refresh(image)
+    refile.refile(db, image)  # a reviewed image moves to the folder its boxes show (never raises; the boxes are saved)
     db.refresh(image)
     return image

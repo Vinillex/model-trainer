@@ -161,7 +161,7 @@ export default function ScrapePanel({ projectId, classes, onImagesChanged }: { p
             <span className="mb-1 block text-neutral-500">File images under</span>
             <select className="input" value={classId} onChange={(e) => setClassId(e.target.value === "" ? "" : Number(e.target.value))} required>
               <option value="">Select class…</option>
-              {classes.map((c) => (
+              {classes.filter((c) => !c.is_mixed).map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}
                   {c.is_negative ? " (negative)" : ""}

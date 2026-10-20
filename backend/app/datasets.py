@@ -89,13 +89,13 @@ def preview(db: Session, project: Project) -> dict:
     return {"reviewed_images": len(reviewed), "reviewed_with_boxes": with_boxes, "reviewed_empty": empty,
             "negative_images": neg, "pending": by_status.get(ReviewStatus.pending, 0),
             "rejected": by_status.get(ReviewStatus.rejected, 0),
-            "boxes_per_class": {c.name: boxes.get(c.name, 0) for c in project.classes if not c.is_negative}}
+            "boxes_per_class": {c.name: boxes.get(c.name, 0) for c in project.classes if c.is_trainable}}
 
 
 def create_version(db: Session, project: Project, name: str | None, val_ratio: float, test_ratio: float, seed: int,
                    include_negatives: bool) -> DatasetVersion:
     """Snapshot the project. Raises ValueError (message safe to show) if there is nothing usable to train on."""
-    classes = sorted((c for c in project.classes if not c.is_negative), key=lambda c: c.index)
+    classes = sorted((c for c in project.classes if c.is_trainable), key=lambda c: c.index)
     class_idx = {c.id: i for i, c in enumerate(classes)}  # contiguous 0..N-1, as YOLO requires
     by_id = {c.id: c for c in project.classes}
 
@@ -146,6 +146,27 @@ def create_version(db: Session, project: Project, name: str | None, val_ratio: f
                 "classes": version.config["classes"], "images": items}
     get_storage().put(version.manifest_key, json.dumps(manifest).encode())
     return version
+
+
+def resolve_manifest(db: Session, manifest: dict) -> dict:
+    """Point each manifest item at its image's *current* storage key.
+
+    A reviewed image can move to another class folder after a version was frozen, but the version must keep working. An item
+    is re-pointed only if the image row still has the same SHA-256: SQLite reuses the id of a deleted image, and an id alone
+    could swap a different picture into a frozen version. Anything else keeps its recorded key (and, if that file is gone,
+    shows up as a missing image, as before).
+    """
+    items = manifest["images"]
+    current: dict[int, tuple[str, str]] = {}
+    for i in range(0, len(items), 500):
+        ids = [it["image_id"] for it in items[i:i + 500]]
+        current.update({iid: (sha, key) for iid, sha, key in
+                        db.execute(select(Image.id, Image.sha256, Image.storage_key).where(Image.id.in_(ids)))})
+    for it in items:
+        row = current.get(it["image_id"])
+        if row and row[0] == it["sha256"]:
+            it["key"] = row[1]
+    return manifest
 
 
 def load_manifest(version: DatasetVersion) -> dict:
