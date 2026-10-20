@@ -123,7 +123,7 @@ def test_create_version_stats_and_warnings(client, project):
     assert v["name"] == "v1" and v["config"]["classes"] == [{"index": 0, "name": "multirotor"}, {"index": 1, "name": "fixed-wing"}, {"index": 2, "name": "shahed"}]
     st = v["stats"]
     assert sum(st["images"].values()) == 27 and sum(st["boxes"].values()) == 22
-    assert st["excluded"] == {"pending": 1, "rejected": 1}
+    assert st["excluded"] == {"pending": 1, "rejected": 1, "not_selected": 0}
     assert sum(st["background_images"].values()) == 5  # 4 hard negatives + the empty shahed image
     assert st["images"]["train"] > st["images"]["val"] > 0
     warnings = " ".join(st["warnings"])

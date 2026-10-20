@@ -169,6 +169,7 @@ folder. `agents/gpu_agent.py` rewrites it to the absolute extract path; do the s
 Because reviewed images can move folders after a version is frozen, the download resolves each manifest item to its image's
 *current* storage key by image id **and SHA-256** (`datasets.resolve_manifest`; the SHA check matters because SQLite reuses the
 id of a deleted image). Never rely on a manifest's recorded `key` alone.
+**Choosing the data** (`Selection` in `datasets.py`): a version can use any mix of `uploaded`, `scraped`, `generated`, and, separately, each *imported dataset by name* (`DatasetCreate.sources`, `.imported_datasets`; `None` = all, `[]` = none). The UI's "Data to include" picker sends both lists and re-reads `GET .../datasets/preview?sources=a,b&imported=x,y` live; the version records the choice (`config.sources`, `config.imported_datasets`) and what it used (`stats.by_source`, e.g. `imported:anti-uav`). Hard negatives follow their own source. Mind the balance: one imported dataset can be 95% of a version, so the picker exists to control it.
 A dataset version used by a training run can't be deleted. If images are deleted after a version was made, its zip fails
 with a clear message (create a new version).
 
@@ -200,9 +201,9 @@ binds `127.0.0.1` by default. **If you bind `0.0.0.0` so the Pi can connect, tel
 can run a browser *on the machine* can do anything.
 
 ### 4.6b Importing public datasets (`scripts/import_yolo.py`)
-`python -m scripts.import_yolo import <folder> --dataset <tag> --map UAV=multirotor --author "..." [--dry-run --sample-sheet out.jpg]`
+`python -m scripts.import_yolo import <folder> --dataset anti-uav --map UAV=multirotor --author "..." [--dry-run --sample-sheet out.jpg]`
 imports a YOLO-format export (Roboflow layout: `<split>/images`, `<split>/labels`, `data.yaml`) as **reviewed** images with boxes,
-source `imported`, stored under `raw/<class>/imported/`, with an `ImportRecord` (dataset, original name and split, URL, licence,
+source `imported`, stored under `raw/<class>/imported/<dataset>/` (one folder per imported dataset, e.g. `raw/multirotor/imported/anti-uav/`; the dataset name is a folder-safe slug), with an `ImportRecord` (dataset, original name and split, URL, licence,
 author). It collapses augmented copies to one image per source frame, drops frames with no boxes, an unmapped class, or any box
 under `--min-box-px` (5), groups frames into **scenes** with a 12x12 colour-thumbnail descriptor (flip- and brightness-robust;
 a plain grayscale dHash chains unrelated skies into one giant group, measured on Anti-UAV), keeps at most `--max-per-scene` (20),
@@ -210,7 +211,7 @@ clean frames first, and uses the scene as `group_key` so dataset versions never 
 split is ignored: **Anti-UAV's leaks** (84% of its valid images have a near-identical train image, because video frames were split
 at random; its filenames restart per split, so they say nothing about which video a frame is from).
 It backs up the live SQLite database first (online backup API, to `backend/data/backups/`), commits every 50 images, and a re-run
-adds nothing (SHA dedupe + deterministic selection). `rollback --dataset <tag>` removes the images, rows and any orphan files.
+adds nothing (SHA dedupe + deterministic selection). `rollback --dataset <name>` removes the images, rows, orphan files and the empty folder.
 The importer needs `numpy` (pinned). **Order matters:** the running backend must already know the `imported` source (restart it
 after pulling this code) *before* the first import, or every endpoint that loads those images fails.
 Imported images are **left out of the data bundle by default** (`bundle export --include-imported` to include them): they can be
@@ -258,6 +259,14 @@ the current schema doesn't know are skipped and counted. **It is a snapshot, not
   asks for removal, tell Vinit: deleting the file is not enough, because git history keeps it (removing it needs a history
   rewrite) and forks may exist. Think before committing *new* scraped images: each export adds more third-party images to a
   public history.
+
+### Data added after the handover snapshot (2026-10-21)
+The snapshot above is what `handover-data/` holds. On the owner's machine the project has since grown: more scraped images (hundreds
+reviewed, boxes started for `fixed-wing`, `shahed`, `vtol`, `interceptor`) and the **Anti-UAV** dataset imported as
+`imported/anti-uav` (4,859 reviewed `multirotor` images across 2,065 scenes, ~190 MB; CC BY 4.0, see `DATA_LICENSES.md`).
+Those imported images are **not** in the repo or the bundle. To train with them, either keep the data owner's backend as the
+single source and run the GPU PC as a worker (it downloads the dataset zip), or re-download the Roboflow export (YOLOv11, version 1)
+and run the importer on the new machine.
 
 ## 6. What has and hasn't been verified
 

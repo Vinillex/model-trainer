@@ -155,7 +155,7 @@ def test_import_stores_reviewed_images_with_boxes_and_attribution(client, datase
     with client.session_factory() as db:
         images = db.scalars(select(Image)).all()
         assert len(images) == len(chosen) and all(i.source == Source.imported and i.review_status == ReviewStatus.reviewed for i in images)
-        assert all("/raw/multirotor/imported/" in i.storage_key and (storage._storage.root / i.storage_key).exists() for i in images)
+        assert all("/raw/multirotor/imported/demo-v1/" in i.storage_key and (storage._storage.root / i.storage_key).exists() for i in images)
         assert all(i.group_key.startswith("demo-v1:scene-") for i in images)
         assert db.scalar(select(func.count()).select_from(Annotation)) == len(chosen)
         rec = db.scalars(select(ImportRecord)).first()
@@ -290,3 +290,33 @@ def test_a_mirrored_copy_of_a_scene_is_grouped_with_it(tmp_path):
     import_yolo.assign_scenes(frames, 0.97)
     scene = {f.stem: f.scene for f in frames}
     assert scene["a"] == scene["a_flipped"] != scene["b"]
+
+
+def test_dataset_names_must_be_safe_folder_names(dataset, capsys):
+    root, _ = dataset
+    for bad in ("Bad Name", "../escape", "UPPER", "", "-leading-dash", "a" * 65):
+        assert import_yolo.main(["import", str(root), f"--dataset={bad}", "--map", "UAV=multirotor", "--author", "x", "--dry-run"]) == 1, bad
+    assert "folder name" in capsys.readouterr().err
+    assert import_yolo.main(["import", str(root), "--dataset", "anti-uav_2", "--map", "UAV=multirotor", "--author", "x", "--dry-run"]) == 0
+
+
+def test_a_rolled_back_dataset_leaves_no_empty_folder_behind(client, dataset):
+    root, _ = dataset
+    pid, chosen, _ = import_it(client, root)
+    folder = storage._storage.root / "projects" / str(pid) / "raw" / "multirotor" / "imported" / "demo-v1"
+    assert folder.is_dir() and any(folder.iterdir())
+    with client.session_factory() as db:
+        rollback(db, "demo-v1")
+    assert not folder.exists()
+
+
+def test_an_imported_image_boxed_as_another_class_stays_inside_its_dataset_folder(client, dataset):
+    root, _ = dataset
+    pid, chosen, _ = import_it(client, root)
+    ids = {c["name"]: c["id"] for c in client.get(f"/projects/{pid}").json()["classes"]}
+    victim = client.get(f"/projects/{pid}/images", params={"source": "imported", "limit": 1}).json()[0]
+    r = client.put(f"/images/{victim['id']}/annotations", json={"boxes": [{"class_id": ids["fixed-wing"], "cx": .5, "cy": .5, "w": .1, "h": .1}]})
+    assert r.status_code == 200 and r.json()["class_id"] == ids["fixed-wing"]            # re-filed by what its box now shows
+    with client.session_factory() as db:
+        key = db.get(Image, victim["id"]).storage_key
+    assert "/raw/fixed-wing/imported/demo-v1/" in key and (storage._storage.root / key).exists()

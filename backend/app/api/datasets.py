@@ -26,17 +26,34 @@ def get_version(db: Session, dataset_id: int) -> DatasetVersion:
     return version
 
 
+def _csv(value: str | None, allowed: tuple[str, ...] | None = None) -> frozenset[str] | None:
+    """None (parameter absent) = all; "" = none; "a,b" = just those."""
+    if value is None:
+        return None
+    names = frozenset(v for v in value.split(",") if v)
+    if allowed is not None and not names <= set(allowed):
+        raise HTTPException(422, f"unknown source(s): {', '.join(sorted(names - set(allowed)))}")
+    return names
+
+
 @router.get("/projects/{project_id}/datasets/preview")
-def dataset_preview(project_id: int, db: Session = Depends(get_db)):
-    """What a dataset created right now would contain, and what would be left out."""
-    return datasets.preview(db, get_project(db, project_id))
+def dataset_preview(project_id: int, sources: str | None = None, imported: str | None = None, db: Session = Depends(get_db)):
+    """What a dataset created right now would contain, and what would be left out.
+
+    `sources` (comma-separated: uploaded, scraped, generated) and `imported` (comma-separated imported dataset names)
+    choose the data; leave one out for "all of it", pass it empty for "none of it"."""
+    selection = datasets.Selection(_csv(sources, datasets.SELECTABLE_SOURCES), _csv(imported))
+    return datasets.preview(db, get_project(db, project_id), selection)
 
 
 @router.post("/projects/{project_id}/datasets", response_model=DatasetOut, status_code=201)
 def create_dataset(project_id: int, body: DatasetCreate, db: Session = Depends(get_db)):
     project = get_project(db, project_id)
     try:
-        version = datasets.create_version(db, project, body.name, body.val_ratio, body.test_ratio, body.seed, body.include_negatives)
+        selection = datasets.Selection(frozenset(body.sources) if body.sources is not None else None,
+                                       frozenset(body.imported_datasets) if body.imported_datasets is not None else None)
+        version = datasets.create_version(db, project, body.name, body.val_ratio, body.test_ratio, body.seed, body.include_negatives,
+                                          selection)
         db.commit()
     except ValueError as e:
         db.rollback()

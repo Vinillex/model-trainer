@@ -29,7 +29,7 @@ class NearDuplicate(ValueError):
 
 def ingest_image(db: Session, project_id: int, cls: DetClass, source: Source, data: bytes,
                  group_key: str | None = None, min_side: int | None = None,
-                 is_near_duplicate: Callable[[int], bool] | None = None) -> Image | None:
+                 is_near_duplicate: Callable[[int], bool] | None = None, subfolder: str | None = None) -> Image | None:
     """Validate and store one image. Returns None if its bytes duplicate an existing image.
 
     Raises ValueError for undecodable, unsupported or too-small images, and NearDuplicate if
@@ -56,7 +56,7 @@ def ingest_image(db: Session, project_id: int, cls: DetClass, source: Source, da
     if is_near_duplicate is not None and is_near_duplicate(dhash):
         raise NearDuplicate("near-duplicate of an existing image")
 
-    key = storage_key_for(project_id, cls.name, source.value, sha, EXT_BY_FORMAT[fmt])
+    key = storage_key_for(project_id, cls.name, source.value, sha, EXT_BY_FORMAT[fmt], subfolder)
     get_storage().put(key, data)
     image = Image(project_id=project_id, class_id=cls.id, source=source, storage_key=key, sha256=sha,
                   width=width, height=height, group_key=group_key,

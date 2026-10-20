@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Literal
 
@@ -179,6 +180,16 @@ class DatasetCreate(BaseModel):
     test_ratio: float = Field(0.1, ge=0, le=0.5)
     seed: int = 42
     include_negatives: bool = True  # hard-negative images become background (empty-label) training images
+    # Which data to use. None = all of it. Imported datasets are chosen only here, by name: [] means no imported dataset.
+    sources: list[Literal["uploaded", "scraped", "generated"]] | None = None
+    imported_datasets: list[str] | None = Field(None, max_length=100)
+
+    @field_validator("imported_datasets")
+    @classmethod
+    def _dataset_names_are_slugs(cls, v):
+        if v is not None and any(not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", n) for n in v):
+            raise ValueError("imported dataset names are lowercase letters, digits, '-' or '_'")
+        return v
 
     @model_validator(mode="after")
     def _leaves_room_for_train(self):

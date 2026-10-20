@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { api, datasetDownloadUrl, parseUtc, type DatasetPreview, type DatasetVersion } from "@/lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { SELECTABLE_SOURCES, api, datasetDownloadUrl, parseUtc, type DataSelection, type DatasetPreview, type DatasetVersion } from "@/lib/api";
 
 const SPLITS = ["train", "val", "test"] as const;
 
@@ -82,8 +82,18 @@ function VersionCard({ v, onDeleted }: { v: DatasetVersion; onDeleted: () => voi
           </tr>
         </tbody>
       </table>
+      {st.by_source && Object.keys(st.by_source).length > 0 && (
+        <p className="text-xs text-neutral-500" data-testid={`dataset-${v.id}-data`}>
+          Data used:{" "}
+          {Object.entries(st.by_source)
+            .map(([k, n]) => `${k.startsWith("imported:") ? `imported (${k.slice(9)})` : k} ${n.toLocaleString()}`)
+            .join(" · ")}
+        </p>
+      )}
       <p className="text-xs text-neutral-500">
-        Left out: {st.excluded.pending} pending, {st.excluded.rejected} rejected. Images from the same source page always share a split.
+        Left out: {st.excluded.pending} pending, {st.excluded.rejected} rejected
+        {(st.excluded.not_selected ?? 0) > 0 && <>, {st.excluded.not_selected!.toLocaleString()} reviewed but not selected</>}. Images from the same
+        source page or scene always share a split.
       </p>
       {st.warnings.length > 0 && (
         <ul className="list-disc space-y-0.5 pl-5 text-xs text-amber-500" data-testid="dataset-warnings">
@@ -104,21 +114,54 @@ export default function DatasetsPanel({ projectId, refreshKey }: { projectId: nu
   const [valPct, setValPct] = useState(10);
   const [testPct, setTestPct] = useState(10);
   const [negatives, setNegatives] = useState(true);
+  const [off, setOff] = useState<Set<string>>(new Set()); // data the person unticked: "source:scraped", "imported:anti-uav"
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(() => {
-    api.datasetPreview(projectId).then(setPreview).catch((e) => setError(e.message));
+  // Everything is selected until unticked. The picker's options come from the preview itself, so the first load asks for all.
+  const selection: DataSelection | undefined = preview
+    ? {
+        sources: SELECTABLE_SOURCES.filter((s) => !off.has(`source:${s}`)),
+        imported: preview.available.imported_datasets.map((d) => d.name).filter((n) => !off.has(`imported:${n}`)),
+      }
+    : undefined;
+  const selectionKey = JSON.stringify(selection ?? null);
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
+
+  const loadPreview = useCallback(() => {
+    api.datasetPreview(projectId, selectionRef.current).then(setPreview).catch((e) => setError(e.message));
+  }, [projectId]);
+  const loadVersions = useCallback(() => {
     api.listDatasets(projectId).then(setVersions).catch((e) => setError(e.message));
   }, [projectId]);
-  useEffect(load, [load, refreshKey]);
+  useEffect(loadVersions, [loadVersions, refreshKey]);
+  useEffect(loadPreview, [loadPreview, refreshKey, selectionKey]);
+  const load = useCallback(() => {
+    loadPreview();
+    loadVersions();
+  }, [loadPreview, loadVersions]);
+
+  const toggle = (key: string) =>
+    setOff((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
 
   async function create(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
     setError(null);
     try {
-      await api.createDataset(projectId, { name: name.trim() || undefined, val_ratio: valPct / 100, test_ratio: testPct / 100, include_negatives: negatives });
+      await api.createDataset(projectId, {
+        name: name.trim() || undefined,
+        val_ratio: valPct / 100,
+        test_ratio: testPct / 100,
+        include_negatives: negatives,
+        sources: selection?.sources,
+        imported_datasets: selection?.imported,
+      });
       setName("");
       load();
     } catch (err) {
@@ -133,7 +176,12 @@ export default function DatasetsPanel({ projectId, refreshKey }: { projectId: nu
     <div className="space-y-4">
       {preview && (
         <p className="text-sm text-neutral-500" data-testid="dataset-preview">
-          A new version would contain <b>{preview.reviewed_images}</b> reviewed images: {preview.reviewed_with_boxes} with boxes, {preview.reviewed_empty} with none, {preview.negative_images} hard negatives.{" "}
+          A new version would contain <b>{preview.reviewed_images.toLocaleString()}</b> reviewed images: {preview.reviewed_with_boxes} with boxes, {preview.reviewed_empty} with none, {preview.negative_images} hard negatives.{" "}
+          {preview.not_selected > 0 && (
+            <>
+              <b>{preview.not_selected.toLocaleString()}</b> reviewed images are not selected below.{" "}
+            </>
+          )}
           {preview.pending + preview.rejected > 0 && (
             <>
               Left out: <b>{preview.pending}</b> pending (review them to include them), {preview.rejected} rejected.{" "}
@@ -158,7 +206,34 @@ export default function DatasetsPanel({ projectId, refreshKey }: { projectId: nu
         <label className="flex items-center gap-1 pb-2">
           <input type="checkbox" checked={negatives} onChange={(e) => setNegatives(e.target.checked)} /> Include hard negatives as background images
         </label>
-        <button className="btn" disabled={busy}>
+        {preview && (
+          <fieldset className="basis-full space-y-1" data-testid="data-picker">
+            <legend className="mb-1 text-neutral-500">Data to include (reviewed images only)</legend>
+            <div className="flex flex-wrap gap-x-5 gap-y-1">
+              {SELECTABLE_SOURCES.map((src) => {
+                const n = preview.available.sources[src];
+                return (
+                  <label key={src} className={`flex items-center gap-1 ${n === 0 ? "text-neutral-500" : ""}`}>
+                    <input type="checkbox" checked={!off.has(`source:${src}`)} onChange={() => toggle(`source:${src}`)} disabled={n === 0} /> {src}{" "}
+                    <span className="text-neutral-500">({n.toLocaleString()})</span>
+                  </label>
+                );
+              })}
+            </div>
+            {preview.available.imported_datasets.length > 0 && (
+              <div className="flex flex-wrap items-center gap-x-5 gap-y-1">
+                <span className="text-neutral-500">Imported datasets:</span>
+                {preview.available.imported_datasets.map((d) => (
+                  <label key={d.name} className="flex items-center gap-1">
+                    <input type="checkbox" checked={!off.has(`imported:${d.name}`)} onChange={() => toggle(`imported:${d.name}`)} /> {d.name}{" "}
+                    <span className="text-neutral-500">({d.reviewed.toLocaleString()})</span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </fieldset>
+        )}
+        <button className="btn" disabled={busy || (preview?.reviewed_images ?? 0) === 0}>
           {busy ? "Creating…" : "Create dataset version"}
         </button>
       </form>

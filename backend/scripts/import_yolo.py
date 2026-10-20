@@ -1,8 +1,8 @@
 """Import a public YOLO-format dataset (such as a Roboflow export) as reviewed images with boxes.
 
-    python -m scripts.import_yolo import <folder> --dataset anti-uav-v1 --map UAV=multirotor --author "Yogith" --dry-run
-    python -m scripts.import_yolo import <folder> --dataset anti-uav-v1 --map UAV=multirotor --author "Yogith"
-    python -m scripts.import_yolo rollback --dataset anti-uav-v1
+    python -m scripts.import_yolo import <folder> --dataset anti-uav --map UAV=multirotor --author "Yogith" --dry-run
+    python -m scripts.import_yolo import <folder> --dataset anti-uav --map UAV=multirotor --author "Yogith"
+    python -m scripts.import_yolo rollback --dataset anti-uav
 
 What it does, in order (all of it deterministic, so a re-run imports the same images):
   1. One image per source frame. Roboflow writes augmented copies as `<frame>_jpg.rf.<hash>.jpg`; the extra copies are dropped.
@@ -12,7 +12,7 @@ What it does, in order (all of it deterministic, so a re-run imports the same im
      unrelated sky scenes into one giant group) and keeps at most --max-per-scene frames per scene, spread evenly, clean
      (un-augmented) ones first. The scene becomes the image's group_key, so dataset versions never split a scene across
      train/val/test. The dataset's own train/valid/test split is ignored: video frames were split at random, so it leaks.
-  4. Stores the images as source "imported" under raw/<class>/imported/, as reviewed, with an ImportRecord for attribution.
+  4. Stores the images as source "imported" under raw/<class>/imported/<dataset>/, as reviewed, with an ImportRecord for attribution.
 `rollback` removes everything imported under one --dataset tag, files included.
 """
 
@@ -43,6 +43,7 @@ from app.storage import LocalStorage, get_storage
 SPLITS = ("test", "valid", "val", "train")  # clean copies first when choosing which frames to keep
 RF_NAME = re.compile(r"^(?P<stem>.+)_(?:jpg|jpeg|png)\.rf\.[0-9a-f]+\.(?:jpg|jpeg|png)$", re.I)
 DEFAULT_SIM, DEFAULT_CAP, DEFAULT_MIN_BOX_PX, BATCH = 0.97, 20, 5.0, 50
+DATASET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")  # it becomes a folder name and part of every scene's group key
 
 
 class ImportProblem(Exception):
@@ -279,7 +280,8 @@ def run_import(db: Session, project_id: int, chosen: list[Frame], dataset: str, 
         if cls is None or not cls.is_trainable:
             raise ImportProblem(f"class '{f.boxes[0][0]}' doesn't exist (or isn't a trainable class) in this project")
         try:
-            image = ingest_image(db, project_id, cls, Source.imported, f.path.read_bytes(), group_key=f"{dataset}:{f.scene}")
+            image = ingest_image(db, project_id, cls, Source.imported, f.path.read_bytes(), group_key=f"{dataset}:{f.scene}",
+                                 subfolder=dataset)
         except ValueError:
             rejected += 1
             continue
@@ -299,17 +301,21 @@ def run_import(db: Session, project_id: int, chosen: list[Frame], dataset: str, 
 
 
 def sweep_orphans(db: Session, project_id: int | None = None) -> int:
-    """Delete files under raw/*/imported/ that no image row uses (what a crashed import can leave behind). Local storage only."""
+    """Delete files under raw/*/imported/ that no image row uses (what a crashed import can leave behind), then any folders
+    left empty. Local storage only."""
     storage = get_storage()
     if not isinstance(storage, LocalStorage):
         return 0
     used = set(db.scalars(select(Image.storage_key).where(Image.source == Source.imported)))
     removed = 0
-    for path in storage.root.glob("projects/*/raw/*/imported/*"):
+    for path in storage.root.glob("projects/*/raw/*/imported/**/*"):
         key = path.relative_to(storage.root).as_posix()
         if path.is_file() and key not in used:
             path.unlink()
             removed += 1
+    for folder in sorted(storage.root.glob("projects/*/raw/*/imported/**/*"), key=lambda p: len(p.parts), reverse=True):
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
     return removed
 
 
@@ -339,7 +345,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     imp = sub.add_parser("import", help="import a YOLO-format dataset folder")
     imp.add_argument("folder", type=Path)
-    imp.add_argument("--dataset", required=True, help="a tag for this import, e.g. anti-uav-v1 (also names the scene groups)")
+    imp.add_argument("--dataset", required=True, help="the dataset's name, e.g. anti-uav: its folder under raw/<class>/imported/ and the tag dataset versions select")
     imp.add_argument("--project", type=int, default=1)
     imp.add_argument("--map", action="append", default=[], metavar="SOURCE=target", help="dataset class -> our class, e.g. UAV=multirotor")
     imp.add_argument("--author", required=True, help="who to credit (for the attribution record)")
@@ -363,6 +369,8 @@ def main(argv=None) -> int:
                 print("rolled back:", rollback(db, args.dataset))
             return 0
 
+        if not DATASET_NAME.match(args.dataset):
+            raise ImportProblem("--dataset must be lowercase letters, digits, '-' or '_' (it becomes a folder name), e.g. anti-uav")
         class_map = _parse_map(args.map)
         meta = read_data_yaml(args.folder)
         if not class_map:

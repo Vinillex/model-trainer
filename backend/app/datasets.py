@@ -3,18 +3,47 @@
 import hashlib
 import json
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from .models import AnnotationStatus, DatasetVersion, DetClass, Image, Project, ReviewStatus, ScrapeRecord
+from .models import AnnotationStatus, DatasetVersion, DetClass, Image, Project, ReviewStatus, ScrapeRecord, Source
 from .storage import get_storage
 from .yolo_export import SPLITS
 
 NEGATIVE = "(negative)"
 MIN_BOXES_WARNING = 20
 KEPT_BOX_STATUSES = (AnnotationStatus.reviewed, AnnotationStatus.auto_exact)  # never unreviewed or rejected boxes
+
+
+SELECTABLE_SOURCES = ("uploaded", "scraped", "generated")  # imported images are chosen per imported dataset instead
+
+
+@dataclass(frozen=True)
+class Selection:
+    """Which reviewed images a dataset version may use. None means "all of them"; an empty set means "none of them".
+
+    `sources` covers uploaded / scraped / generated. Imported images are chosen only through `imported`, by dataset name
+    (their folder under raw/<class>/imported/), so one imported dataset can be in a version while another is not.
+    """
+
+    sources: frozenset[str] | None = None
+    imported: frozenset[str] | None = None
+
+    def wants(self, img: Image) -> bool:
+        if img.source == Source.imported:
+            name = img.import_record.dataset if img.import_record else None
+            return self.imported is None or name in self.imported
+        return self.sources is None or img.source.value in self.sources
+
+
+def source_label(img: Image) -> str:
+    """"uploaded", "scraped", "generated", or "imported:<dataset>"."""
+    if img.source == Source.imported:
+        return f"imported:{img.import_record.dataset if img.import_record else '?'}"
+    return img.source.value
 
 
 def _round(x: float) -> int:
@@ -67,12 +96,14 @@ def assign_splits(items: list[dict], val_ratio: float, test_ratio: float, seed: 
             it["split"] = split_of[name]
 
 
-def preview(db: Session, project: Project) -> dict:
-    """What a new version would contain right now."""
+def preview(db: Session, project: Project, selection: Selection | None = None) -> dict:
+    """What a new version would contain right now, for the data chosen in `selection` (all of it if None)."""
     by_status = dict(db.execute(select(Image.review_status, func.count()).where(Image.project_id == project.id)
                                 .group_by(Image.review_status)).all())
-    reviewed = db.scalars(select(Image).where(Image.project_id == project.id, Image.review_status == ReviewStatus.reviewed)
-                          .options(selectinload(Image.annotations))).all()
+    reviewed_all = db.scalars(select(Image).where(Image.project_id == project.id, Image.review_status == ReviewStatus.reviewed)
+                              .options(selectinload(Image.annotations), selectinload(Image.import_record))).all()
+    available = Counter(source_label(i) for i in reviewed_all)
+    reviewed = [i for i in reviewed_all if selection is None or selection.wants(i)]
     negatives = {c.id for c in project.classes if c.is_negative}
     names = {c.id: c.name for c in project.classes}
     boxes: Counter = Counter()
@@ -89,20 +120,31 @@ def preview(db: Session, project: Project) -> dict:
     return {"reviewed_images": len(reviewed), "reviewed_with_boxes": with_boxes, "reviewed_empty": empty,
             "negative_images": neg, "pending": by_status.get(ReviewStatus.pending, 0),
             "rejected": by_status.get(ReviewStatus.rejected, 0),
+            "reviewed_total": len(reviewed_all), "not_selected": len(reviewed_all) - len(reviewed),
+            # everything that could be chosen, whatever is selected now: what the picker offers
+            "available": {"sources": {src: available.get(src, 0) for src in SELECTABLE_SOURCES},
+                          "imported_datasets": [{"name": k.split(":", 1)[1], "reviewed": n} for k, n in sorted(available.items())
+                                                if k.startswith("imported:")]},
             "boxes_per_class": {c.name: boxes.get(c.name, 0) for c in project.classes if c.is_trainable}}
 
 
 def create_version(db: Session, project: Project, name: str | None, val_ratio: float, test_ratio: float, seed: int,
-                   include_negatives: bool) -> DatasetVersion:
-    """Snapshot the project. Raises ValueError (message safe to show) if there is nothing usable to train on."""
+                   include_negatives: bool, selection: Selection | None = None) -> DatasetVersion:
+    """Snapshot the project (only the data in `selection`, all of it if None).
+    Raises ValueError (message safe to show) if there is nothing usable to train on."""
     classes = sorted((c for c in project.classes if c.is_trainable), key=lambda c: c.index)
     class_idx = {c.id: i for i, c in enumerate(classes)}  # contiguous 0..N-1, as YOLO requires
     by_id = {c.id: c for c in project.classes}
 
     images = db.scalars(select(Image).where(Image.project_id == project.id, Image.review_status == ReviewStatus.reviewed)
-                        .order_by(Image.id).options(selectinload(Image.annotations), selectinload(Image.scrape_record))).all()
+                        .order_by(Image.id).options(selectinload(Image.annotations), selectinload(Image.scrape_record),
+                                                    selectinload(Image.import_record))).all()
     items = []
+    not_selected = 0
     for img in images:
+        if selection is not None and not selection.wants(img):
+            not_selected += 1
+            continue
         cls = by_id[img.class_id]
         if cls.is_negative and not include_negatives:
             continue
@@ -120,8 +162,11 @@ def create_version(db: Session, project: Project, name: str | None, val_ratio: f
         items.append({
             "image_id": img.id, "key": img.storage_key, "sha256": img.sha256, "ext": img.storage_key.rsplit(".", 1)[-1],
             "width": img.width, "height": img.height, "source": img.source.value, "folder_class": cls.name,
+            "dataset": img.import_record.dataset if img.import_record else None,
             "group": f"{img.source.value}:{group}", "stratum": stratum, "boxes": boxes,
         })
+    if not items and not_selected:
+        raise ValueError("None of the data you selected has reviewed images. Tick other data, or review more images.")
     if not items:
         raise ValueError("No reviewed images yet. Review some images first (pending and rejected images are never exported).")
     if not any(it["boxes"] for it in items):
@@ -130,13 +175,15 @@ def create_version(db: Session, project: Project, name: str | None, val_ratio: f
     assign_splits(items, val_ratio, test_ratio, seed)
     for it in items:
         del it["stratum"]
-    stats = _stats(items, classes, db, project)
+    stats = _stats(items, classes, db, project, not_selected)
     if stats["images"]["train"] == 0:
         raise ValueError("The train split would be empty; review more images.")
 
     count = db.scalar(select(func.count()).select_from(DatasetVersion).where(DatasetVersion.project_id == project.id)) or 0
     version = DatasetVersion(project_id=project.id, name=name or f"v{count + 1}", stats=stats, manifest_key="",
                              config={"val_ratio": val_ratio, "test_ratio": test_ratio, "seed": seed, "include_negatives": include_negatives,
+                                     "sources": sorted(selection.sources) if selection and selection.sources is not None else None,
+                                     "imported_datasets": sorted(selection.imported) if selection and selection.imported is not None else None,
                                      "classes": [{"index": i, "name": c.name} for i, c in enumerate(classes)]})
     db.add(version)
     db.flush()  # assigns the id used in the manifest path
@@ -173,7 +220,7 @@ def load_manifest(version: DatasetVersion) -> dict:
     return json.loads(get_storage().get(version.manifest_key))
 
 
-def _stats(items: list[dict], classes: list[DetClass], db: Session, project: Project) -> dict:
+def _stats(items: list[dict], classes: list[DetClass], db: Session, project: Project, not_selected: int = 0) -> dict:
     names = [c.name for c in classes]
     images = {s: 0 for s in SPLITS}
     boxes = {s: 0 for s in SPLITS}
@@ -205,5 +252,8 @@ def _stats(items: list[dict], classes: list[DetClass], db: Session, project: Pro
         elif total < MIN_BOXES_WARNING:
             warnings.append(f"Class '{n}' has only {total} boxes (aim for {MIN_BOXES_WARNING}+ to start with, far more for good accuracy).")
     return {"images": images, "boxes": boxes, "background_images": dict(background), "per_class": per_class,
-            "excluded": {"pending": by_status.get(ReviewStatus.pending, 0), "rejected": by_status.get(ReviewStatus.rejected, 0)},
+            "excluded": {"pending": by_status.get(ReviewStatus.pending, 0), "rejected": by_status.get(ReviewStatus.rejected, 0),
+                         "not_selected": not_selected},
+            "by_source": dict(sorted(Counter(f"imported:{it['dataset']}" if it["source"] == "imported" else it["source"]
+                                             for it in items).items())),
             "warnings": warnings}

@@ -20,8 +20,10 @@ from .storage import get_storage
 log = logging.getLogger(__name__)
 
 
-def storage_key_for(project_id: int, folder: str, source: str, sha: str, ext: str) -> str:
-    return f"projects/{project_id}/raw/{folder}/{source}/{sha}.{ext}"
+def storage_key_for(project_id: int, folder: str, source: str, sha: str, ext: str, subfolder: str | None = None) -> str:
+    """raw/<class>/<source>/[<subfolder>/]<sha>.<ext>. Imported images get a subfolder named after their dataset."""
+    middle = f"{source}/{subfolder}" if subfolder else source
+    return f"projects/{project_id}/raw/{folder}/{middle}/{sha}.{ext}"
 
 
 def ensure_mixed(db: Session, project_id: int) -> DetClass:
@@ -56,7 +58,8 @@ def refile(db: Session, image: Image) -> bool:
         if target is None or target.id == image.class_id:
             return False
         old_key = image.storage_key
-        new_key = storage_key_for(image.project_id, target.name, image.source.value, image.sha256, old_key.rsplit(".", 1)[-1])
+        dataset = image.import_record.dataset if image.import_record else None  # an imported image stays in its dataset's folder
+        new_key = storage_key_for(image.project_id, target.name, image.source.value, image.sha256, old_key.rsplit(".", 1)[-1], dataset)
         if new_key == old_key:
             return False
         if db.scalar(select(Image.id).where(Image.storage_key == new_key)):

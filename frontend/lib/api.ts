@@ -120,13 +120,26 @@ export interface Job {
   finished_at: string | null;
 }
 
+export type SelectableSource = "uploaded" | "scraped" | "generated";
+export const SELECTABLE_SOURCES: SelectableSource[] = ["uploaded", "scraped", "generated"];
+
+/** Which data a dataset version uses: the three plain sources, and imported datasets by name (they are chosen one by one). */
+export interface DataSelection {
+  sources: SelectableSource[];
+  imported: string[];
+}
+
 export interface DatasetPreview {
-  reviewed_images: number;
+  reviewed_images: number; // for the current selection
   reviewed_with_boxes: number;
   reviewed_empty: number;
   negative_images: number;
   pending: number;
   rejected: number;
+  reviewed_total: number; // all reviewed images, whatever is selected
+  not_selected: number;
+  /** Everything that can be chosen, with its number of reviewed images. */
+  available: { sources: Record<SelectableSource, number>; imported_datasets: { name: string; reviewed: number }[] };
   boxes_per_class: Record<string, number>;
 }
 
@@ -137,13 +150,22 @@ export interface DatasetVersion {
   project_id: number;
   name: string;
   created_at: string;
-  config: { val_ratio: number; test_ratio: number; seed: number; include_negatives: boolean; classes: { index: number; name: string }[] };
+  config: {
+    val_ratio: number;
+    test_ratio: number;
+    seed: number;
+    include_negatives: boolean;
+    sources?: SelectableSource[] | null; // null/absent = all
+    imported_datasets?: string[] | null;
+    classes: { index: number; name: string }[];
+  };
   stats: {
     images: Record<SplitName, number>;
     boxes: Record<SplitName, number>;
     background_images: Partial<Record<SplitName, number>>;
     per_class: Record<string, Record<SplitName, { images: number; boxes: number }>>;
-    excluded: { pending: number; rejected: number };
+    excluded: { pending: number; rejected: number; not_selected?: number };
+    by_source?: Record<string, number>; // "scraped", "uploaded", "imported:<dataset>"
     warnings: string[];
   };
 }
@@ -250,9 +272,16 @@ export const api = {
   serpapiAccount: () => req<SerpApiAccount>("/serpapi/account"),
   listJobs: (projectId: number) => req<Job[]>(`/projects/${projectId}/jobs?limit=10`),
   cancelJob: (id: number) => req<Job>(`/jobs/${id}/cancel`, { method: "POST" }),
-  datasetPreview: (projectId: number) => req<DatasetPreview>(`/projects/${projectId}/datasets/preview`),
+  datasetPreview: (projectId: number, sel?: DataSelection) =>
+    req<DatasetPreview>(
+      `/projects/${projectId}/datasets/preview` +
+        (sel ? `?${new URLSearchParams({ sources: sel.sources.join(","), imported: sel.imported.join(",") })}` : ""),
+    ),
   listDatasets: (projectId: number) => req<DatasetVersion[]>(`/projects/${projectId}/datasets`),
-  createDataset: (projectId: number, body: { name?: string; val_ratio: number; test_ratio: number; include_negatives: boolean }) =>
+  createDataset: (
+    projectId: number,
+    body: { name?: string; val_ratio: number; test_ratio: number; include_negatives: boolean; sources?: SelectableSource[]; imported_datasets?: string[] },
+  ) =>
     req<DatasetVersion>(`/projects/${projectId}/datasets`, json("POST", body)),
   deleteDataset: (id: number) => req<void>(`/datasets/${id}`, { method: "DELETE" }),
   deleteImage: (id: number) => req<void>(`/images/${id}`, { method: "DELETE" }),
