@@ -144,6 +144,56 @@ export interface DatasetVersion {
   };
 }
 
+export type RunStage = "queued" | "training" | "exporting" | "awaiting_package" | "packaging" | "done" | "failed" | "cancelled";
+
+export interface RunMetrics {
+  precision?: number | null;
+  recall?: number | null;
+  map50?: number | null;
+  map50_95?: number | null;
+}
+
+export interface TrainingRun {
+  id: number;
+  project_id: number;
+  dataset_id: number;
+  name: string;
+  config: { model: string; epochs: number; imgsz: number; batch: number; export_imx: boolean };
+  stage: RunStage;
+  progress: RunMetrics & { message?: string; epoch?: number; epochs?: number };
+  metrics: RunMetrics & { per_class?: Record<string, { ap50: number | null; ap50_95: number | null }> };
+  artifacts: Partial<Record<ArtifactName, { size: number | null }>>;
+  error: string | null;
+  cancel_requested: boolean;
+  worker: string | null;
+  attempts: number;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export type ArtifactName = "best_pt" | "imx_zip" | "labels" | "rpk";
+
+export interface TrainingParams {
+  dataset_id: number;
+  model: "yolo11n" | "yolov8n";
+  epochs: number;
+  imgsz: number;
+  batch: number;
+  export_imx: boolean;
+}
+
+export interface WorkerInfo {
+  name: string;
+  kind: "gpu" | "pi";
+  online: boolean;
+  last_seen: string;
+  run_id: number | null;
+}
+
+/** The backend stores UTC but its timestamps carry no zone suffix, which `new Date` would read as local time. */
+export const parseUtc = (s: string) => new Date(/(Z|[+-]\d\d:?\d\d)$/.test(s) ? s : s + "Z");
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(API + path, init);
   if (!res.ok) {
@@ -162,6 +212,7 @@ const json = (method: string, body: unknown): RequestInit => ({
 
 export const datasetDownloadUrl = (id: number) => `${API}/datasets/${id}/download`;
 export const imageUrl = (id: number) => `${API}/images/${id}/file`;
+export const artifactUrl = (runId: number, name: ArtifactName) => `${API}/training-runs/${runId}/artifacts/${name}`;
 
 export const api = {
   listProjects: () => req<Project[]>("/projects"),
@@ -200,4 +251,9 @@ export const api = {
     req<DatasetVersion>(`/projects/${projectId}/datasets`, json("POST", body)),
   deleteDataset: (id: number) => req<void>(`/datasets/${id}`, { method: "DELETE" }),
   deleteImage: (id: number) => req<void>(`/images/${id}`, { method: "DELETE" }),
+  createTrainingRun: (projectId: number, body: TrainingParams) => req<TrainingRun>(`/projects/${projectId}/training-runs`, json("POST", body)),
+  listTrainingRuns: (projectId: number) => req<TrainingRun[]>(`/projects/${projectId}/training-runs`),
+  cancelTrainingRun: (id: number) => req<TrainingRun>(`/training-runs/${id}/cancel`, { method: "POST" }),
+  deleteTrainingRun: (id: number) => req<void>(`/training-runs/${id}`, { method: "DELETE" }),
+  trainingWorkers: () => req<WorkerInfo[]>("/training-workers"),
 };

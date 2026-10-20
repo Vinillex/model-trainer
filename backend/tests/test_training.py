@@ -321,3 +321,13 @@ def test_workers_list_shows_who_called_in(client, lan, ready):
     workers = {w["name"]: w for w in client.get("/training-workers").json()}
     assert workers["gpu-1"]["kind"] == "gpu" and workers["gpu-1"]["online"] and workers["gpu-1"]["run_id"] is not None
     assert workers["pi-1"]["kind"] == "pi" and workers["pi-1"]["run_id"] is None
+
+
+def test_a_worker_keeps_its_kind_and_is_freed_when_its_run_is_cancelled(client, lan, ready):
+    rid = new_run(client, ready)["id"]
+    claim(lan, name="gpu-1")
+    lan.post(f"/workers/runs/{rid}/heartbeat", json={}, headers=hdr("gpu-1"))
+    client.post(f"/training-runs/{rid}/cancel")
+    assert lan.post(f"/workers/runs/{rid}/heartbeat", json={}, headers=hdr("gpu-1")).json() == {"cancel": True}
+    w = {w["name"]: w for w in client.get("/training-workers").json()}["gpu-1"]
+    assert w["kind"] == "gpu" and w["run_id"] is None          # not "pi" (the stage is no longer a GPU one), not busy with a dead run

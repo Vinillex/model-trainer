@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from .. import training
 from ..db import get_db
-from ..models import DatasetVersion, TrainingRun
+from ..models import DatasetVersion
 from ..schemas import ClaimIn, CompleteIn, FailIn, HeartbeatIn, TrainingRunOut
 from ..security import require_token, worker_name
 from ..storage import get_storage
@@ -48,8 +48,9 @@ def claim(body: ClaimIn, worker: str = Depends(worker_name), db: Session = Depen
 
 @router.post("/runs/{run_id}/heartbeat")
 def heartbeat(run_id: int, body: HeartbeatIn, worker: str = Depends(worker_name), db: Session = Depends(get_db)):
+    kind = training.kind_of(guarded(training.owned, db, run_id, worker).stage)  # read before the heartbeat can end the run
     cancel = guarded(training.heartbeat, db, run_id, worker, body.progress, body.stage)
-    training.touch_worker(worker, training.kind_of(db.get(TrainingRun, run_id).stage), run_id)
+    training.touch_worker(worker, kind, None if cancel else run_id)
     return {"cancel": cancel}
 
 

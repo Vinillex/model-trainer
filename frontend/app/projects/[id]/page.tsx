@@ -8,6 +8,7 @@ import DatasetsPanel from "@/components/DatasetsPanel";
 import ClassForm from "@/components/ClassForm";
 import ScrapePanel from "@/components/ScrapePanel";
 import StatsTable from "@/components/StatsTable";
+import TrainingPanel from "@/components/TrainingPanel";
 import UploadBox from "@/components/UploadBox";
 import { api, type Project, type StatRow } from "@/lib/api";
 
@@ -62,6 +63,11 @@ export default function ProjectPage() {
       <section className="space-y-3">
         <h2 className="text-lg font-medium">Dataset versions</h2>
         <DatasetsPanel projectId={projectId} refreshKey={refreshKey} />
+      </section>
+
+      <section className="space-y-3">
+        <h2 className="text-lg font-medium">Train &amp; export</h2>
+        <TrainingPanel projectId={projectId} refreshKey={refreshKey} />
       </section>
 
       <section className="space-y-3">

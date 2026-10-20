@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { api, datasetDownloadUrl, type DatasetPreview, type DatasetVersion } from "@/lib/api";
+import { api, datasetDownloadUrl, parseUtc, type DatasetPreview, type DatasetVersion } from "@/lib/api";
 
 const SPLITS = ["train", "val", "test"] as const;
 
@@ -26,7 +26,7 @@ function VersionCard({ v, onDeleted }: { v: DatasetVersion; onDeleted: () => voi
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-medium">{v.name}</span>
         <span className="text-neutral-500">
-          {total} images · requested split {Math.round((1 - v.config.val_ratio - v.config.test_ratio) * 100)}/{Math.round(v.config.val_ratio * 100)}/{Math.round(v.config.test_ratio * 100)} · {new Date(v.created_at).toLocaleString()}
+          {total} images · requested split {Math.round((1 - v.config.val_ratio - v.config.test_ratio) * 100)}/{Math.round(v.config.val_ratio * 100)}/{Math.round(v.config.test_ratio * 100)} · {parseUtc(v.created_at).toLocaleString()}
         </span>
         <span className="ml-auto flex gap-2">
           <a className="btn" href={datasetDownloadUrl(v.id)} download>
