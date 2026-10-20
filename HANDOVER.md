@@ -19,7 +19,7 @@ Decisions already made (don't re-litigate without a reason):
 
 | Decision | Detail |
 |---|---|
-| Compute | **Local GPUs** (RTX 4060 Ti 8 GB and RTX 3060 12 GB, both in Windows PCs). **RunPod is not on the training path.** An API key exists (`MT_RUNPOD_API_KEY`, read-only account check only) but the account has $0 and no card. Keep RunPod as an option for FLUX or large auto-labeling jobs only. |
+| Compute | **Local GPUs** (RTX 4060 Ti 8 GB and RTX 3060 12 GB, both in Windows PCs). **RunPod is not on the training path.** An optional API key setting exists (`MT_RUNPOD_API_KEY`, read-only account check only) and is unused. Keep RunPod as an option for FLUX or large auto-labeling jobs only. |
 | Model | **YOLO11n / YOLOv8n only.** Ultralytics' IMX export supports nothing else, and the sensor has about 8 MB of model memory. Input up to 640x640. |
 | Labeling | Built-in review UI (box editor), not CVAT or Label Studio. |
 | Auth | **None.** Single user, trusted network. The only protection is a loopback guard plus a worker token (section 4.6). |
@@ -187,8 +187,23 @@ can run a browser *on the machine* can do anything.
 repeatable), copies every stored file under `storage/`, and writes `files.json` with SHA-256s. `import` verifies every
 checksum *before* touching anything (catches CRLF conversion or a lost file), refuses a non-empty database, restores
 files, then inserts rows with their **original ids** so dataset-version manifests stay valid. SQLite only. Tables/columns
-the current schema doesn't know are skipped and counted. To refresh: `python -m scripts.bundle export`, commit, push.
-**It is a snapshot, not a sync**: whichever machine runs the backend owns the data. Don't review on two machines at once.
+the current schema doesn't know are skipped and counted. **It is a snapshot, not a sync**: whichever machine runs the backend owns the data. Don't review on two machines at once.
+
+**Refreshing the data** (Vinit will keep creating data after this handover):
+1. On the machine that owns the data: `cd backend && python -m scripts.bundle export`, then commit and push `handover-data/`.
+   Images are stored under their SHA-256, so a re-export only adds the new files.
+2. On another machine, the importer needs an **empty** database. Stop the backend, `mv backend/data backend/data.old`,
+   `git pull`, `python -m scripts.bundle import`. That **replaces** that machine's database: anything only it has (reviews,
+   `training_runs` and their metrics) is gone from the DB unless you exported it first. If a GPU machine holds runs worth
+   keeping, export from there *before* replacing, and don't let two machines add data independently.
+3. There is **no merge import** (matching images by SHA-256 and remapping ids, since dataset manifests reference image ids).
+   Build one if two machines ever need to add data in parallel.
+4. `export` copies *every* file under storage, including training artifacts (`projects/<id>/training/<run>/`: `best.pt`
+   about 5 MB, `packerOut.zip`, the `.rpk`). Delete runs you don't need in the UI (that removes their files) before
+   exporting, or the weights go into the public history.
+5. **Size.** 21 MB for 52 images (the 12 MB one is a single PNG). Plain git is fine up to roughly a thousand images; GitHub
+   rejects any file over 100 MB, warns over 50 MB, and recommends keeping a repo under about 1 GB. Beyond that, move images
+   out of git (a bucket, rsync, or Git LFS, whose free bandwidth is small) and commit only `db.json`.
 
 ## 5. State of the data (honest)
 
@@ -201,8 +216,12 @@ the current schema doesn't know are skipped and counted. To refresh: `python -m 
   six boxed images of one class won't do. Don't create a dataset version from them.
 - Many scraped images are product shots (white background, packaging). Expect to reject a good share.
 - SerpAPI quota: 2 of 250 searches used this month (as of the handover).
-- The scraped images come from commercial sites (Amazon, DJI). Their sources are in `scrape_records`. **Keep the repo
-  private**, and treat them as research data, not something to redistribute.
+- **This repo is public, and the 50 scraped images are in it, by Vinit's informed choice.** They came from commercial and
+  editorial pages (DJI, Amazon, eBay, Walmart, Wired, The Verge, Space.com, Popular Mechanics and others) and remain the
+  property of their owners; each image's source page is in `scrape_records` / `handover-data/db.json`. If a rights holder
+  asks for removal, tell Vinit: deleting the file is not enough, because git history keeps it (removing it needs a history
+  rewrite) and forks may exist. Think before committing *new* scraped images: each export adds more third-party images to a
+  public history.
 
 ## 6. What has and hasn't been verified
 
@@ -237,7 +256,7 @@ In rough priority order:
 5. Real training run, then an on-device check on the Pi (FPS and accuracy on a test clip).
 6. **v2: FLUX generation** (the user asked for this explicitly). The 3060 12 GB can run a quantized FLUX slowly; RunPod is the
    alternative for volume.
-7. Smaller items: Alembic migrations, gallery thumbnails, a CLIP relevance filter for scraped images, store SerpAPI
+7. A merge-capable data import (section 4.7), then smaller items: Alembic migrations, gallery thumbnails, a CLIP relevance filter for scraped images, store SerpAPI
    `license_details_url` (present on ~21% of results) and download-failure reasons, hash thumbnails *before* downloading to
    catch the same photo at different URLs, a "release this run" call so Ctrl-C on an agent frees its run immediately,
    training resume after a lost worker, S3 storage testing, docker-compose.
