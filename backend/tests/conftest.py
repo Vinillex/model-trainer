@@ -7,6 +7,8 @@ from app import db as app_db
 from app import storage
 from app.main import app
 
+from .helpers import from_ip
+
 
 @pytest.fixture()
 def client(tmp_path):
@@ -21,7 +23,7 @@ def client(tmp_path):
             yield s
 
     app.dependency_overrides[app_db.get_db] = override
-    client_ = TestClient(app)  # not used as a context manager, so the app's lifespan (and its worker) never starts
+    client_ = TestClient(from_ip(app, "127.0.0.1"))  # a local browser; not used as a context manager, so the app's lifespan (and its worker) never starts
     client_.session_factory = Session
     storage._storage = storage.LocalStorage(str(tmp_path))
     yield client_

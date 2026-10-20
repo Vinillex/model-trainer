@@ -26,3 +26,12 @@ def encode(im: PILImage.Image, fmt="JPEG", **kw) -> bytes:
 
 def photo(seed: int, size=(320, 240), **kw) -> bytes:
     return encode(photo_image(seed, size), **kw)
+
+
+def from_ip(app, ip: str):
+    """Wrap an ASGI app so requests appear to come from `ip` (this Starlette's TestClient always says "testclient")."""
+    async def wrapped(scope, receive, send):
+        if scope["type"] == "http":
+            scope = {**scope, "client": (ip, 50000)}
+        await app(scope, receive, send)
+    return wrapped

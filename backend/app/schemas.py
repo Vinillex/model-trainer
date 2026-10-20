@@ -1,8 +1,9 @@
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .models import AnnotationStatus, JobStatus, ReviewStatus, Source
+from .models import AnnotationStatus, JobStatus, ReviewStatus, RunStage, Source
 
 NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
 
@@ -191,3 +192,64 @@ class DatasetOut(BaseModel):
     created_at: datetime
     config: dict
     stats: dict
+
+
+class TrainingRunCreate(BaseModel):
+    dataset_id: int
+    name: str | None = Field(None, min_length=1, max_length=120)  # defaults to run-<id>
+    model: Literal["yolo11n", "yolov8n"] = "yolo11n"  # the only detectors Ultralytics can export for the IMX500
+    epochs: int = Field(100, ge=1, le=1000)
+    imgsz: int = Field(640, ge=320, le=640, multiple_of=32)  # the IMX500 takes up to 640x640
+    batch: int = Field(16, ge=1, le=128)
+    export_imx: bool = True  # False: stop after training and keep best.pt only
+
+
+class TrainingRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    project_id: int
+    dataset_id: int
+    name: str
+    config: dict
+    stage: RunStage
+    progress: dict
+    metrics: dict
+    artifacts: dict  # name -> {size}; storage keys stay server-side
+    error: str | None
+    cancel_requested: bool
+    worker: str | None
+    attempts: int
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+    @field_validator("artifacts", mode="before")
+    @classmethod
+    def _hide_keys(cls, v):
+        return {name: {"size": a.get("size")} for name, a in (v or {}).items()}
+
+
+class WorkerOut(BaseModel):
+    name: str
+    kind: str
+    online: bool
+    last_seen: datetime
+    run_id: int | None
+
+
+class ClaimIn(BaseModel):
+    kind: Literal["gpu", "pi"]
+
+
+class HeartbeatIn(BaseModel):
+    progress: dict | None = None
+    stage: Literal["exporting"] | None = None  # the GPU worker moves training -> exporting
+
+
+class CompleteIn(BaseModel):
+    metrics: dict | None = None
+
+
+class FailIn(BaseModel):
+    error: str = Field(max_length=4000)

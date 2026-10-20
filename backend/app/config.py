@@ -34,5 +34,10 @@ class Settings(BaseSettings):
     runpod_api_key: str | None = None
     runpod_graphql_url: str = "https://api.runpod.io/graphql"
 
+    # Remote workers (GPU PC for training/export, Raspberry Pi for .rpk packaging) call /workers/* with this token.
+    # Unset = the worker API is disabled. Set MT_WORKER_TOKEN in backend/.env.
+    worker_token: str | None = None
+    worker_lease_seconds: int = 900  # a worker silent for this long loses its run (heartbeats renew the lease)
+
 
 settings = Settings()

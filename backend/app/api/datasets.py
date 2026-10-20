@@ -10,7 +10,7 @@ from starlette.background import BackgroundTask
 
 from .. import datasets
 from ..db import get_db
-from ..models import DatasetVersion
+from ..models import DatasetVersion, TrainingRun
 from ..schemas import DatasetCreate, DatasetOut
 from ..storage import get_storage
 from ..yolo_export import MissingImages, make_zip_file
@@ -58,10 +58,8 @@ def read_dataset(dataset_id: int, db: Session = Depends(get_db)):
     return get_version(db, dataset_id)
 
 
-@router.get("/datasets/{dataset_id}/download")
-def download_dataset(dataset_id: int, db: Session = Depends(get_db)):
+def zip_response(db: Session, version: DatasetVersion) -> FileResponse:
     """The version as a YOLO-format zip (images/, labels/, data.yaml), built from the frozen manifest."""
-    version = get_version(db, dataset_id)
     storage = get_storage()
     try:
         path = make_zip_file(datasets.load_manifest(version), storage.get)
@@ -71,9 +69,16 @@ def download_dataset(dataset_id: int, db: Session = Depends(get_db)):
     return FileResponse(path, media_type="application/zip", filename=filename, background=BackgroundTask(os.unlink, path))
 
 
+@router.get("/datasets/{dataset_id}/download")
+def download_dataset(dataset_id: int, db: Session = Depends(get_db)):
+    return zip_response(db, get_version(db, dataset_id))
+
+
 @router.delete("/datasets/{dataset_id}", status_code=204)
 def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
     version = get_version(db, dataset_id)
+    if db.scalar(select(TrainingRun.id).where(TrainingRun.dataset_id == dataset_id).limit(1)) is not None:
+        raise HTTPException(409, "Training runs use this dataset version. Delete those runs first.")
     get_storage().delete(version.manifest_key)
     db.delete(version)
     db.commit()

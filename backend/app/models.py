@@ -206,3 +206,42 @@ class DatasetVersion(Base):
     stats: Mapped[dict] = mapped_column(JSON, default=dict)  # counts per split/class, warnings
     manifest_key: Mapped[str] = mapped_column(String(512))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class RunStage(str, enum.Enum):
+    queued = "queued"  # waiting for a GPU worker
+    training = "training"
+    exporting = "exporting"  # Ultralytics format="imx": quantize + convert
+    awaiting_package = "awaiting_package"  # waiting for the Raspberry Pi to build the .rpk
+    packaging = "packaging"
+    done = "done"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class TrainingRun(Base):
+    """One train -> IMX export -> .rpk package pipeline on one dataset version, executed by remote workers.
+
+    Not a `Job`: remote workers claim these over HTTP with a lease, so the in-process worker and the
+    restart-time `recover_interrupted` (which fails every running Job) must never see them.
+    """
+
+    __tablename__ = "training_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    dataset_id: Mapped[int] = mapped_column(ForeignKey("dataset_versions.id"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    config: Mapped[dict] = mapped_column(JSON, default=dict)  # model, epochs, imgsz, batch, export_imx
+    stage: Mapped[RunStage] = mapped_column(Enum(RunStage), default=RunStage.queued, index=True)
+    progress: Mapped[dict] = mapped_column(JSON, default=dict)  # epoch, epochs, metrics, message
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)  # final validation metrics
+    artifacts: Mapped[dict] = mapped_column(JSON, default=dict)  # name -> {key, size}
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    worker: Mapped[str | None] = mapped_column(String(120), default=None)  # lease holder
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)  # leases lost so far
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
