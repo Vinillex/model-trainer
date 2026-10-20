@@ -71,6 +71,7 @@ export interface StatRow {
   generated: number;
   pending: number;
   rejected: number;
+  boxes: number; // boxes drawn with this class on any image; a class that has any can't be removed
 }
 
 export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
@@ -222,6 +223,7 @@ export const api = {
     req<DetClass>(`/projects/${projectId}/classes`, json("POST", { name, is_negative: isNegative })),
   createClasses: (projectId: number, names: string[], isNegative: boolean) =>
     req<BulkClassResult>(`/projects/${projectId}/classes/bulk`, json("POST", { names, is_negative: isNegative })),
+  deleteClass: (projectId: number, classId: number) => req<void>(`/projects/${projectId}/classes/${classId}`, { method: "DELETE" }),
   stats: (projectId: number) => req<StatRow[]>(`/projects/${projectId}/stats`),
   listImages: (projectId: number, p: { classId?: number; source?: Source; reviewStatus?: ReviewStatus; limit: number; offset: number }) => {
     const q = new URLSearchParams({ limit: String(p.limit), offset: String(p.offset) });

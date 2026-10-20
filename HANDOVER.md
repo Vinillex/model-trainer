@@ -127,6 +127,11 @@ Also `image_hashes`, `scrape_records` (provenance: query, original URL, page URL
 `backend/data/storage/projects/<id>/raw/<class>/<source>/<sha256>.<ext>` (the per-class `uploaded/scraped/generated`
 layout the user asked for); the DB is `backend/data/model_trainer.db`.
 
+**Removing a class** (`DELETE /projects/{id}/classes/{class_id}`, the Remove button in the class table) is allowed only when
+nothing uses it: no images, no boxes drawn with it on any image, and no queued/running scrape job aimed at it. Dataset
+versions are self-contained snapshots, so existing ones are unaffected. New positive classes get `index = max + 1`, never a
+count, because a removal leaves a gap and a count would reuse a live class's index.
+
 There are **no migrations**. `create_all` makes missing *tables* on startup; a new *column* on an existing table needs a
 manual `ALTER TABLE`. Alembic is a known to-do. `scripts/bundle.py` tolerates schema drift (section 4.7).
 

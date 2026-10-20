@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import DetClass, Image, Project, ReviewStatus
+from ..models import Annotation, DetClass, Image, Job, JobStatus, Project, ReviewStatus
 from ..schemas import (NAME_PATTERN, BulkClassCreate, BulkClassResult, ClassCreate, ClassOut, ProjectCreate,
                        ProjectOut, StatRow)
 
@@ -19,11 +19,11 @@ DEFAULT_NEGATIVES = ["birds", "aircraft", "helicopters", "balloons", "empty-sky"
 def add_class(db: Session, project: Project, name: str, is_negative: bool) -> DetClass:
     index = None
     if not is_negative:
-        index = db.scalar(
-            select(func.count()).select_from(DetClass).where(
-                DetClass.project_id == project.id, DetClass.is_negative.is_(False)
-            )
+        # max + 1, not a count: a removed class leaves a gap, and counting would hand a new class a live class's index.
+        top = db.scalar(
+            select(func.max(DetClass.index)).where(DetClass.project_id == project.id, DetClass.is_negative.is_(False))
         )
+        index = 0 if top is None else top + 1
     cls = DetClass(project_id=project.id, name=name, is_negative=is_negative, index=index)
     db.add(cls)
     db.flush()
@@ -106,6 +106,25 @@ def create_classes_bulk(project_id: int, body: BulkClassCreate, db: Session = De
     return result
 
 
+@router.delete("/{project_id}/classes/{class_id}", status_code=204)
+def delete_class(project_id: int, class_id: int, db: Session = Depends(get_db)):
+    """Remove a class nothing uses. Refused while it has images, boxes, or a queued/running scrape job aimed at it."""
+    get_project(db, project_id)
+    cls = db.get(DetClass, class_id)
+    if cls is None or cls.project_id != project_id:
+        raise HTTPException(404, "class not found")
+    images = db.scalar(select(func.count()).select_from(Image).where(Image.class_id == class_id))
+    boxes = db.scalar(select(func.count()).select_from(Annotation).where(Annotation.class_id == class_id))
+    if images or boxes:
+        raise HTTPException(409, f"Class '{cls.name}' is still in use ({images} images, {boxes} boxes). "
+                                 "A class can only be removed once nothing uses it.")
+    active = db.scalars(select(Job).where(Job.project_id == project_id, Job.status.in_((JobStatus.queued, JobStatus.running)))).all()
+    if any(j.params.get("class_id") == class_id for j in active):
+        raise HTTPException(409, f"A scrape job for '{cls.name}' is queued or running. Cancel it first.")
+    db.delete(cls)  # dataset versions are self-contained snapshots, so existing ones are unaffected
+    db.commit()
+
+
 @router.get("/{project_id}/stats", response_model=list[StatRow])
 def project_stats(project_id: int, db: Session = Depends(get_db)):
     project = get_project(db, project_id)
@@ -126,4 +145,13 @@ def project_stats(project_id: int, db: Session = Depends(get_db)):
     )
     for class_id, status, n in by_review:
         setattr(rows[class_id], status.value, n)
+    box_counts = db.execute(
+        select(Annotation.class_id, func.count())
+        .join(Image, Image.id == Annotation.image_id)
+        .where(Image.project_id == project_id)
+        .group_by(Annotation.class_id)
+    )
+    for class_id, n in box_counts:
+        if class_id in rows:
+            rows[class_id].boxes = n
     return list(rows.values())

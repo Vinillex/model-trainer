@@ -66,6 +66,7 @@ class StatRow(BaseModel):
     generated: int = 0
     pending: int = 0
     rejected: int = 0
+    boxes: int = 0  # boxes drawn with this class (on any image); a class that has any can't be removed
 
 
 class BulkClassCreate(BaseModel):

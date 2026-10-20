@@ -46,7 +46,7 @@ export default function ProjectPage() {
 
       <section className="space-y-3">
         <h2 className="text-lg font-medium">Dataset</h2>
-        <StatsTable projectId={projectId} rows={stats} />
+        <StatsTable projectId={projectId} rows={stats} onChanged={() => { loadProject(); loadStats(); }} />
         <ClassForm projectId={projectId} onAdded={() => { loadProject(); loadStats(); }} />
       </section>
 
