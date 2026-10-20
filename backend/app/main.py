@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import annotations, images, jobs as jobs_api, projects
+from .api import annotations, datasets as datasets_api, images, jobs as jobs_api, projects
 from . import jobs
 from .config import settings
 from .db import Base, engine
@@ -29,6 +29,7 @@ app.include_router(projects.router)
 app.include_router(images.router)
 app.include_router(annotations.router)
 app.include_router(jobs_api.router)
+app.include_router(datasets_api.router)
 
 
 @app.get("/health")

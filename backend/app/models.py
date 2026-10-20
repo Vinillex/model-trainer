@@ -188,3 +188,21 @@ class SearchLog(Base):
     results: Mapped[int] = mapped_column(Integer)  # 0 means the query ran out of results
     job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class DatasetVersion(Base):
+    """A frozen snapshot of the reviewed images and their boxes, with a train/val/test split.
+
+    The snapshot itself is a manifest.json in storage; later edits, deletions or new classes never change it.
+    """
+
+    __tablename__ = "dataset_versions"
+    __table_args__ = (UniqueConstraint("project_id", "name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    config: Mapped[dict] = mapped_column(JSON, default=dict)  # split ratios, seed, class list
+    stats: Mapped[dict] = mapped_column(JSON, default=dict)  # counts per split/class, warnings
+    manifest_key: Mapped[str] = mapped_column(String(512))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

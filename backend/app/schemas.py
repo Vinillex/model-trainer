@@ -159,3 +159,28 @@ class SerpApiAccount(BaseModel):
     plan_searches_left: int | None
     total_searches_left: int | None
     account_rate_limit_per_hour: int | None
+
+
+class DatasetCreate(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=120)  # defaults to v1, v2, ...
+    val_ratio: float = Field(0.1, ge=0, le=0.5)
+    test_ratio: float = Field(0.1, ge=0, le=0.5)
+    seed: int = 42
+    include_negatives: bool = True  # hard-negative images become background (empty-label) training images
+
+    @model_validator(mode="after")
+    def _leaves_room_for_train(self):
+        if self.val_ratio + self.test_ratio > 0.6:
+            raise ValueError("val_ratio + test_ratio must be at most 0.6")
+        return self
+
+
+class DatasetOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    project_id: int
+    name: str
+    created_at: datetime
+    config: dict
+    stats: dict
