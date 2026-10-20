@@ -1,11 +1,12 @@
 """Image scraping: SerpAPI Google Images search -> download -> validate/dedupe -> store as `scraped` images."""
 
+import hashlib
 import ipaddress
 import socket
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 from sqlalchemy import select
@@ -14,7 +15,7 @@ from sqlalchemy.orm import Session
 from . import imagehash
 from .api.images import NearDuplicate, ingest_image
 from .config import settings
-from .models import DetClass, Image, ImageHash, Job, ScrapeRecord, Source
+from .models import DetClass, Image, ImageHash, Job, ScrapedUrl, ScrapeRecord, SearchLog, Source, UrlOutcome
 from .storage import get_storage
 
 USER_AGENT = "Mozilla/5.0 (compatible; model-trainer-dataset-builder)"
@@ -72,6 +73,40 @@ class SerpApiClient:
             results.append(SearchResult(original=r["original"], page_url=r.get("link"), title=r.get("title"),
                                         width=r.get("original_width"), height=r.get("original_height")))
         return results
+
+
+ACCOUNT_FIELDS = ("plan_name", "searches_per_month", "this_month_usage", "plan_searches_left",
+                  "total_searches_left", "account_rate_limit_per_hour")
+
+
+def fetch_account(api_key: str, http: httpx.Client | None = None, url: str | None = None) -> dict:
+    """Plan and quota from SerpAPI's Account API. It's free and doesn't count as a search.
+
+    Only whitelisted plan fields are returned (the raw response also holds the key and account email).
+    """
+    http = http or httpx.Client(timeout=20)
+    try:
+        resp = http.get(url or settings.serpapi_account_url, params={"api_key": api_key})
+    except httpx.HTTPError as e:
+        raise SearchError(f"SerpAPI account request failed ({type(e).__name__})") from None
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    if resp.status_code != 200 or not isinstance(body, dict) or body.get("error"):
+        detail = body.get("error") if isinstance(body, dict) else None
+        raise SearchError(f"SerpAPI account HTTP {resp.status_code}: {detail or 'no details'}")
+    return {k: body.get(k) for k in ACCOUNT_FIELDS}
+
+
+def url_key(url: str) -> str:
+    """Stable key for 'have we seen this image URL': scheme/host lower-cased, fragment dropped."""
+    parts = urlsplit(url.strip())
+    return hashlib.sha256(urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", parts.query, "")).encode()).hexdigest()
+
+
+def normalize_query(query: str) -> str:
+    return " ".join(query.lower().split())
 
 
 def _check_public(url: str) -> None:
@@ -137,46 +172,67 @@ def _load_hashes(db: Session, project_id: int) -> list[int]:
     return [int(h, 16) for h in rows]
 
 
+def _known_url_keys(db: Session, project_id: int) -> set[str]:
+    """URLs not worth downloading again: everything tried before except transient download failures."""
+    keys = set(db.scalars(select(ScrapedUrl.url_sha).where(ScrapedUrl.project_id == project_id,
+                                                          ScrapedUrl.outcome != UrlOutcome.download_failed)))
+    # Images scraped before the ledger existed only have a provenance record.
+    keys.update(url_key(u) for u in db.scalars(select(ScrapeRecord.original_url).join(Image).where(Image.project_id == project_id)))
+    return keys
+
+
 def run_scrape(db: Session, job: Job, search: Callable[[str, int], list[SearchResult]],
                fetch: Callable[[str], bytes]) -> None:
     """Execute a scrape job. Progress counters are written to job.progress after every image, so the UI can poll."""
     params = job.params
     cls = db.get(DetClass, params["class_id"])
+    query = normalize_query(params["query"])
     max_images, max_pages = params["max_images"], params["max_pages"]
+    start_page = params.get("start_page", 0)
     min_side, near_dist = params["min_side"], params["near_dup_distance"]
     counters = dict.fromkeys(COUNTERS, 0)
 
-    seen_urls = set(db.scalars(select(ScrapeRecord.original_url).join(Image).where(Image.project_id == job.project_id)))
+    known = _known_url_keys(db, job.project_id) if params.get("skip_known_urls", True) else set()
     hashes = _load_hashes(db, job.project_id)
     near = (lambda h: any(imagehash.distance(h, x) <= near_dist for x in hashes)) if near_dist > 0 else None
 
     def publish():
-        job.progress = {**counters, "target": max_images}
+        job.progress = {**counters, "target": max_images, "start_page": start_page}
         db.commit()
 
     def cancelled() -> bool:
         db.refresh(job)
         return job.cancel_requested
 
+    def record(r: SearchResult, outcome: UrlOutcome) -> None:
+        key = url_key(r.original)
+        row = db.scalar(select(ScrapedUrl).where(ScrapedUrl.project_id == job.project_id, ScrapedUrl.url_sha == key))
+        if row is None:
+            db.add(ScrapedUrl(project_id=job.project_id, url_sha=key, url=r.original, outcome=outcome, job_id=job.id))
+        else:  # a retried failure
+            row.outcome, row.job_id = outcome, job.id
+
     publish()
-    page = 0
-    while counters["added"] < max_images and page < max_pages and not cancelled():
+    page = start_page
+    while counters["added"] < max_images and page < start_page + max_pages and not cancelled():
         results = search(params["query"], page)
+        db.add(SearchLog(project_id=job.project_id, query=query[:300], page=page, results=len(results), job_id=job.id))
         page += 1
-        counters["pages"] = page
+        counters["pages"] += 1
         if not results:
             break  # ran out of results
         counters["candidates"] += len(results)
 
         todo = []
         for r in results:
-            if r.original in seen_urls:
+            key = url_key(r.original)
+            if key in known:
                 counters["already_scraped"] += 1
             elif r.width and r.height and min(r.width, r.height) < min_side:
                 counters["too_small"] += 1  # cheap pre-filter from the search metadata: skip the download
             else:
                 todo.append(r)
-                seen_urls.add(r.original)
+                known.add(key)  # also catches the same URL appearing twice in one job
         publish()
 
         chunk_size = settings.scrape_download_workers * 2
@@ -194,6 +250,7 @@ def run_scrape(db: Session, job: Job, search: Callable[[str, int], list[SearchRe
                         data = future.result()
                     except FetchError:
                         counters["download_failed"] += 1
+                        record(r, UrlOutcome.download_failed)
                         publish()
                         continue
                     host = urlparse(r.page_url or "").hostname
@@ -202,17 +259,21 @@ def run_scrape(db: Session, job: Job, search: Callable[[str, int], list[SearchRe
                                              min_side=min_side, is_near_duplicate=near)
                     except NearDuplicate:
                         counters["near_duplicates"] += 1
+                        record(r, UrlOutcome.near_duplicate)
                     except ValueError:
                         counters["rejected"] += 1
+                        record(r, UrlOutcome.rejected)
                     else:
                         if image is None:
                             counters["duplicates"] += 1
+                            record(r, UrlOutcome.duplicate)
                         else:
                             image.scrape_record = ScrapeRecord(job_id=job.id, query=params["query"][:300],
                                                                original_url=r.original[:2048], title=(r.title or None) and r.title[:500],
                                                                page_url=(r.page_url or None) and r.page_url[:2048])
                             hashes.append(int(image.hash.dhash, 16))
                             counters["added"] += 1
+                            record(r, UrlOutcome.added)
                     publish()
         finally:
             # Don't wait for downloads we no longer want (stop, cancel, or reached max_images).

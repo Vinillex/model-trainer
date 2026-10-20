@@ -4,8 +4,9 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
-from ..models import DetClass, Job, JobStatus
-from ..schemas import JobOut, ScrapeJobCreate
+from ..models import DetClass, Job, JobStatus, SearchLog
+from ..schemas import JobOut, ScrapeJobCreate, SearchHistory, SerpApiAccount
+from ..scrape import SearchError, fetch_account, normalize_query
 from .projects import get_project
 
 router = APIRouter(tags=["jobs"])
@@ -24,6 +25,28 @@ def create_scrape_job(project_id: int, body: ScrapeJobCreate, db: Session = Depe
     db.add(job)
     db.commit()
     return job
+
+
+@router.get("/projects/{project_id}/searches", response_model=SearchHistory)
+def search_history(project_id: int, query: str = Query(min_length=1, max_length=300), db: Session = Depends(get_db)):
+    """Which result pages of this query were already searched, so the next job can start where the last one stopped."""
+    get_project(db, project_id)
+    q = normalize_query(query)
+    rows = db.execute(select(SearchLog.page, SearchLog.results).where(SearchLog.project_id == project_id, SearchLog.query == q)).all()
+    pages = sorted({page for page, _ in rows})
+    return SearchHistory(query=q, pages_searched=pages, next_page=pages[-1] + 1 if pages else 0,
+                         exhausted_at=min((page for page, n in rows if n == 0), default=None))
+
+
+@router.get("/serpapi/account", response_model=SerpApiAccount)
+def serpapi_account():
+    """Remaining SerpAPI quota. Asking is free: SerpAPI doesn't count Account API calls as searches."""
+    if not settings.serpapi_key:
+        raise HTTPException(503, "SerpAPI is not configured: set MT_SERPAPI_KEY in backend/.env and restart the backend")
+    try:
+        return fetch_account(settings.serpapi_key)
+    except SearchError as e:
+        raise HTTPException(502, str(e))
 
 
 @router.get("/projects/{project_id}/jobs", response_model=list[JobOut])

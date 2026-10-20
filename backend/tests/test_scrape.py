@@ -194,7 +194,7 @@ def test_run_scrape_filters_and_stores(client, project):
     with client.session_factory() as db:
         job = db.get(Job, job_id)
         assert job.progress == {"pages": 2, "candidates": 9, "added": 2, "duplicates": 1, "near_duplicates": 2,
-                                "already_scraped": 0, "too_small": 1, "download_failed": 1, "rejected": 2, "target": 10}
+                                "already_scraped": 0, "too_small": 1, "download_failed": 1, "rejected": 2, "target": 10, "start_page": 0}
         scraped = db.scalars(select(Image).where(Image.source == Source.scraped).order_by(Image.id)).all()
         assert [i.scrape_record.original_url for i in scraped] == ["https://a.test/new2.jpg", "https://g.test/new3.jpg"]
         first = scraped[0]
@@ -203,12 +203,14 @@ def test_run_scrape_filters_and_stores(client, project):
         assert first.group_key == "a.test" and first.review_status.value == "pending" and first.class_id == ids["multirotor"]
         assert db.query(ImageHash).count() == 3  # the upload was backfilled, both scraped images hashed
 
-    # A re-run skips URLs it already scraped without downloading them again.
+    # A re-run never downloads a URL it already tried, whatever happened to it the first time:
+    # stored, exact duplicate, near-duplicate or rejected. Only the failed download is retried.
     job2 = make_job(client, pid, ids["multirotor"])
     _, fetched2 = run(client, job2, pages, downloads)
-    assert "https://a.test/new2.jpg" not in fetched2 and "https://g.test/new3.jpg" not in fetched2
+    assert fetched2 == ["https://d.test/broken.jpg"]
     with client.session_factory() as db:
-        assert db.get(Job, job2).progress["already_scraped"] == 2
+        p2 = db.get(Job, job2).progress
+        assert (p2["already_scraped"], p2["download_failed"], p2["too_small"], p2["added"]) == (7, 1, 1, 0)
 
 
 def test_run_scrape_stops_at_max_images_and_max_pages(client, project):
@@ -404,7 +406,7 @@ def test_scrape_job_api(client, project, monkeypatch):
     job = client.post(url, json=body).json()
     assert job["status"] == "queued" and job["type"] == "scrape"
     assert job["params"] == {"class_id": ids["multirotor"], "query": "fpv drone", "max_images": 50, "max_pages": 3,
-                             "min_side": 200, "near_dup_distance": 4}
+                             "min_side": 200, "near_dup_distance": 4, "start_page": 0, "skip_known_urls": True}
     assert SECRET not in str(job)
 
     assert [j["id"] for j in client.get(f"/projects/{pid}/jobs").json()] == [job["id"]]
@@ -422,3 +424,137 @@ def test_scrape_job_api(client, project, monkeypatch):
         db.commit()
     r = client.post(f"/jobs/{running['id']}/cancel").json()
     assert r["status"] == "running" and r["cancel_requested"] is True  # asked to stop at its next checkpoint
+
+
+# ---------- "never download the same image twice" ----------
+
+def test_known_urls_option_off_reattempts_but_never_stores_twice(client, project):
+    pid, ids = project
+    downloads = {"https://a.test/1.jpg": photo(11), "https://b.test/2.jpg": photo(12)}
+    pages = [[sr(u) for u in downloads]]
+    run(client, make_job(client, pid, ids["multirotor"]), pages, downloads)
+
+    second = make_job(client, pid, ids["multirotor"], skip_known_urls=False)
+    _, fetched = run(client, second, pages, downloads)
+    assert sorted(fetched) == sorted(downloads)  # explicitly asked to look again...
+    with client.session_factory() as db:
+        assert db.get(Job, second).progress["duplicates"] == 2 and db.query(Image).count() == 2  # ...but nothing doubled up
+
+
+def test_url_stays_known_after_its_image_is_deleted(client, project):
+    pid, ids = project
+    downloads = {"https://a.test/1.jpg": photo(21)}
+    pages = [[sr("https://a.test/1.jpg")]]
+    run(client, make_job(client, pid, ids["multirotor"]), pages, downloads)
+    image_id = client.get(f"/projects/{pid}/images").json()[0]["id"]
+    client.delete(f"/images/{image_id}")  # you deleted it because you didn't want it...
+
+    _, fetched = run(client, make_job(client, pid, ids["multirotor"]), pages, downloads)
+    assert fetched == []  # ...so it must not come back on the next run
+
+
+def test_images_scraped_before_the_ledger_existed_are_still_skipped(client, project):
+    pid, ids = project
+    downloads = {"https://a.test/1.jpg": photo(31)}
+    pages = [[sr("https://a.test/1.jpg")]]
+    run(client, make_job(client, pid, ids["multirotor"]), pages, downloads)
+    from app.models import ScrapedUrl
+
+    with client.session_factory() as db:
+        db.query(ScrapedUrl).delete()  # as in a database from before the ledger
+        db.commit()
+    _, fetched = run(client, make_job(client, pid, ids["multirotor"]), pages, downloads)
+    assert fetched == []  # the provenance record still says we have it
+
+
+def test_url_key_ignores_case_and_fragment_but_not_query():
+    from app.scrape import url_key
+
+    assert url_key("HTTPS://Example.COM/a.jpg#frag") == url_key("https://example.com/a.jpg")
+    assert url_key("https://example.com/a.jpg?w=1") != url_key("https://example.com/a.jpg?w=2")
+
+
+# ---------- start page, search history ----------
+
+def test_start_page_and_search_log(client, project):
+    pid, ids = project
+    pages = {3: [sr("https://p3.test/1.jpg")], 4: [sr("https://p4.test/1.jpg")]}  # page 5 returns nothing
+    downloads = {"https://p3.test/1.jpg": photo(41), "https://p4.test/1.jpg": photo(42)}
+    searched = []
+
+    def search(query, page):
+        searched.append(page)
+        return pages.get(page, [])
+
+    job_id = make_job(client, pid, ids["multirotor"], start_page=3, max_pages=5, query="  Quad   Copter ")
+    with client.session_factory() as db:
+        run_scrape(db, db.get(Job, job_id), search, lambda u: downloads[u])
+    assert searched == [3, 4, 5]  # began at the requested page and stopped at the first empty one
+    with client.session_factory() as db:
+        progress = db.get(Job, job_id).progress
+        assert (progress["pages"], progress["start_page"], progress["added"]) == (3, 3, 2)
+
+    h = client.get(f"/projects/{pid}/searches", params={"query": "quad copter"}).json()
+    assert h == {"query": "quad copter", "pages_searched": [3, 4, 5], "next_page": 6, "exhausted_at": 5}
+    assert client.get(f"/projects/{pid}/searches", params={"query": "never searched"}).json() == \
+           {"query": "never searched", "pages_searched": [], "next_page": 0, "exhausted_at": None}
+
+
+def test_start_page_validation(client, project, monkeypatch):
+    pid, ids = project
+    monkeypatch.setattr(settings, "serpapi_key", SECRET)
+    url = f"/projects/{pid}/jobs/scrape"
+    body = {"class_id": ids["multirotor"], "query": "drone"}
+    assert client.post(url, json={**body, "start_page": 97, "max_pages": 3}).status_code == 201  # ijn 97..99
+    assert client.post(url, json={**body, "start_page": 98, "max_pages": 3}).status_code == 422  # would reach ijn 100
+    assert client.post(url, json={**body, "start_page": 100}).status_code == 422
+    assert client.post(url, json={**body, "start_page": -1}).status_code == 422
+
+
+# ---------- account / quota ----------
+
+def test_fetch_account_returns_only_plan_fields():
+    from app.scrape import fetch_account
+
+    body = {"account_email": "me@example.com", "api_key": SECRET, "plan_name": "Free Plan", "searches_per_month": 250,
+            "this_month_usage": 3, "plan_searches_left": 247, "total_searches_left": 247, "account_rate_limit_per_hour": 250}
+    seen = {}
+
+    def handler(request):
+        seen.update(request.url.params)
+        return httpx.Response(200, json=body)
+
+    out = fetch_account(SECRET, httpx.Client(transport=httpx.MockTransport(handler)), "https://serp.test/account.json")
+    assert seen == {"api_key": SECRET}
+    assert out["plan_name"] == "Free Plan" and out["total_searches_left"] == 247
+    assert "me@example.com" not in str(out) and SECRET not in str(out)
+
+    with pytest.raises(SearchError, match="HTTP 401: Invalid API key") as e:
+        fetch_account(SECRET, httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(401, json={"error": "Invalid API key."}))))
+    assert SECRET not in str(e.value)
+
+    def boom(request):
+        raise httpx.ConnectError(f"cannot reach {request.url}")
+
+    with pytest.raises(SearchError) as e:
+        fetch_account(SECRET, httpx.Client(transport=httpx.MockTransport(boom)))
+    assert SECRET not in str(e.value) and SECRET not in repr(e.value.__cause__)
+
+
+def test_account_endpoint(client, monkeypatch):
+    from app.api import jobs as jobs_api
+
+    monkeypatch.setattr(settings, "serpapi_key", None)
+    assert client.get("/serpapi/account").status_code == 503
+
+    monkeypatch.setattr(settings, "serpapi_key", SECRET)
+    monkeypatch.setattr(jobs_api, "fetch_account", lambda key: {"plan_name": "Free Plan", "searches_per_month": 250,
+                        "this_month_usage": 2, "plan_searches_left": 248, "total_searches_left": 248, "account_rate_limit_per_hour": 250})
+    assert client.get("/serpapi/account").json()["total_searches_left"] == 248
+
+    def fail(key):
+        raise SearchError("SerpAPI account HTTP 401: Invalid API key.")
+
+    monkeypatch.setattr(jobs_api, "fetch_account", fail)
+    r = client.get("/serpapi/account")
+    assert r.status_code == 502 and "Invalid API key" in r.json()["detail"] and SECRET not in r.text

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .models import AnnotationStatus, JobStatus, ReviewStatus, Source
 
@@ -115,10 +115,18 @@ class ScrapeJobCreate(BaseModel):
     class_id: int  # images are filed under this class (a hard-negative category is fine, e.g. birds)
     query: str = Field(min_length=1, max_length=300)
     max_images: int = Field(50, ge=1, le=500)
-    # Each page is one SerpAPI search (~100 results). This caps how many searches a job can spend.
-    max_pages: int = Field(3, ge=1, le=20)
+    # SerpAPI `ijn` is 0-based; the UI shows it 1-based. Each page is one SerpAPI search.
+    start_page: int = Field(0, ge=0, le=99)
+    max_pages: int = Field(3, ge=1, le=20)  # caps how many searches a job can spend
     min_side: int = Field(200, ge=32, le=4000)  # skip images whose shorter side is smaller, in pixels
     near_dup_distance: int = Field(4, ge=0, le=16)  # dHash bits; 0 keeps near-duplicates
+    skip_known_urls: bool = True  # don't re-download URLs an earlier job already tried
+
+    @model_validator(mode="after")
+    def _within_serpapi_page_range(self):
+        if self.start_page + self.max_pages > 100:
+            raise ValueError("start_page + max_pages must be at most 100 (SerpAPI allows ijn 0-99)")
+        return self
 
 
 class JobOut(BaseModel):
@@ -135,3 +143,19 @@ class JobOut(BaseModel):
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+
+
+class SearchHistory(BaseModel):
+    query: str  # normalized
+    pages_searched: list[int]  # 0-based, ascending
+    next_page: int  # first page after the highest one already searched
+    exhausted_at: int | None  # a page that came back empty: the query has no results beyond it
+
+
+class SerpApiAccount(BaseModel):
+    plan_name: str | None
+    searches_per_month: int | None
+    this_month_usage: int | None
+    plan_searches_left: int | None
+    total_searches_left: int | None
+    account_rate_limit_per_hour: int | None

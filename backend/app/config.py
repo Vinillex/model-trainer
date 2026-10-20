@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # Scraping (SerpAPI Google Images). Set MT_SERPAPI_KEY in backend/.env.
     serpapi_key: str | None = None
     serpapi_url: str = "https://serpapi.com/search"
+    serpapi_account_url: str = "https://serpapi.com/account.json"  # free to call; doesn't use quota
     scrape_max_bytes: int = 15 * 1024 * 1024
     scrape_download_workers: int = 8
     # Dev/test only: allow fetching images from loopback/private addresses (normally blocked as SSRF).

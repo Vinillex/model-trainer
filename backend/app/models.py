@@ -148,3 +148,43 @@ class Job(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class UrlOutcome(str, enum.Enum):
+    added = "added"
+    duplicate = "duplicate"  # same bytes as an image already in the project
+    near_duplicate = "near_duplicate"
+    rejected = "rejected"  # not decodable / unsupported / below the minimum size once downloaded
+    download_failed = "download_failed"  # retried by later jobs: failures are often transient
+
+
+class ScrapedUrl(Base):
+    """Every image URL a scrape job has tried, whatever happened. Later jobs skip these without downloading.
+
+    Deliberately NOT removed when the image is deleted: a deleted image is usually one you didn't want.
+    """
+
+    __tablename__ = "scraped_urls"
+    __table_args__ = (UniqueConstraint("project_id", "url_sha"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    url_sha: Mapped[str] = mapped_column(String(64))  # of the normalized URL; keeps the unique index small
+    url: Mapped[str] = mapped_column(Text)
+    outcome: Mapped[UrlOutcome] = mapped_column(Enum(UrlOutcome))
+    job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class SearchLog(Base):
+    """One row per search-result page fetched, so we know which pages of a query were already spent."""
+
+    __tablename__ = "search_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    query: Mapped[str] = mapped_column(String(300), index=True)  # normalized: lowercase, single spaces
+    page: Mapped[int] = mapped_column(Integer)  # SerpAPI `ijn`, 0-based
+    results: Mapped[int] = mapped_column(Integer)  # 0 means the query ran out of results
+    job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

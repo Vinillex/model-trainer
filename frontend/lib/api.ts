@@ -82,6 +82,24 @@ export interface ScrapeParams {
   max_pages: number;
   min_side: number;
   near_dup_distance: number;
+  start_page: number; // 0-based (SerpAPI ijn)
+  skip_known_urls: boolean;
+}
+
+export interface SearchHistory {
+  query: string;
+  pages_searched: number[]; // 0-based
+  next_page: number;
+  exhausted_at: number | null;
+}
+
+export interface SerpApiAccount {
+  plan_name: string | null;
+  searches_per_month: number | null;
+  this_month_usage: number | null;
+  plan_searches_left: number | null;
+  total_searches_left: number | null;
+  account_rate_limit_per_hour: number | null;
 }
 
 export interface Job {
@@ -142,6 +160,9 @@ export const api = {
     req<ImageDetail>(`/images/${id}/annotations`, json("PUT", { boxes, review_status: reviewStatus ?? null })),
   createScrapeJob: (projectId: number, p: Partial<ScrapeParams> & Pick<ScrapeParams, "class_id" | "query">) =>
     req<Job>(`/projects/${projectId}/jobs/scrape`, json("POST", p)),
+  searchHistory: (projectId: number, query: string) =>
+    req<SearchHistory>(`/projects/${projectId}/searches?${new URLSearchParams({ query })}`),
+  serpapiAccount: () => req<SerpApiAccount>("/serpapi/account"),
   listJobs: (projectId: number) => req<Job[]>(`/projects/${projectId}/jobs?limit=10`),
   cancelJob: (id: number) => req<Job>(`/jobs/${id}/cancel`, { method: "POST" }),
   deleteImage: (id: number) => req<void>(`/images/${id}`, { method: "DELETE" }),
