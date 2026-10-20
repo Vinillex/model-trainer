@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import Gallery from "@/components/Gallery";
+import ClassForm from "@/components/ClassForm";
 import StatsTable from "@/components/StatsTable";
 import UploadBox from "@/components/UploadBox";
 import { api, type Project, type StatRow } from "@/lib/api";
@@ -13,8 +14,6 @@ export default function ProjectPage() {
   const [project, setProject] = useState<Project | null>(null);
   const [stats, setStats] = useState<StatRow[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [newClass, setNewClass] = useState("");
-  const [newNegative, setNewNegative] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const loadProject = useCallback(() => {
@@ -26,20 +25,6 @@ export default function ProjectPage() {
 
   useEffect(loadProject, [loadProject]);
   useEffect(loadStats, [loadStats, refreshKey]);
-
-  async function addClass(e: React.FormEvent) {
-    e.preventDefault();
-    setError(null);
-    try {
-      await api.createClass(projectId, newClass.trim(), newNegative);
-      setNewClass("");
-      setNewNegative(false);
-      loadProject();
-      loadStats();
-    } catch (err) {
-      setError((err as Error).message);
-    }
-  }
 
   if (error && !project) return <p className="text-red-600">{error}</p>;
   if (!project) return <p className="text-neutral-500">Loading…</p>;
@@ -56,22 +41,8 @@ export default function ProjectPage() {
 
       <section className="space-y-3">
         <h2 className="text-lg font-medium">Dataset</h2>
-        <StatsTable rows={stats} />
-        <form onSubmit={addClass} className="flex flex-wrap items-center gap-2">
-          <input
-            className="input w-48"
-            placeholder="new-class-name"
-            pattern="^[a-z0-9][a-z0-9_\-]*$"
-            title="lowercase letters, digits, - and _"
-            value={newClass}
-            onChange={(e) => setNewClass(e.target.value)}
-            required
-          />
-          <label className="flex items-center gap-1 text-sm">
-            <input type="checkbox" checked={newNegative} onChange={(e) => setNewNegative(e.target.checked)} /> hard negative
-          </label>
-          <button className="btn">Add class</button>
-        </form>
+        <StatsTable projectId={projectId} rows={stats} />
+        <ClassForm projectId={projectId} onAdded={() => { loadProject(); loadStats(); }} />
       </section>
 
       <section className="space-y-3">

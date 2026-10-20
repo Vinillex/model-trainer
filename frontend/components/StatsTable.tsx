@@ -1,6 +1,7 @@
+import Link from "next/link";
 import { SOURCES, type StatRow } from "@/lib/api";
 
-export default function StatsTable({ rows }: { rows: StatRow[] }) {
+export default function StatsTable({ projectId, rows }: { projectId: number; rows: StatRow[] }) {
   const total = (r: StatRow) => r.uploaded + r.scraped + r.generated;
   return (
     <table className="w-full text-sm">
@@ -12,7 +13,8 @@ export default function StatsTable({ rows }: { rows: StatRow[] }) {
               {s}
             </th>
           ))}
-          <th className="pl-2 text-right">Total</th>
+          <th className="px-2 text-right">Total</th>
+          <th className="pl-2 text-right">To review</th>
         </tr>
       </thead>
       <tbody>
@@ -27,7 +29,16 @@ export default function StatsTable({ rows }: { rows: StatRow[] }) {
                 {r[s]}
               </td>
             ))}
-            <td className="pl-2 text-right tabular-nums font-medium">{total(r)}</td>
+            <td className="px-2 text-right font-medium tabular-nums">{total(r)}</td>
+            <td className="pl-2 text-right tabular-nums">
+              {r.pending > 0 ? (
+                <Link href={`/projects/${projectId}/review?class=${r.class_id}`} className="text-blue-500 hover:underline">
+                  {r.pending} →
+                </Link>
+              ) : (
+                <span className="text-neutral-500">{r.is_negative ? "–" : 0}</span>
+              )}
+            </td>
           </tr>
         ))}
       </tbody>

@@ -17,6 +17,8 @@ export interface Project {
   classes: DetClass[];
 }
 
+export type ReviewStatus = "pending" | "reviewed" | "rejected";
+
 export interface ImageRow {
   id: number;
   class_id: number;
@@ -25,7 +27,33 @@ export interface ImageRow {
   width: number;
   height: number;
   group_key: string | null;
+  review_status: ReviewStatus;
   created_at: string;
+}
+
+/** Normalized YOLO-style box: centre and size as fractions of the image. */
+export interface BoxIn {
+  class_id: number;
+  cx: number;
+  cy: number;
+  w: number;
+  h: number;
+}
+
+export interface Annotation extends BoxIn {
+  id: number;
+  status: "auto" | "auto_exact" | "reviewed" | "rejected";
+  confidence: number | null;
+}
+
+export interface ImageDetail extends ImageRow {
+  annotations: Annotation[];
+}
+
+export interface BulkClassResult {
+  added: DetClass[];
+  skipped: string[];
+  invalid: string[];
 }
 
 export interface UploadResult {
@@ -41,6 +69,8 @@ export interface StatRow {
   uploaded: number;
   scraped: number;
   generated: number;
+  pending: number;
+  rejected: number;
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -67,11 +97,14 @@ export const api = {
   getProject: (id: number) => req<Project>(`/projects/${id}`),
   createClass: (projectId: number, name: string, isNegative: boolean) =>
     req<DetClass>(`/projects/${projectId}/classes`, json("POST", { name, is_negative: isNegative })),
+  createClasses: (projectId: number, names: string[], isNegative: boolean) =>
+    req<BulkClassResult>(`/projects/${projectId}/classes/bulk`, json("POST", { names, is_negative: isNegative })),
   stats: (projectId: number) => req<StatRow[]>(`/projects/${projectId}/stats`),
-  listImages: (projectId: number, p: { classId?: number; source?: Source; limit: number; offset: number }) => {
+  listImages: (projectId: number, p: { classId?: number; source?: Source; reviewStatus?: ReviewStatus; limit: number; offset: number }) => {
     const q = new URLSearchParams({ limit: String(p.limit), offset: String(p.offset) });
     if (p.classId !== undefined) q.set("class_id", String(p.classId));
     if (p.source) q.set("source", p.source);
+    if (p.reviewStatus) q.set("review_status", p.reviewStatus);
     return req<ImageRow[]>(`/projects/${projectId}/images?${q}`);
   },
   upload: (projectId: number, classId: number, files: File[]) => {
@@ -79,5 +112,8 @@ export const api = {
     files.forEach((f) => form.append("files", f));
     return req<UploadResult>(`/projects/${projectId}/classes/${classId}/images`, { method: "POST", body: form });
   },
+  getImage: (id: number) => req<ImageDetail>(`/images/${id}`),
+  putAnnotations: (id: number, boxes: BoxIn[], reviewStatus?: ReviewStatus) =>
+    req<ImageDetail>(`/images/${id}/annotations`, json("PUT", { boxes, review_status: reviewStatus ?? null })),
   deleteImage: (id: number) => req<void>(`/images/${id}`, { method: "DELETE" }),
 };

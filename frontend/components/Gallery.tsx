@@ -1,9 +1,11 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { SOURCES, api, imageUrl, type DetClass, type ImageRow, type Source } from "@/lib/api";
 
 const PAGE = 48;
+const STATUS_STYLE = { pending: "text-amber-500", reviewed: "text-green-500", rejected: "text-red-500" } as const;
 
 export default function Gallery({ projectId, classes, refreshKey, onChanged }: { projectId: number; classes: DetClass[]; refreshKey: number; onChanged: () => void }) {
   const [classId, setClassId] = useState<number | undefined>();
@@ -11,6 +13,7 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
   const [images, setImages] = useState<ImageRow[]>([]);
   const [more, setMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<number | null>(null);
   const className = (id: number) => classes.find((c) => c.id === id)?.name ?? id;
 
   const load = useCallback(
@@ -33,6 +36,7 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
   async function remove(id: number) {
     try {
       await api.deleteImage(id);
+      setConfirming(null);
       setImages((prev) => prev.filter((i) => i.id !== id));
       onChanged();
     } catch (e) {
@@ -65,23 +69,33 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
         {images.map((img) => (
           <figure key={img.id} className="group relative overflow-hidden rounded border border-neutral-300 dark:border-neutral-700">
-            {/* eslint-disable-next-line @next/next/no-img-element -- served by the API, not optimizable by next/image */}
-            <img src={imageUrl(img.id)} alt={`${className(img.class_id)} #${img.id}`} loading="lazy" className="aspect-square w-full object-cover" />
+            <Link href={`/projects/${projectId}/review?image=${img.id}`} title="Open in review screen">
+              {/* eslint-disable-next-line @next/next/no-img-element -- served by the API, not optimizable by next/image */}
+              <img src={imageUrl(img.id)} alt={`${className(img.class_id)} #${img.id}`} loading="lazy" className="aspect-square w-full object-cover" />
+            </Link>
             <figcaption className="flex items-center justify-between px-2 py-1 text-xs">
               <span>
                 {className(img.class_id)} · {img.source}
               </span>
-              <span className="text-neutral-500">
-                {img.width}×{img.height}
-              </span>
+              <span className={STATUS_STYLE[img.review_status]}>{img.review_status}</span>
             </figcaption>
-            <button
-              onClick={() => confirm("Delete this image?") && remove(img.id)}
-              className="absolute right-1 top-1 hidden rounded bg-black/70 px-1.5 py-0.5 text-xs text-white group-hover:block"
-              aria-label="Delete image"
-            >
-              Delete
-            </button>
+            {/* Sibling of the link, so clicking it never navigates. Stays visible while confirming. */}
+            <div className={`absolute right-1 top-1 gap-1 ${confirming === img.id ? "flex" : "hidden group-hover:flex"}`}>
+              {confirming === img.id ? (
+                <>
+                  <button onClick={() => remove(img.id)} className="rounded bg-red-600 px-1.5 py-0.5 text-xs text-white">
+                    Confirm delete
+                  </button>
+                  <button onClick={() => setConfirming(null)} className="rounded bg-black/70 px-1.5 py-0.5 text-xs text-white">
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button onClick={() => setConfirming(img.id)} className="rounded bg-black/70 px-1.5 py-0.5 text-xs text-white" aria-label="Delete image">
+                  Delete
+                </button>
+              )}
+            </div>
           </figure>
         ))}
       </div>
