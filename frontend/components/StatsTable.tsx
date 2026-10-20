@@ -61,7 +61,7 @@ export default function StatsTable({ projectId, rows, onChanged }: { projectId: 
               </td>
               <td className="whitespace-nowrap pl-2 text-right">
                 {!removable(r) ? (
-                  <span className="text-xs text-neutral-500" title="Remove or re-class its images and boxes first">
+                  <span className="text-xs text-neutral-500" title="Delete its images and boxes first">
                     in use
                   </span>
                 ) : confirming === r.class_id ? (

@@ -181,6 +181,7 @@ export default function ScrapePanel({ projectId, classes, onImagesChanged }: { p
             {busy ? "Starting…" : "Start scrape"}
           </button>
         </div>
+        <p className="text-xs text-neutral-500">The class only decides the folder and whether the images count as hard negatives. A search can return other kinds of drone too: in review, give each box its own class.</p>
 
         <div className="flex flex-wrap items-end gap-4 text-sm">
           <label>

@@ -108,12 +108,19 @@ def create_version(db: Session, project: Project, name: str | None, val_ratio: f
             continue
         rec: ScrapeRecord | None = img.scrape_record
         group = (rec.page_url if rec and rec.page_url else None) or img.group_key or f"image-{img.id}"
+        boxes = [[class_idx[a.class_id], a.cx, a.cy, a.w, a.h] for a in img.annotations
+                 if a.status in KEPT_BOX_STATUSES and a.class_id in class_idx]
+        # Balance the split by what the boxes say the image shows, not by the class it happened to be filed under: a mixed
+        # search filed under one class would otherwise leave the other classes' images to chance in val and test.
+        if boxes:
+            top = sorted(Counter(b[0] for b in boxes).items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+            stratum = classes[top].name
+        else:
+            stratum = NEGATIVE if cls.is_negative else cls.name
         items.append({
             "image_id": img.id, "key": img.storage_key, "sha256": img.sha256, "ext": img.storage_key.rsplit(".", 1)[-1],
             "width": img.width, "height": img.height, "source": img.source.value, "folder_class": cls.name,
-            "group": f"{img.source.value}:{group}", "stratum": NEGATIVE if cls.is_negative else cls.name,
-            "boxes": [[class_idx[a.class_id], a.cx, a.cy, a.w, a.h] for a in img.annotations
-                      if a.status in KEPT_BOX_STATUSES and a.class_id in class_idx],
+            "group": f"{img.source.value}:{group}", "stratum": stratum, "boxes": boxes,
         })
     if not items:
         raise ValueError("No reviewed images yet. Review some images first (pending and rejected images are never exported).")

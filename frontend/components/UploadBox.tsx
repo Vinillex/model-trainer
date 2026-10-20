@@ -40,6 +40,7 @@ export default function UploadBox({ projectId, classes, onDone }: { projectId: n
 
   return (
     <div className="space-y-3">
+      <p className="text-xs text-neutral-500">The class only decides the folder and whether the images count as hard negatives; each box you draw in review carries its own class.</p>
       <select className="input" value={classId} onChange={(e) => setClassId(e.target.value === "" ? "" : Number(e.target.value))}>
         <option value="">Select target class…</option>
         {classes.map((c) => (

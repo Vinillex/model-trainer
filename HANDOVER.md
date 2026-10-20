@@ -152,7 +152,7 @@ The API key never appears in errors or logs. Jobs run on the in-process worker t
 ### 4.4 Dataset versions (`datasets.py`, `yolo_export.py`)
 A version freezes the **reviewed** images and their boxes (only `reviewed`/`auto_exact` boxes) into a `manifest.json` in
 storage; later edits or deletions never change it. Split is **grouped** (images from the same source page/video stay
-together, so near-duplicates can't leak from train into val), **stratified per class**, deterministic by seed, and
+together, so near-duplicates can't leak from train into val), **stratified by the class of each image's boxes** (most common box class; the class an image was *filed under* is only a folder, so a mixed search filed under one class still gets every class into val/test; background images use their filing class), deterministic by seed, and
 generated images are train-only. Warnings are attached (empty val/test, class with no boxes, fewer than 20 boxes).
 Download gives a standard Ultralytics folder: `data.yaml`, `images/{train,val,test}`, `labels/...`.
 **Trap:** `data.yaml` says `path: .`, which Ultralytics resolves against *its own datasets directory*, not the yaml's

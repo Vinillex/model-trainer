@@ -271,3 +271,31 @@ def test_label_and_yaml_formatting():
     m = {"classes": [{"index": 0, "name": 'a "b"'}], "images": [{"split": "train"}]}
     y = data_yaml(m)
     assert 'names:\n  0: "a \\"b\\""' in y and "test:" not in y  # names are quoted/escaped, test omitted when empty
+
+
+@pytest.mark.parametrize("seed", range(1, 9))
+def test_split_is_balanced_by_the_class_of_the_boxes_not_the_class_the_image_was_filed_under(client, project, seed):
+    pid, ids = project
+    # One mixed search, so every image is filed under multirotor even though 10 of them show fixed-wing drones.
+    for _ in range(14):
+        add(client, pid, ids["multirotor"], [box(ids["multirotor"])])
+    for _ in range(10):
+        add(client, pid, ids["multirotor"], [box(ids["fixed-wing"], 0.3, 0.6)])
+    per_class = client.post(f"/projects/{pid}/datasets", json={"seed": seed}).json()["stats"]["per_class"]
+    for cls in ("multirotor", "fixed-wing"):
+        for split in ("val", "test"):
+            assert per_class[cls][split]["boxes"] > 0, f"{cls} is missing from {split} with seed {seed}"
+
+
+def test_an_image_is_balanced_by_its_most_common_box_class_and_background_images_by_their_filing(client, project):
+    pid, ids = project
+    for _ in range(6):                                                    # 2 fixed-wing boxes + 1 multirotor box: fixed-wing wins
+        add(client, pid, ids["multirotor"], [box(ids["fixed-wing"], 0.2), box(ids["fixed-wing"], 0.6), box(ids["multirotor"], 0.9)])
+    for _ in range(6):
+        add(client, pid, ids["multirotor"], [box(ids["multirotor"])])
+    for _ in range(4):
+        add(client, pid, ids["birds"])                                    # hard negatives keep their own stratum
+    v = client.post(f"/projects/{pid}/datasets", json={}).json()
+    st = v["stats"]
+    assert st["images"]["val"] > 0 and st["background_images"].get("val", 0) + st["background_images"].get("test", 0) >= 1
+    assert st["per_class"]["fixed-wing"]["val"]["boxes"] > 0 and st["per_class"]["multirotor"]["val"]["boxes"] > 0
