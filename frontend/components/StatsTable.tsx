@@ -7,7 +7,7 @@ import { SOURCES, api, type StatRow } from "@/lib/api";
 export default function StatsTable({ projectId, rows, onChanged }: { projectId: number; rows: StatRow[]; onChanged: () => void }) {
   const [confirming, setConfirming] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const total = (r: StatRow) => r.uploaded + r.scraped + r.generated;
+  const total = (r: StatRow) => r.uploaded + r.scraped + r.generated + r.imported;
   const removable = (r: StatRow) => total(r) === 0 && r.boxes === 0; // the server enforces this too
 
   async function remove(r: StatRow) {

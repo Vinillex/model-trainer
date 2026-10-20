@@ -199,6 +199,24 @@ everything except `/workers/*`, where it must present `MT_WORKER_TOKEN` (unset =
 binds `127.0.0.1` by default. **If you bind `0.0.0.0` so the Pi can connect, tell Vinit.** Still no user auth: anyone who
 can run a browser *on the machine* can do anything.
 
+### 4.6b Importing public datasets (`scripts/import_yolo.py`)
+`python -m scripts.import_yolo import <folder> --dataset <tag> --map UAV=multirotor --author "..." [--dry-run --sample-sheet out.jpg]`
+imports a YOLO-format export (Roboflow layout: `<split>/images`, `<split>/labels`, `data.yaml`) as **reviewed** images with boxes,
+source `imported`, stored under `raw/<class>/imported/`, with an `ImportRecord` (dataset, original name and split, URL, licence,
+author). It collapses augmented copies to one image per source frame, drops frames with no boxes, an unmapped class, or any box
+under `--min-box-px` (5), groups frames into **scenes** with a 12x12 colour-thumbnail descriptor (flip- and brightness-robust;
+a plain grayscale dHash chains unrelated skies into one giant group, measured on Anti-UAV), keeps at most `--max-per-scene` (20),
+clean frames first, and uses the scene as `group_key` so dataset versions never split a scene. The dataset's own train/valid/test
+split is ignored: **Anti-UAV's leaks** (84% of its valid images have a near-identical train image, because video frames were split
+at random; its filenames restart per split, so they say nothing about which video a frame is from).
+It backs up the live SQLite database first (online backup API, to `backend/data/backups/`), commits every 50 images, and a re-run
+adds nothing (SHA dedupe + deterministic selection). `rollback --dataset <tag>` removes the images, rows and any orphan files.
+The importer needs `numpy` (pinned). **Order matters:** the running backend must already know the `imported` source (restart it
+after pulling this code) *before* the first import, or every endpoint that loads those images fails.
+Imported images are **left out of the data bundle by default** (`bundle export --include-imported` to include them): they can be
+thousands of files and belong to someone else (see `DATA_LICENSES.md`). Dataset versions that contain them only download on a
+machine that has them.
+
 ### 4.7 The data bundle (`scripts/bundle.py`, `handover-data/`)
 `export` dumps **every table** to `db.json` (primary-key order, no timestamps, so diffs are stable and re-export is
 repeatable), copies every stored file under `storage/`, and writes `files.json` with SHA-256s. `import` verifies every

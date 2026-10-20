@@ -66,6 +66,7 @@ class StatRow(BaseModel):
     uploaded: int = 0
     scraped: int = 0
     generated: int = 0
+    imported: int = 0
     pending: int = 0
     rejected: int = 0
     boxes: int = 0  # boxes drawn with this class (on any image); a class that has any can't be removed

@@ -21,6 +21,7 @@ from sqlalchemy import JSON, DateTime, Engine, func, select
 from app.config import settings
 from app.db import Base
 from app import models  # noqa: F401 - registers every table on Base.metadata
+from app.models import Source
 from app.storage import LocalStorage, Storage, get_storage
 
 FORMAT = 1
@@ -59,8 +60,18 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def export_bundle(engine: Engine, storage_root: Path, out: Path) -> dict:
-    """Write the database and every stored file under `storage_root` into `out`. Safe to repeat: it replaces its own output."""
+def _is_imported_file(key: str) -> bool:
+    parts = key.split("/")
+    return len(parts) >= 5 and parts[0] == "projects" and parts[2] == "raw" and parts[4] == "imported"
+
+
+def export_bundle(engine: Engine, storage_root: Path, out: Path, include_imported: bool = False) -> dict:
+    """Write the database and every stored file under `storage_root` into `out`. Safe to repeat: it replaces its own output.
+
+    Images imported from public datasets (source "imported") are left out by default, with their boxes, hashes and import
+    records: they can be thousands of images, and they belong to someone else. Dataset versions that include them only
+    download on a machine that has them.
+    """
     if out.exists() and any(out.iterdir()) and not (out / DB_FILE).exists():
         raise BundleError(f"{out} isn't empty and doesn't look like a bundle; refusing to write into it")
     for name in (DB_FILE, FILES_FILE):
@@ -69,15 +80,27 @@ def export_bundle(engine: Engine, storage_root: Path, out: Path) -> dict:
     out.mkdir(parents=True, exist_ok=True)
 
     tables, counts = {}, {}
+    skip_ids: set[int] = set()
+    skip_keys: set[str] = set()
     with engine.connect() as conn:
+        if not include_imported:
+            images = Base.metadata.tables["images"]
+            for iid, key in conn.execute(select(images.c.id, images.c.storage_key).where(images.c.source == Source.imported)):
+                skip_ids.add(iid)
+                skip_keys.add(key)
         for table in Base.metadata.sorted_tables:
             rows = conn.execute(select(table).order_by(*table.primary_key.columns)).all()  # primary-key order: stable diffs
+            owner = "id" if table.name == "images" else "image_id" if "image_id" in table.c else None
+            if skip_ids and owner:
+                rows = [r for r in rows if r._mapping[table.c[owner]] not in skip_ids]  # the image's own rows and every child row
             tables[table.name] = [{c.name: _dump_value(c, row._mapping[c]) for c in table.columns} for row in rows]
             counts[table.name] = len(rows)
 
     files = {}
     for path in sorted(p for p in storage_root.rglob("*") if p.is_file() and not _is_junk(p)):
         key = path.relative_to(storage_root).as_posix()
+        if not include_imported and (key in skip_keys or _is_imported_file(key)):
+            continue  # includes files a crashed import left behind
         data = path.read_bytes()
         dest = out / STORAGE_DIR / key
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -86,7 +109,7 @@ def export_bundle(engine: Engine, storage_root: Path, out: Path) -> dict:
 
     _write_json(out / DB_FILE, {"format": FORMAT, "tables": tables})
     _write_json(out / FILES_FILE, files)
-    return {"tables": counts, "files": len(files), "bytes": sum(f["size"] for f in files.values())}
+    return {"tables": counts, "files": len(files), "bytes": sum(f["size"] for f in files.values()), "left_out_imported": len(skip_ids)}
 
 
 def import_bundle(engine: Engine, storage: Storage, bundle: Path) -> dict:
@@ -155,7 +178,9 @@ def _summary(result: dict) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("export", help="write the bundle").add_argument("--dir", type=Path, default=DEFAULT_DIR)
+    exp = sub.add_parser("export", help="write the bundle")
+    exp.add_argument("--dir", type=Path, default=DEFAULT_DIR)
+    exp.add_argument("--include-imported", action="store_true", help="also bundle images imported from public datasets (can be huge)")
     sub.add_parser("import", help="restore the bundle into an empty database").add_argument("--dir", type=Path, default=DEFAULT_DIR)
     args = ap.parse_args(argv)
     try:
@@ -163,8 +188,10 @@ def main(argv=None) -> int:
             if settings.storage_backend != "local":
                 raise BundleError("export reads local storage only (MT_STORAGE_BACKEND=local)")
             from app.db import engine
-            r = export_bundle(engine, LocalStorage(settings.local_storage_dir).root, args.dir)
+            r = export_bundle(engine, LocalStorage(settings.local_storage_dir).root, args.dir, args.include_imported)
             print(f"exported to {args.dir}: {_summary(r)} ({r['bytes'] / 2**20:.1f} MB)")
+            if r["left_out_imported"]:
+                print(f"left out {r['left_out_imported']} imported images (use --include-imported to bundle them)")
         else:
             from app.db import engine
             Path("data").mkdir(exist_ok=True)

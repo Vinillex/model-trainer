@@ -1,7 +1,7 @@
 export const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
-export type Source = "uploaded" | "scraped" | "generated";
-export const SOURCES: Source[] = ["uploaded", "scraped", "generated"];
+export type Source = "uploaded" | "scraped" | "generated" | "imported";
+export const SOURCES: Source[] = ["uploaded", "scraped", "generated", "imported"];
 
 export interface DetClass {
   id: number;
@@ -71,6 +71,7 @@ export interface StatRow {
   uploaded: number;
   scraped: number;
   generated: number;
+  imported: number;
   pending: number;
   rejected: number;
   boxes: number; // boxes drawn with this class on any image; a class that has any can't be removed

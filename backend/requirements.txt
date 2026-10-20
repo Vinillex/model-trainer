@@ -7,3 +7,4 @@ boto3==1.35.90
 pillow==11.1.0
 httpx==0.28.1
 pytest==8.3.4
+numpy==2.5.4

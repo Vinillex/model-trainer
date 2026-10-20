@@ -15,6 +15,7 @@ class Source(str, enum.Enum):
     uploaded = "uploaded"
     scraped = "scraped"
     generated = "generated"
+    imported = "imported"  # from a public dataset (see ImportRecord for where each image came from)
 
 
 class AnnotationStatus(str, enum.Enum):
@@ -95,6 +96,7 @@ class Image(Base):
     annotations: Mapped[list["Annotation"]] = relationship(back_populates="image", cascade="all, delete-orphan")
     hash: Mapped["ImageHash | None"] = relationship(cascade="all, delete-orphan", uselist=False)
     scrape_record: Mapped["ScrapeRecord | None"] = relationship(cascade="all, delete-orphan", uselist=False)
+    import_record: Mapped["ImportRecord | None"] = relationship(cascade="all, delete-orphan", uselist=False)
 
 
 class Annotation(Base):
@@ -160,6 +162,20 @@ class Job(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class ImportRecord(Base):
+    """Where an imported image came from (a public dataset), for attribution, licence review and rollback."""
+
+    __tablename__ = "import_records"
+
+    image_id: Mapped[int] = mapped_column(ForeignKey("images.id"), primary_key=True)
+    dataset: Mapped[str] = mapped_column(String(80), index=True)  # the import's tag, e.g. "anti-uav-v1"
+    original_name: Mapped[str] = mapped_column(String(300))
+    original_split: Mapped[str] = mapped_column(String(16))  # the dataset's own train/valid/test (not used for our splits)
+    dataset_url: Mapped[str] = mapped_column(String(500))
+    license: Mapped[str] = mapped_column(String(80))
+    author: Mapped[str] = mapped_column(String(200))
 
 
 class UrlOutcome(str, enum.Enum):
