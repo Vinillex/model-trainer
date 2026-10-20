@@ -1,2 +1,6 @@
-# Install inside WSL2 Ubuntu (a venv is recommended). The CUDA build of torch comes with the default Linux wheel.
+# Install into a Python 3.11 venv (see README step 1.4). Ultralytics' own IMX export environment is declared as
+# Python 3.11 with torch >= 2.9 and < 2.12; a newer torch or Python 3.12 may break the export step.
+# The default Linux torch wheels include CUDA, so the NVIDIA GPU is used inside WSL2.
+torch>=2.9,<2.12
+torchvision
 ultralytics

@@ -28,6 +28,7 @@ def lan(client, monkeypatch):
     """A client on another machine of the LAN (e.g. the GPU PC), with the worker API enabled."""
     monkeypatch.setattr(settings, "worker_token", TOKEN)
     training._workers.clear()
+    training._last_served = None
     return TestClient(from_ip(app, "192.168.1.50"))
 
 
@@ -331,3 +332,40 @@ def test_a_worker_keeps_its_kind_and_is_freed_when_its_run_is_cancelled(client, 
     assert lan.post(f"/workers/runs/{rid}/heartbeat", json={}, headers=hdr("gpu-1")).json() == {"cancel": True}
     w = {w["name"]: w for w in client.get("/training-workers").json()}["gpu-1"]
     assert w["kind"] == "gpu" and w["run_id"] is None          # not "pi" (the stage is no longer a GPU one), not busy with a dead run
+
+
+def test_time_the_backend_was_not_serving_never_counts_against_a_worker(client, lan, ready):
+    rid = new_run(client, ready)["id"]
+    claim(lan, name="gpu-1")
+    expire_lease(client, rid)                                                      # the Mac slept for 20 minutes...
+    training._last_served = datetime.now(timezone.utc) - timedelta(minutes=20)     # ...so no worker could heartbeat
+    assert claim(lan, "pi", "pi-1").status_code == 204                             # the Pi is first to call in afterwards
+    assert stage(client, rid) == "training"                                        # and does NOT take the run from gpu-1
+    assert claim(lan, name="gpu-2").status_code == 204
+    assert lan.post(f"/workers/runs/{rid}/heartbeat", json={}, headers=hdr("gpu-1")).status_code == 200
+
+
+def test_a_lease_that_expired_while_the_backend_was_serving_is_still_reaped(client, lan, ready):
+    rid = new_run(client, ready)["id"]
+    claim(lan, name="gpu-1")
+    expire_lease(client, rid)                                                      # gpu-1 went silent, but the server kept answering
+    training._last_served = datetime.now(timezone.utc) - timedelta(seconds=5)
+    assert claim(lan, name="gpu-2").json()["run_id"] == rid                        # so the run is handed over as before
+
+
+def test_a_restart_counts_as_a_gap(client, lan, ready):
+    rid = new_run(client, ready)["id"]
+    claim(lan, name="gpu-1")
+    expire_lease(client, rid)
+    training._last_served = None                                                   # what a freshly started backend has
+    assert claim(lan, name="gpu-2").status_code == 204
+    assert stage(client, rid) == "training"
+
+
+def test_unauthenticated_requests_do_not_count_as_the_server_serving_workers(client, lan, ready):
+    rid = new_run(client, ready)["id"]
+    claim(lan, name="gpu-1")
+    expire_lease(client, rid)
+    training._last_served = datetime.now(timezone.utc) - timedelta(minutes=20)
+    assert lan.get("/workers/ping").status_code == 401                             # no token
+    assert training._last_served < datetime.now(timezone.utc) - timedelta(minutes=19)

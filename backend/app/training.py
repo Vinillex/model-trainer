@@ -90,6 +90,26 @@ def delete_run(db: Session, run: TrainingRun) -> None:
 
 # ---------- leases (the workers) ----------
 
+# When the backend itself wasn't serving (the Mac slept, it restarted), workers couldn't heartbeat. That says nothing
+# about the workers, so after such a gap every active lease starts afresh instead of being reaped by whichever
+# agent calls in first. Workers poll every few seconds, so a gap this long means the server wasn't answering.
+SERVER_GAP_SECONDS = 120
+_last_served: datetime | None = None  # None at startup: a restart counts as a gap
+_served_lock = threading.Lock()
+
+
+def mark_served(db: Session) -> None:
+    """Call at the start of every authenticated worker request."""
+    global _last_served
+    now = _now()
+    with _served_lock:
+        gap = _last_served is None or now - _last_served > timedelta(seconds=SERVER_GAP_SECONDS)
+        _last_served = now
+    if gap:
+        db.execute(update(TrainingRun).where(TrainingRun.stage.in_(ACTIVE)).values(lease_expires_at=_lease()))
+        db.commit()
+
+
 def reap_expired(db: Session) -> None:
     """Take runs back from workers that went silent."""
     now = _now()

@@ -14,7 +14,12 @@ from ..security import require_token, worker_name
 from ..storage import get_storage
 from .datasets import zip_response
 
-router = APIRouter(prefix="/workers", tags=["workers"], dependencies=[Depends(require_token)])
+def served(db: Session = Depends(get_db)) -> None:
+    training.mark_served(db)
+
+
+# Order matters: only a request that passed the token check may count as "the server is serving workers".
+router = APIRouter(prefix="/workers", tags=["workers"], dependencies=[Depends(require_token), Depends(served)])
 
 
 def guarded(fn, *args):

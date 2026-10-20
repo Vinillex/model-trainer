@@ -15,8 +15,9 @@ gpu_agent.py              pi_agent.py
 ```
 
 Agents only make outgoing requests, so the PC and the Pi need no open ports. A worker that goes silent for 15 minutes
-loses its run, which goes back in the queue (after 3 lost leases it fails). If the backend restarts or the Mac sleeps
-mid-run, the agent keeps retrying and carries on.
+loses its run, which goes back in the queue (after 3 lost leases it fails). Time when the *backend* wasn't answering
+(the Mac slept, you restarted it) never counts against a worker: the agents keep retrying and carry on, and their
+15 minutes start again once the backend is back.
 
 > **Not verified yet:** the real IMX export and `imx500-package` have not been run, only the plumbing around them.
 > Step 1.5 below tests the export on its own before you rely on it.
@@ -46,17 +47,22 @@ GPU through the normal Windows driver.
    In Ubuntu, `nvidia-smi` must list your card. If it doesn't, nothing below will use the GPU.
 3. In Ubuntu:
    ```
-   sudo apt update && sudo apt install -y python3-venv python3-pip openjdk-17-jre-headless curl
+   sudo apt update && sudo apt install -y python3-venv curl openjdk-17-jre-headless
    java -version        # must say 17 or newer
    ```
 4. Copy this `agents/` folder into Ubuntu, for example by pasting it in File Explorer at
-   `\\wsl.localhost\Ubuntu-24.04\home\<your-user>\agents`. Then:
+   `\\wsl.localhost\Ubuntu-24.04\home\<your-user>\agents`. The IMX export is only set up for **Python 3.11**
+   (Ubuntu 24.04 ships 3.12), so make a 3.11 environment with `uv`, which fetches that Python for you:
    ```
    cd ~/agents
-   python3 -m venv ~/venv && source ~/venv/bin/activate
-   pip install -r requirements-gpu.txt
+   python3 -m venv ~/tools && ~/tools/bin/pip install uv
+   ~/tools/bin/uv venv --python 3.11 ~/venv
+   source ~/venv/bin/activate
+   ~/tools/bin/uv pip install -r requirements-gpu.txt
+   python -c "import torch; print(torch.__version__, torch.cuda.is_available())"     # expect True
    ```
-5. **Test the export on its own first.** It downloads the export tools on first use and takes several minutes:
+5. **Test the export on its own first.** On first use it pip-installs the Sony conversion tools
+   (model-compression-toolkit, imx500-converter) into this venv, so it needs internet and takes several minutes:
    ```
    python -c "from ultralytics import YOLO; YOLO('yolo11n.pt').export(format='imx', data='coco8.yaml')"
    ls yolo11n_imx_model        # should contain packerOut.zip and labels.txt

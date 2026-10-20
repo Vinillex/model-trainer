@@ -95,8 +95,10 @@ class UltralyticsBackend:
         from ultralytics import YOLO
 
         # `data` supplies the calibration images for int8 quantization.
-        YOLO(str(best_pt)).export(format="imx", data=str(data_yaml), imgsz=cfg["imgsz"], device=self.device)
-        out = best_pt.with_name(best_pt.stem + "_imx_model")
+        exported = YOLO(str(best_pt)).export(format="imx", data=str(data_yaml), imgsz=cfg["imgsz"], device=self.device)
+        out = Path(exported)  # the <weights>_imx_model/ folder that imxconv-pt wrote packerOut.zip and labels.txt into
+        if not out.is_dir():
+            out = best_pt.with_name(best_pt.stem + "_imx_model")
         packer, labels = next(out.rglob("packerOut.zip"), None), next(out.rglob("labels.txt"), None)
         if packer is None or labels is None:
             found = sorted(str(p.relative_to(out)) for p in out.rglob("*")) if out.exists() else "(no output folder)"
