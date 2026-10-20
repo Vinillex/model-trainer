@@ -116,6 +116,34 @@ export interface Job {
   finished_at: string | null;
 }
 
+export interface DatasetPreview {
+  reviewed_images: number;
+  reviewed_with_boxes: number;
+  reviewed_empty: number;
+  negative_images: number;
+  pending: number;
+  rejected: number;
+  boxes_per_class: Record<string, number>;
+}
+
+type SplitName = "train" | "val" | "test";
+
+export interface DatasetVersion {
+  id: number;
+  project_id: number;
+  name: string;
+  created_at: string;
+  config: { val_ratio: number; test_ratio: number; seed: number; include_negatives: boolean; classes: { index: number; name: string }[] };
+  stats: {
+    images: Record<SplitName, number>;
+    boxes: Record<SplitName, number>;
+    background_images: Partial<Record<SplitName, number>>;
+    per_class: Record<string, Record<SplitName, { images: number; boxes: number }>>;
+    excluded: { pending: number; rejected: number };
+    warnings: string[];
+  };
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(API + path, init);
   if (!res.ok) {
@@ -132,6 +160,7 @@ const json = (method: string, body: unknown): RequestInit => ({
   body: JSON.stringify(body),
 });
 
+export const datasetDownloadUrl = (id: number) => `${API}/datasets/${id}/download`;
 export const imageUrl = (id: number) => `${API}/images/${id}/file`;
 
 export const api = {
@@ -165,5 +194,10 @@ export const api = {
   serpapiAccount: () => req<SerpApiAccount>("/serpapi/account"),
   listJobs: (projectId: number) => req<Job[]>(`/projects/${projectId}/jobs?limit=10`),
   cancelJob: (id: number) => req<Job>(`/jobs/${id}/cancel`, { method: "POST" }),
+  datasetPreview: (projectId: number) => req<DatasetPreview>(`/projects/${projectId}/datasets/preview`),
+  listDatasets: (projectId: number) => req<DatasetVersion[]>(`/projects/${projectId}/datasets`),
+  createDataset: (projectId: number, body: { name?: string; val_ratio: number; test_ratio: number; include_negatives: boolean }) =>
+    req<DatasetVersion>(`/projects/${projectId}/datasets`, json("POST", body)),
+  deleteDataset: (id: number) => req<void>(`/datasets/${id}`, { method: "DELETE" }),
   deleteImage: (id: number) => req<void>(`/images/${id}`, { method: "DELETE" }),
 };

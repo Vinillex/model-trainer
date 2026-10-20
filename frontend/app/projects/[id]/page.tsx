@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import Gallery from "@/components/Gallery";
+import DatasetsPanel from "@/components/DatasetsPanel";
 import ClassForm from "@/components/ClassForm";
 import ScrapePanel from "@/components/ScrapePanel";
 import StatsTable from "@/components/StatsTable";
@@ -56,6 +57,11 @@ export default function ProjectPage() {
       <section className="space-y-3">
         <h2 className="text-lg font-medium">Scrape images</h2>
         <ScrapePanel projectId={projectId} classes={project.classes} onImagesChanged={bumpRefresh} />
+      </section>
+
+      <section className="space-y-3">
+        <h2 className="text-lg font-medium">Dataset versions</h2>
+        <DatasetsPanel projectId={projectId} refreshKey={refreshKey} />
       </section>
 
       <section className="space-y-3">
