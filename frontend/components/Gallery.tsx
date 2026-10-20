@@ -1,0 +1,95 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import { SOURCES, api, imageUrl, type DetClass, type ImageRow, type Source } from "@/lib/api";
+
+const PAGE = 48;
+
+export default function Gallery({ projectId, classes, refreshKey, onChanged }: { projectId: number; classes: DetClass[]; refreshKey: number; onChanged: () => void }) {
+  const [classId, setClassId] = useState<number | undefined>();
+  const [source, setSource] = useState<Source | undefined>();
+  const [images, setImages] = useState<ImageRow[]>([]);
+  const [more, setMore] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const className = (id: number) => classes.find((c) => c.id === id)?.name ?? id;
+
+  const load = useCallback(
+    async (offset: number) => {
+      try {
+        const rows = await api.listImages(projectId, { classId, source, limit: PAGE, offset });
+        setImages((prev) => (offset === 0 ? rows : [...prev, ...rows]));
+        setMore(rows.length === PAGE);
+        setError(null);
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    },
+    [projectId, classId, source],
+  );
+  useEffect(() => {
+    load(0);
+  }, [load, refreshKey]);
+
+  async function remove(id: number) {
+    try {
+      await api.deleteImage(id);
+      setImages((prev) => prev.filter((i) => i.id !== id));
+      onChanged();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap gap-2">
+        <select className="input" value={classId ?? ""} onChange={(e) => setClassId(e.target.value === "" ? undefined : Number(e.target.value))}>
+          <option value="">All classes</option>
+          {classes.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+        <select className="input" value={source ?? ""} onChange={(e) => setSource((e.target.value || undefined) as Source | undefined)}>
+          <option value="">All sources</option>
+          {SOURCES.map((s) => (
+            <option key={s} value={s}>
+              {s}
+            </option>
+          ))}
+        </select>
+      </div>
+      {error && <p className="text-sm text-red-600">{error}</p>}
+      {images.length === 0 && !error && <p className="text-sm text-neutral-500">No images match.</p>}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
+        {images.map((img) => (
+          <figure key={img.id} className="group relative overflow-hidden rounded border border-neutral-300 dark:border-neutral-700">
+            {/* eslint-disable-next-line @next/next/no-img-element -- served by the API, not optimizable by next/image */}
+            <img src={imageUrl(img.id)} alt={`${className(img.class_id)} #${img.id}`} loading="lazy" className="aspect-square w-full object-cover" />
+            <figcaption className="flex items-center justify-between px-2 py-1 text-xs">
+              <span>
+                {className(img.class_id)} · {img.source}
+              </span>
+              <span className="text-neutral-500">
+                {img.width}×{img.height}
+              </span>
+            </figcaption>
+            <button
+              onClick={() => confirm("Delete this image?") && remove(img.id)}
+              className="absolute right-1 top-1 hidden rounded bg-black/70 px-1.5 py-0.5 text-xs text-white group-hover:block"
+              aria-label="Delete image"
+            >
+              Delete
+            </button>
+          </figure>
+        ))}
+      </div>
+      {more && (
+        <button className="btn" onClick={() => load(images.length)}>
+          Load more
+        </button>
+      )}
+    </div>
+  );
+}
