@@ -30,5 +30,9 @@ class Settings(BaseSettings):
     # Dev/test only: allow fetching images from loopback/private addresses (normally blocked as SSRF).
     scrape_allow_private_hosts: bool = False
 
+    # RunPod (GPU pods for training, serverless for auto-labeling). Set MT_RUNPOD_API_KEY in backend/.env.
+    runpod_api_key: str | None = None
+    runpod_graphql_url: str = "https://api.runpod.io/graphql"
+
 
 settings = Settings()

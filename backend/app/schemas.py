@@ -161,6 +161,13 @@ class SerpApiAccount(BaseModel):
     account_rate_limit_per_hour: int | None
 
 
+class RunPodAccount(BaseModel):
+    balance: float | None
+    spend_per_hr: float | None
+    spend_limit_per_hr: float | None
+    pod_count: int
+
+
 class DatasetCreate(BaseModel):
     name: str | None = Field(None, min_length=1, max_length=120)  # defaults to v1, v2, ...
     val_ratio: float = Field(0.1, ge=0, le=0.5)

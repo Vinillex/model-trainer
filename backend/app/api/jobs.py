@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..db import get_db
 from ..models import DetClass, Job, JobStatus, SearchLog
-from ..schemas import JobOut, ScrapeJobCreate, SearchHistory, SerpApiAccount
+from ..runpod_client import RunPodError, fetch_account as fetch_runpod_account
+from ..schemas import JobOut, RunPodAccount, ScrapeJobCreate, SearchHistory, SerpApiAccount
 from ..scrape import SearchError, fetch_account, normalize_query
 from .projects import get_project
 
@@ -46,6 +47,17 @@ def serpapi_account():
     try:
         return fetch_account(settings.serpapi_key)
     except SearchError as e:
+        raise HTTPException(502, str(e))
+
+
+@router.get("/runpod/account", response_model=RunPodAccount)
+def runpod_account():
+    """RunPod credit balance and spend. Read-only and free."""
+    if not settings.runpod_api_key:
+        raise HTTPException(503, "RunPod is not configured: set MT_RUNPOD_API_KEY in backend/.env and restart the backend")
+    try:
+        return fetch_runpod_account(settings.runpod_api_key)
+    except RunPodError as e:
         raise HTTPException(502, str(e))
 
 
