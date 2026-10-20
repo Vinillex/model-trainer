@@ -92,6 +92,7 @@ export is Linux-only. If this machine is already native Linux, ignore the WSL no
    ```
    cd backend && uvicorn app.main:app --port 8000          # no --reload; restart after code changes
    cd frontend && npm ci && npm run dev                    # Node 20 LTS recommended (tested 20.11.1; Next 15 needs >= 18.18)
+   # npm may warn that eslint-visitor-keys wants Node >= 20.19: harmless, lint still runs.
    ```
    Open `http://localhost:3000/projects/1` from the Windows browser. You should see the 52 images. If requests fail with
    403, it is the networking issue from step 2.
@@ -249,6 +250,8 @@ In rough priority order:
 - **Restart servers by port** after code changes (uvicorn runs without `--reload`): `lsof -ti tcp:8000 | xargs kill`.
 - **Never run `next build` while `next dev` is running**: they share `.next` and the browser gets ChunkLoadError. Use
   `npx tsc --noEmit` and `npx next lint` for checks.
+- **Next.js is pinned to 15.1.12** (exact). Every 15.1.x up to 15.1.10 is flagged by npm as vulnerable (CVE-2025-66478), and GitHub
+  would raise an alert. Don't downgrade; if you upgrade, stay on a non-deprecated version (`npm view next@<v> deprecated` is empty).
 - Server timestamps are **UTC with no zone suffix**; `new Date(x)` reads them as local time. Use `parseUtc()` from `lib/api.ts`.
 - Tests use a **file-backed** SQLite in `tmp_path`, not `:memory:` + `StaticPool`: threads shared one connection and a cancel
   test flaked about 1 run in 8.
