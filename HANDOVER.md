@@ -74,7 +74,7 @@ export is Linux-only. If this machine is already native Linux, ignore the WSL no
    for WSL, must allow inbound TCP 8000 for the Pi. **I never tested any of this**; see Microsoft's WSL networking docs.
 3. **Clone and set up the backend.**
    ```
-   git clone <repo-url> ~/model_trainer && cd ~/model_trainer/backend
+   git clone https://github.com/Vinillex/model-trainer.git ~/model_trainer && cd ~/model_trainer/backend    # public: no login needed
    python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
    ```
    The backend was developed and tested on **Python 3.13**. Ubuntu 24.04 ships 3.12: try it, and if anything fails get
