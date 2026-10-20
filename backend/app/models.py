@@ -32,7 +32,9 @@ class Project(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     created_by: Mapped[str | None] = mapped_column(String(120), default=None)
 
-    classes: Mapped[list["DetClass"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    classes: Mapped[list["DetClass"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan", order_by="DetClass.id"
+    )
 
 
 class DetClass(Base):
