@@ -33,9 +33,12 @@ author, licence and original filename in the database (`import_records`).
 
 **Licence caveat.** The "CC BY 4.0" label is what the uploader put on Roboflow Universe; the dataset page has no description
 and does not say where the frames came from. It looks like a re-upload of frames from video recordings, so the label may not
-match the terms of the original source. Check the original source before redistributing these images or using them
-commercially. For that reason the imported images are **not** committed to this repository (`handover-data/` excludes them by
-default), only this attribution is.
+match the terms of the original source. Check the original source before reusing these images commercially.
+
+**Where the images are.** At the owner's request the imported images are committed in this repository, under
+`handover-data/storage/projects/1/raw/multirotor/imported/anti-uav/` (4,859 images; the bundle export normally leaves imported
+images out, this one was exported with `--include-imported`). Their boxes and per-image provenance (dataset, author, licence, URL,
+original filename) are in `handover-data/db.json` (`import_records`). The licence caveat above applies to these files.
 
 ## Images collected from web pages
 

@@ -216,7 +216,8 @@ The importer needs `numpy` (pinned). **Order matters:** the running backend must
 after pulling this code) *before* the first import, or every endpoint that loads those images fails.
 Imported images are **left out of the data bundle by default** (`bundle export --include-imported` to include them): they can be
 thousands of files and belong to someone else (see `DATA_LICENSES.md`). Dataset versions that contain them only download on a
-machine that has them.
+machine that has them. **The committed `handover-data/` was exported with `--include-imported`**, so a fresh clone gets Anti-UAV
+too; when you re-export for a push, decide again whether to pass the flag.
 
 ### 4.7 The data bundle (`scripts/bundle.py`, `handover-data/`)
 `export` dumps **every table** to `db.json` (primary-key order, no timestamps, so diffs are stable and re-export is
@@ -244,6 +245,8 @@ the current schema doesn't know are skipped and counted. **It is a snapshot, not
 
 ## 5. State of the data (honest)
 
+*The numbers below describe the first snapshot. See "Data added after the handover snapshot" just before section 6 for the current state.*
+
 - Project 1 `drone-detector`, 13 classes: positives `multirotor`, `fixed-wing`, `shahed`, `vtol`, `quad-copter`,
   `flying-wing`; hard negatives `birds`, `aircraft`, `helicopters`, `balloons`, `empty-sky`, `drones-in-fog`, `smoke`.
 - **52 images, all in `multirotor`**: 2 uploaded + 50 scraped (one real SerpAPI search, "DJI Quadcopter", 50 of 100
@@ -264,9 +267,9 @@ the current schema doesn't know are skipped and counted. **It is a snapshot, not
 The snapshot above is what `handover-data/` holds. On the owner's machine the project has since grown: more scraped images (hundreds
 reviewed, boxes started for `fixed-wing`, `shahed`, `vtol`, `interceptor`) and the **Anti-UAV** dataset imported as
 `imported/anti-uav` (4,859 reviewed `multirotor` images across 2,065 scenes, ~190 MB; CC BY 4.0, see `DATA_LICENSES.md`).
-Those imported images are **not** in the repo or the bundle. To train with them, either keep the data owner's backend as the
-single source and run the GPU PC as a worker (it downloads the dataset zip), or re-download the Roboflow export (YOLOv11, version 1)
-and run the importer on the new machine.
+The committed `handover-data/` was re-exported with `--include-imported` after that import, so it holds the *later* state too: a
+fresh clone plus `python -m scripts.bundle import` restores Anti-UAV with no re-download (the raw Roboflow export, 826 MB with
+augmented copies, is deliberately not in git). If you re-download it anyway (YOLOv11, version 1), the importer reproduces the same selection.
 
 ## 6. What has and hasn't been verified
 
