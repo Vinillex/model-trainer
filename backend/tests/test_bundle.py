@@ -187,3 +187,14 @@ def test_synthetic_seed_makes_a_project_a_run_can_start_on(client):
     assert out["run"]["stage"] == "queued" and out["run"]["config"]["epochs"] == 2
     rows = client.get(f"/projects/{other}/stats").json()
     assert rows and all(r["uploaded"] + r["scraped"] + r["generated"] == 0 for r in rows)  # the other project was left untouched
+
+
+def test_export_leaves_out_finder_and_explorer_junk(source, tmp_path):
+    engine, root = source
+    for junk in (root / ".DS_Store", root / "projects" / ".DS_Store", root / "projects" / "._shadow.jpg", root / "Thumbs.db"):
+        junk.parent.mkdir(parents=True, exist_ok=True)
+        junk.write_bytes(b"not part of the project")
+    exported = bundle.export_bundle(engine, root, tmp_path / "bundle")
+    keys = json.loads((tmp_path / "bundle" / "files.json").read_text())
+    assert not [k for k in keys if k.rsplit("/", 1)[-1] in {".DS_Store", "Thumbs.db"} or k.rsplit("/", 1)[-1].startswith("._")]
+    assert exported["files"] == len(keys) > 20                       # real files still exported

@@ -26,6 +26,11 @@ from app.storage import LocalStorage, Storage, get_storage
 FORMAT = 1
 DB_FILE, FILES_FILE, STORAGE_DIR = "db.json", "files.json", "storage"
 DEFAULT_DIR = Path(__file__).resolve().parents[2] / "handover-data"
+JUNK_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}  # folder-view files Finder/Explorer drop into any folder you open
+
+
+def _is_junk(path: Path) -> bool:
+    return path.name in JUNK_FILES or path.name.startswith("._")  # "._x" = macOS AppleDouble sidecars
 
 
 class BundleError(Exception):
@@ -71,7 +76,7 @@ def export_bundle(engine: Engine, storage_root: Path, out: Path) -> dict:
             counts[table.name] = len(rows)
 
     files = {}
-    for path in sorted(p for p in storage_root.rglob("*") if p.is_file()):
+    for path in sorted(p for p in storage_root.rglob("*") if p.is_file() and not _is_junk(p)):
         key = path.relative_to(storage_root).as_posix()
         data = path.read_bytes()
         dest = out / STORAGE_DIR / key
