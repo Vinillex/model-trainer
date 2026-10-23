@@ -1,0 +1,4 @@
+# Optional: the AI check (app/ai/). The backend, its tests and every other feature work without it.
+# Ultralytics provides SAM 2.1 (box refinement) and the YOLO detector, and pulls in torch (the Mac's GPU is used through "mps").
+# Same pin as agents/requirements-gpu.txt so the detector loads the weights the training pods made.
+ultralytics==8.4.183

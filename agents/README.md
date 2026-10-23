@@ -19,6 +19,8 @@ loses its run, which goes back in the queue (after 3 lost leases it fails). Time
 (the Mac slept, you restarted it) never counts against a worker: the agents keep retrying and carry on, and their
 15 minutes start again once the backend is back.
 
+> **No GPU of your own?** Train on a rented RunPod GPU instead: see [RUNPOD.md](RUNPOD.md). The Pi part (section 2) is the same.
+
 > **Not verified yet:** the real IMX export and `imx500-package` have not been run, only the plumbing around them.
 > Step 1.5 below tests the export on its own before you rely on it.
 
@@ -60,6 +62,10 @@ GPU through the normal Windows driver.
    source ~/venv/bin/activate
    ~/tools/bin/uv pip install -r requirements-gpu.txt
    python -c "import torch; print(torch.__version__, torch.cuda.is_available())"     # expect True
+   # Install the IMX export's own tools now. Left to Ultralytics, it installs them in the middle of the first export and the
+   # export crashes with a matplotlib error (model-compression-toolkit needs matplotlib < 3.10):
+   ~/tools/bin/uv pip install torch==2.9.1 torchvision==0.24.1 "model-compression-toolkit>=2.4.1" "edge-mdt-cl<1.1.0" \
+     "edge-mdt-tpc>=1.2.0" "pydantic<2.12" "imx500-converter[pt]>=3.17.3"
    ```
 5. **Test the export on its own first.** On first use it pip-installs the Sony conversion tools
    (model-compression-toolkit, imx500-converter) into this venv, so it needs internet and takes several minutes:
@@ -103,6 +109,16 @@ GPU through the normal Windows driver.
 3. When the run is `done`, download `network.rpk` and `labels.txt` and follow Ultralytics' Sony IMX500 guide to run
    them on the Pi.
 
+**Where the settings are.** *Resolution*: the **Image size** dropdown in Train & export (320 to 640 in steps of 32, default 640;
+the IMX500 takes at most 640x640). It is stored in the run's config and used for both training and the IMX export, so the model
+expects exactly that size. Keep 640 for drones: at 640 the median box in the data is about 13 px, at 320 it would be about 6 px.
+*Box format*: training labels are always normalized YOLO (`class cx cy w h`, fractions of the image) and that is not a setting.
+How the camera's *output* is read is a **Pi-side** setting, not part of training: with picamera2 it is `NetworkIntrinsics.bbox_order`
+(`"xy"` or `"yx"`) and `bbox_normalization` (true or false), which can be embedded in the `.rpk` or set in your Pi script;
+Ultralytics' own deploy example uses Sony's `pp_od_yolo_ultralytics` post-processing instead. The right values for an
+Ultralytics YOLO11 IMX model have **not been verified** here: once the first `.rpk` runs on the Pi, test with an image where you
+know the box and flip the setting if the boxes are transposed or mis-scaled. (The export also puts NMS inside the model.)
+
 A run with *Export for IMX500* turned off stops after training and gives you `best.pt` only, with no Pi involved.
 
 ## Options
@@ -114,6 +130,7 @@ A run with *Export for IMX500* turned off stops after training and gives you `be
 | `--heartbeat 20` | seconds between lease renewals |
 | `--workdir work` | where datasets and weights live during a run |
 | `--device auto` | (GPU agent) `0`, `1`, `cpu`; auto picks CUDA if there is one |
+| `--patience 21600` | (GPU agent) seconds a request keeps being retried while the backend can't be reached; the RunPod launcher sets 900 (or `MT_PATIENCE`) because a rented GPU bills while it waits |
 
 Stopping an agent with Ctrl-C doesn't tell the backend; the run is requeued once its 15-minute lease runs out.
 Cancel it in the UI instead for an immediate stop.

@@ -134,3 +134,92 @@ def test_a_frozen_version_does_not_change_when_data_is_added_later(client, mixed
     for _ in range(5):
         insert(client, pid, ids["multirotor"], Source.uploaded, box_class=ids["multirotor"])
     assert client.get(f"/datasets/{v1['id']}").json()["stats"]["by_source"] == {"uploaded": 12}
+
+
+def test_the_image_list_can_show_one_imported_dataset_on_its_own(client, mixed_data):
+    pid, _ = mixed_data
+    listing = lambda **p: client.get(f"/projects/{pid}/images", params={"limit": 500, **p})
+    mine = listing(dataset="anti-uav").json()
+    assert len(mine) == 16 and {i["dataset"] for i in mine} == {"anti-uav"} and {i["source"] for i in mine} == {"imported"}
+    assert len(listing(dataset="other-set").json()) == 10
+    assert listing(dataset="no-such-dataset").json() == []
+    everything = listing().json()
+    assert {i["dataset"] for i in everything if i["source"] == "imported"} == {"anti-uav", "other-set"}
+    assert all(i["dataset"] is None for i in everything if i["source"] != "imported")
+    assert listing(dataset="Bad Name!").status_code == 422
+
+
+def test_the_dataset_filter_combines_with_the_other_filters(client, project):
+    pid, ids = project
+    m = ids["multirotor"]
+    for status in (ReviewStatus.reviewed, ReviewStatus.pending, ReviewStatus.pending):
+        insert(client, pid, m, Source.imported, "set-a", status=status)
+    insert(client, pid, ids["birds"], Source.imported, "set-a")
+    listing = lambda **p: client.get(f"/projects/{pid}/images", params=p).json()
+    assert len(listing(dataset="set-a", review_status="pending")) == 2
+    assert len(listing(dataset="set-a", class_id=ids["birds"])) == 1
+    assert listing(dataset="set-a", source="uploaded") == []
+
+
+def test_imported_datasets_are_counted_by_review_state(client, project):
+    pid, ids = project
+    m = ids["multirotor"]
+    for status, n in ((ReviewStatus.reviewed, 3), (ReviewStatus.pending, 2), (ReviewStatus.rejected, 1)):
+        for _ in range(n):
+            insert(client, pid, m, Source.imported, "set-a", status=status)
+    insert(client, pid, m, Source.imported, "set-b")
+    insert(client, pid, m, Source.scraped)                                  # not imported: never listed
+    assert client.get(f"/projects/{pid}/imported-datasets").json() == [
+        {"name": "set-a", "total": 6, "reviewed": 3, "pending": 2, "rejected": 1, "checked": 0},
+        {"name": "set-b", "total": 1, "reviewed": 1, "pending": 0, "rejected": 0, "checked": 0},
+    ]
+    other = client.post("/projects", json={"name": "other"}).json()["id"]
+    assert client.get(f"/projects/{other}/imported-datasets").json() == []   # per project
+    assert client.get("/projects/9999/imported-datasets").status_code == 404
+
+
+def test_opening_an_imported_image_marks_it_as_manually_checked(client, project):
+    pid, ids = project
+    m = ids["multirotor"]
+    insert(client, pid, m, Source.imported, "set-a")
+    insert(client, pid, m, Source.imported, "set-a")
+    insert(client, pid, m, Source.imported, "set-b")
+    insert(client, pid, m, Source.scraped)
+    rows = client.get(f"/projects/{pid}/images", params={"limit": 50}).json()
+    imported = [r for r in rows if r["source"] == "imported"]
+    scraped = next(r for r in rows if r["source"] == "scraped")
+    assert {r["manually_checked"] for r in imported} == {False} and scraped["manually_checked"] is None  # imported images only
+
+    first = next(r["id"] for r in imported if r["dataset"] == "set-a")
+    done = client.post(f"/images/{first}/manual-check")
+    assert done.status_code == 200 and done.json()["manually_checked"] is True
+    assert client.post(f"/images/{first}/manual-check").json()["manually_checked"] is True          # repeating is harmless
+    assert client.get(f"/images/{first}").json()["manually_checked"] is True
+
+    listing = lambda **p: sorted(r["id"] for r in client.get(f"/projects/{pid}/images", params=p).json())
+    unchecked = sorted(r["id"] for r in imported if r["id"] != first)
+    assert listing(manually_checked="true") == [first]
+    assert listing(manually_checked="false") == unchecked                                           # never the scraped image
+    assert listing(dataset="set-a", manually_checked="true") == [first]
+    assert len(listing(dataset="set-a", manually_checked="false")) == 1
+    counts = {d["name"]: d["checked"] for d in client.get(f"/projects/{pid}/imported-datasets").json()}
+    assert counts == {"set-a": 1, "set-b": 0}
+
+    assert client.post(f"/images/{scraped['id']}/manual-check").status_code == 409
+    assert client.post("/images/999999/manual-check").status_code == 404
+
+
+def test_a_manual_check_goes_with_its_image(client, project):
+    from sqlalchemy import func, select
+
+    from app.models import ManualCheck
+
+    pid, ids = project
+    insert(client, pid, ids["multirotor"], Source.imported, "set-a")
+    image_id = client.get(f"/projects/{pid}/images").json()[0]["id"]
+    assert client.post(f"/images/{image_id}/manual-check").status_code == 200
+    with client.session_factory() as db:
+        assert db.scalar(select(func.count()).select_from(ManualCheck)) == 1
+        db.delete(db.get(Image, image_id))                                                          # what a rollback or delete does
+        db.commit()
+        assert db.scalar(select(func.count()).select_from(ManualCheck)) == 0

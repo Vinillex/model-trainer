@@ -64,9 +64,13 @@ def runpod_account():
 
 
 @router.get("/projects/{project_id}/jobs", response_model=list[JobOut])
-def list_jobs(project_id: int, limit: int = Query(20, le=100), db: Session = Depends(get_db)):
+def list_jobs(project_id: int, limit: int = Query(20, le=100), type: str | None = Query(None, pattern=r"^[a-z_]{1,32}$"), db: Session = Depends(get_db)):
+    """`type` keeps one kind of job (scrape, ai_check), so each panel shows only its own."""
     get_project(db, project_id)
-    return db.scalars(select(Job).where(Job.project_id == project_id).order_by(Job.id.desc()).limit(limit)).all()
+    q = select(Job).where(Job.project_id == project_id)
+    if type is not None:
+        q = q.where(Job.type == type)
+    return db.scalars(q.order_by(Job.id.desc()).limit(limit)).all()
 
 
 @router.get("/jobs/{job_id}", response_model=JobOut)

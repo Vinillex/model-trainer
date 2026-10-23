@@ -1,10 +1,12 @@
 """The GPU and Pi agents against a real backend over HTTP (uvicorn in a thread), with fake training and packaging."""
 
+import io
 import socket
 import stat
 import sys
 import threading
 import time
+import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -24,6 +26,7 @@ import pi_agent  # noqa: E402
 REAL_PREFLIGHT = gpu_agent.preflight  # the autouse fixture below stubs it out for the other tests
 
 from .test_datasets import populate  # noqa: E402
+from .test_dataset_bucket import bucket, get_version  # noqa: E402, F401 - fixture
 
 TOKEN = "agent-test-token"
 
@@ -59,9 +62,9 @@ def run_id(client):
 class FakeBackend:
     """Stands in for Ultralytics: checks what the agent hands over and writes dummy outputs."""
 
-    def __init__(self, epoch_seconds=0.0, fail_with=None):
-        self.epoch_seconds, self.fail_with = epoch_seconds, fail_with
-        self.seen, self.epochs_run = {}, 0
+    def __init__(self, epoch_seconds=0.0, fail_with=None, export_fails=None):
+        self.epoch_seconds, self.fail_with, self.export_fails = epoch_seconds, fail_with, export_fails
+        self.seen, self.epochs_run, self.exports = {}, 0, 0
 
     def train(self, cfg, data_yaml, run_dir, on_progress, should_stop):
         text = data_yaml.read_text()
@@ -80,6 +83,9 @@ class FakeBackend:
         return gpu_agent.TrainResult(best, {"map50": 0.3, "per_class": {"multirotor": {"ap50": 0.3}}})
 
     def export_imx(self, best_pt, data_yaml, cfg, run_dir):
+        self.exports += 1
+        if self.export_fails:
+            raise self.export_fails
         (run_dir / "packerOut.zip").write_bytes(b"PK-packer")
         (run_dir / "labels.txt").write_text("multirotor\nfixed-wing\nshahed\n")
         return run_dir / "packerOut.zip", run_dir / "labels.txt"
@@ -130,6 +136,107 @@ def test_heartbeats_carry_training_progress(client, server, run_id):
     gpu(server, FakeBackend(epoch_seconds=0.15))
     # The run is finished by now, but progress from the last beats is kept on it.
     assert client.get(f"/training-runs/{run_id}").json()["progress"].get("epoch") in (1, 2, 3)
+
+
+def test_a_slow_upload_shows_up_in_the_progress_message(client, server, run_id, monkeypatch):
+    """The second RunPod pod sat in a failing upload for most of an hour while the run still said "training"."""
+    seen, real_upload = [], common.Api.upload
+
+    def slow_upload(self, rid, name, file):
+        time.sleep(0.4)                                                                      # beats go out every 0.1 s meanwhile
+        seen.append((name, client.get(f"/training-runs/{rid}").json()["progress"].get("message")))
+        real_upload(self, rid, name, file)
+
+    monkeypatch.setattr(common.Api, "upload", slow_upload)
+    assert gpu(server, FakeBackend()) == 0
+    assert seen == [("best_pt", "uploading the trained weights"), ("imx_zip", "uploading the IMX500 package"),
+                    ("labels", "uploading the IMX500 package")]
+
+
+def cannot_upload_best_pt(monkeypatch):
+    """Uploads of best.pt give up (the network path to the backend is dead for big bodies); everything else works."""
+    real_upload = common.Api.upload
+
+    def upload(self, rid, name, file):
+        if name == "best_pt":
+            raise common.ApiError(0, "gave up on PUT /workers/runs/1/artifacts/best_pt after 900s: can't reach the backend (TimeoutError)")
+        real_upload(self, rid, name, file)
+    monkeypatch.setattr(common.Api, "upload", upload)
+
+
+def test_a_best_pt_upload_that_cannot_get_through_still_runs_the_export_and_says_so(client, server, run_id, monkeypatch):
+    """Pod 4 spent its hour retrying this upload and never reached the export, the one step nobody had seen work."""
+    cannot_upload_best_pt(monkeypatch)
+    backend = FakeBackend()
+    assert gpu(server, backend) == 0
+    run = client.get(f"/training-runs/{run_id}").json()
+    assert backend.exports == 1
+    assert run["stage"] == "failed" and run["artifacts"] == {}
+    assert "best.pt could not be uploaded" in run["error"] and "IMX export itself worked" in run["error"] and "packerOut.zip" in run["error"]
+
+
+def test_an_export_that_fails_after_a_lost_upload_reports_both(client, server, run_id, monkeypatch):
+    cannot_upload_best_pt(monkeypatch)
+    assert gpu(server, FakeBackend(export_fails=RuntimeError("matplotlib"))) == 0
+    error = client.get(f"/training-runs/{run_id}").json()["error"]
+    assert "could not be uploaded" in error and "export failed too: matplotlib" in error
+
+
+def test_a_lost_upload_without_an_export_fails_the_run_at_once(client, server, monkeypatch):
+    cannot_upload_best_pt(monkeypatch)
+    p = client.post("/projects", json={"name": "d"}).json()
+    populate(client, p["id"], {c["name"]: c["id"] for c in p["classes"]})
+    did = client.post(f"/projects/{p['id']}/datasets", json={}).json()["id"]
+    rid = client.post(f"/projects/{p['id']}/training-runs", json={"dataset_id": did, "epochs": 1, "export_imx": False}).json()["id"]
+    backend = FakeBackend()
+    gpu(server, backend)
+    run = client.get(f"/training-runs/{rid}").json()
+    assert run["stage"] == "failed" and "gave up" in run["error"] and backend.exports == 0
+
+
+def test_the_patience_setting_reaches_the_api(server, run_id, monkeypatch):
+    seen = []
+
+    class Spy(gpu_agent.Api):
+        def __init__(self, *a, **kw):
+            seen.append(kw.get("max_wait"))
+            super().__init__(*a, **kw)
+    monkeypatch.setattr(gpu_agent, "Api", Spy)
+    gpu(server, FakeBackend(), "--patience", "42")
+    monkeypatch.setenv("MT_PATIENCE", "900")
+    gpu(server, FakeBackend())
+    assert seen == [42.0, 900.0]
+
+
+def test_the_dataset_comes_from_the_bucket_and_the_worker_token_stays_home(client, server, run_id, bucket, caplog):
+    from app import dataset_bucket
+    from app.models import TrainingRun
+    db, v = get_version(client, db_run(client, run_id).dataset_id)
+    dataset_bucket.ensure_uploaded(db, v)
+    backend = FakeBackend()
+    assert gpu(server, backend) == 0
+    assert client.get(f"/training-runs/{run_id}").json()["stage"] == "awaiting_package"
+    assert len(bucket.requests) == 1                                                   # fetched from the bucket, once
+    sent = {k.lower() for k in bucket.requests[0]["headers"]}
+    assert "x-worker-token" not in sent and "x-worker-name" not in sent                # the token never goes to the bucket
+    assert backend.seen["dirs"]                                                        # and it trained on what came from there
+
+
+def test_a_bad_bucket_link_falls_back_to_the_backend_without_logging_the_signature(client, server, run_id, bucket, caplog):
+    from app import dataset_bucket
+    db, v = get_version(client, db_run(client, run_id).dataset_id)
+    dataset_bucket.ensure_uploaded(db, v)
+    bucket.broken = True                                                               # an expired link answers 403
+    assert gpu(server, FakeBackend()) == 0
+    assert client.get(f"/training-runs/{run_id}").json()["stage"] == "awaiting_package"
+    assert len(bucket.requests) == 2                                                   # two quick tries, then the backend
+    assert "X-Amz-Signature" not in caplog.text and "through the backend instead" in caplog.text
+
+
+def db_run(client, run_id):
+    from app.models import TrainingRun
+    with client.session_factory() as db:
+        return db.get(TrainingRun, run_id)
 
 
 def test_training_only_run_skips_export_and_needs_no_pi(client, server):
@@ -269,3 +376,78 @@ def test_api_retries_when_the_backend_is_down_then_comes_up():
     finally:
         time.sleep(0.05)
         getattr(start_later, "srv", None) and start_later.srv.shutdown()
+
+
+class CutShort(BaseHTTPRequestHandler):
+    """Announces 1000 bytes but, the first time, sends 400 and hangs up: what a connection dropped mid-download looks like."""
+
+    hits = 0
+
+    def do_GET(self):
+        CutShort.hits += 1
+        self.send_response(200)
+        self.send_header("Content-Length", "1000")
+        self.end_headers()
+        self.wfile.write(b"x" * (400 if CutShort.hits == 1 else 1000))
+
+    def log_message(self, *args):
+        pass
+
+
+def test_a_download_that_is_cut_short_is_noticed_and_fetched_again(tmp_path):
+    CutShort.hits = 0
+    srv = HTTPServer(("127.0.0.1", 0), CutShort)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        dest = tmp_path / "dataset.zip"
+        common.Api(f"http://127.0.0.1:{srv.server_port}", "t", "w", backoff_base=0.01).download("/file", dest)
+        assert dest.stat().st_size == 1000 and CutShort.hits == 2           # the 400-byte file was not kept as if it were complete
+        assert list(tmp_path.glob("*.part")) == []
+    finally:
+        srv.shutdown()
+
+
+class ScriptedApi:
+    """Stands in for the backend connection: each download writes the next prepared payload."""
+
+    def __init__(self, *payloads):
+        self.payloads, self.calls = list(payloads), 0
+
+    def download(self, url, dest):
+        self.calls += 1
+        dest.write_bytes(self.payloads.pop(0))
+
+
+def a_dataset_zip() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("data.yaml", "path: .\ntrain: images/train\nval: images/val\n")
+    return buf.getvalue()
+
+
+def test_a_dataset_that_is_not_a_zip_is_fetched_again(tmp_path):
+    api, said = ScriptedApi(b"<html>502 Bad Gateway</html>", a_dataset_zip()), []
+    data_yaml = gpu_agent.fetch_dataset(api, "/x", tmp_path, said.append, pause=0)
+    assert data_yaml.name == "data.yaml" and api.calls == 2
+    assert said == ["downloading the dataset", "downloading the dataset (try 2 of 3)"]
+
+
+def test_a_dataset_that_never_arrives_intact_fails_saying_what_arrived(tmp_path):
+    junk = b"<html>nope</html>"
+    api = ScriptedApi(junk, junk, junk, junk)
+    with pytest.raises(RuntimeError) as e:
+        gpu_agent.fetch_dataset(api, "/x", tmp_path, pause=0)
+    assert api.calls == 3 and "after 3 tries" in str(e.value)                       # gives up, but not at the first bad file
+    assert f"{len(junk)} bytes" in str(e.value) and "<html>nope" in str(e.value)    # so the next failure explains itself
+
+
+def test_the_export_calibrates_on_about_150_validation_images_not_all_of_them(tmp_path):
+    def make(n):
+        d = tmp_path / f"ds{n}"
+        (d / "images" / "val").mkdir(parents=True)
+        for i in range(n):
+            (d / "images" / "val" / f"{i}.jpg").write_bytes(b"x")
+        return d / "data.yaml"
+    assert gpu_agent.calibration_fraction(make(520)) == pytest.approx(150 / 520)          # run 5: 520 images, one at a time, was killed
+    assert gpu_agent.calibration_fraction(make(23)) == 1.0                                # small sets are used whole
+    assert gpu_agent.calibration_fraction(tmp_path / "empty" / "data.yaml") == 1.0        # no val folder: leave it to Ultralytics

@@ -3,10 +3,15 @@
 Every route needs the worker token; the worker's name comes in the X-Worker-Name header and identifies the lease holder.
 """
 
+import io
+import re
+import tarfile
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
-from .. import training
+from .. import dataset_bucket, training
 from ..db import get_db
 from ..models import DatasetVersion
 from ..schemas import ClaimIn, CompleteIn, FailIn, HeartbeatIn, TrainingRunOut
@@ -39,6 +44,42 @@ def ping():
     return {"ok": True}
 
 
+AGENTS_DIR = Path(__file__).resolve().parents[3] / "agents"
+AGENT_FILES = ("common.py", "gpu_agent.py", "requirements-gpu.txt")
+
+
+@router.get("/agent")
+def agent_bundle():
+    """The GPU agent's code as a tar.gz. A fresh machine (a RunPod pod) fetches it here, so it runs exactly the version on
+    this Mac, including changes that were never committed."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name in AGENT_FILES:
+            tar.add(AGENTS_DIR / name, arcname=name)
+    return Response(buf.getvalue(), media_type="application/gzip")
+
+
+WORKER_LOG_MAX_BYTES = 256 * 1024
+
+
+def worker_log_path(worker: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", worker).strip("._")[:100] or "worker"  # one plain file name, never a path
+    return Path(training.settings.worker_log_dir) / f"{safe}.log"
+
+
+@router.post("/log", status_code=204)
+async def worker_log(request: Request, worker: str = Depends(worker_name)):
+    """One progress line from a worker that has no agent running yet (a RunPod pod installing its tools)."""
+    line = (await request.body())[:2000].decode("utf-8", "replace").replace("\r", " ").replace("\n", " ").strip()
+    if line:
+        path = worker_log_path(worker)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists() or path.stat().st_size < WORKER_LOG_MAX_BYTES:  # a runaway pod can't fill the disk
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    return Response(status_code=204)
+
+
 @router.post("/claim", response_model=None)
 def claim(body: ClaimIn, worker: str = Depends(worker_name), db: Session = Depends(get_db)):
     training.touch_worker(worker, body.kind)
@@ -46,8 +87,10 @@ def claim(body: ClaimIn, worker: str = Depends(worker_name), db: Session = Depen
     if run is None:
         return Response(status_code=204)
     training.touch_worker(worker, body.kind, run.id)
+    # dataset_link: a signed link to the bucket's copy, tried first; dataset_url (through this backend) stays the fallback.
+    link = dataset_bucket.link_if_stored(db.get(DatasetVersion, run.dataset_id)) if body.kind == "gpu" else None
     return {"run_id": run.id, "kind": body.kind, "stage": run.stage.value, "name": run.name, "config": run.config,
-            "dataset_url": f"/workers/runs/{run.id}/dataset", "artifacts": sorted(run.artifacts),
+            "dataset_url": f"/workers/runs/{run.id}/dataset", "dataset_link": link, "artifacts": sorted(run.artifacts),
             "lease_seconds": training.settings.worker_lease_seconds}
 
 

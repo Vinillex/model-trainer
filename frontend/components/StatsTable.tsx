@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useState } from "react";
 import { SOURCES, api, type StatRow } from "@/lib/api";
+import { saveGalleryFilters } from "@/lib/galleryFilters";
 
 export default function StatsTable({ projectId, rows, onChanged }: { projectId: number; rows: StatRow[]; onChanged: () => void }) {
   const [confirming, setConfirming] = useState<number | null>(null);
@@ -57,7 +58,12 @@ export default function StatsTable({ projectId, rows, onChanged }: { projectId: 
               <td className="px-2 text-right font-medium tabular-nums">{total(r)}</td>
               <td className="px-2 text-right tabular-nums">
                 {r.pending > 0 ? (
-                  <Link href={`/projects/${projectId}/review?class=${r.class_id}`} className="text-blue-500 hover:underline">
+                  // The review screen shows whatever the main page's filters say, so this link sets them to "this class, not reviewed".
+                  <Link
+                    href={`/projects/${projectId}/review`}
+                    onClick={() => saveGalleryFilters(projectId, { scope: "", classId: r.class_id, reviewStatus: "pending" })}
+                    className="text-blue-500 hover:underline"
+                  >
                     {r.pending} →
                   </Link>
                 ) : (

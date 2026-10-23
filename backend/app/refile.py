@@ -58,8 +58,9 @@ def refile(db: Session, image: Image) -> bool:
         if target is None or target.id == image.class_id:
             return False
         old_key = image.storage_key
-        dataset = image.import_record.dataset if image.import_record else None  # an imported image stays in its dataset's folder
-        new_key = storage_key_for(image.project_id, target.name, image.source.value, image.sha256, old_key.rsplit(".", 1)[-1], dataset)
+        # an imported image stays in its dataset's folder, an uploaded one in the folder it was uploaded in
+        subfolder = image.import_record.dataset if image.import_record else image.upload_record.folder if image.upload_record else None
+        new_key = storage_key_for(image.project_id, target.name, image.source.value, image.sha256, old_key.rsplit(".", 1)[-1], subfolder)
         if new_key == old_key:
             return False
         if db.scalar(select(Image.id).where(Image.storage_key == new_key)):
@@ -87,7 +88,7 @@ def refile(db: Session, image: Image) -> bool:
 def refile_project(db: Session, project_id: int, dry_run: bool) -> dict:
     """Apply the rule to every reviewed image of a project (for data reviewed before the rule existed)."""
     images = db.scalars(select(Image).where(Image.project_id == project_id, Image.review_status == ReviewStatus.reviewed)
-                        .order_by(Image.id).options(selectinload(Image.annotations))).all()
+                        .order_by(Image.id).options(selectinload(Image.annotations), selectinload(Image.import_record), selectinload(Image.upload_record))).all()
     names = {c.id: c.name for c in db.scalars(select(DetClass).where(DetClass.project_id == project_id))}
     moves, unchanged, failed = [], 0, 0
     for img in images:

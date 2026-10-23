@@ -4,7 +4,10 @@ import tempfile
 # Tests must never touch the real database, storage or API keys from backend/.env, even if one starts the app's
 # lifespan (which creates tables, fails "running" jobs and starts the background worker). Set before `app` is imported.
 os.environ.update(MT_DATABASE_URL="sqlite://", MT_LOCAL_STORAGE_DIR=tempfile.mkdtemp(prefix="mt-test-storage-"), MT_RUN_WORKER="false",
-                  MT_SERPAPI_KEY="", MT_RUNPOD_API_KEY="", MT_WORKER_TOKEN="")
+                  MT_WORKER_LOG_DIR=tempfile.mkdtemp(prefix="mt-test-worker-logs-"),
+                  MT_SERPAPI_KEY="", MT_RUNPOD_API_KEY="", MT_WORKER_TOKEN="",
+                  # the real dataset bucket: a launcher test with --yes would otherwise upload its zip to it
+                  MT_DATASET_BUCKET="", MT_DATASET_BUCKET_ENDPOINT="", MT_DATASET_BUCKET_ACCESS_KEY="", MT_DATASET_BUCKET_SECRET_KEY="")
 
 import pytest
 from fastapi.testclient import TestClient

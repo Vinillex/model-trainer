@@ -64,6 +64,18 @@ def _num(x) -> float | None:
     return x if math.isfinite(x) else None  # NaN would not survive JSON
 
 
+CALIBRATION_IMAGES = 150  # the IMX export quantizes against validation images; Sony suggests 300+, but every one costs time and memory
+
+
+def calibration_fraction(data_yaml: Path, wanted: int = CALIBRATION_IMAGES) -> float:
+    """The `fraction` of the validation split to calibrate on, so about `wanted` images are used. The export of run 5 (520 validation
+    images, one at a time) ran for 13 minutes and then its process was killed (exit 137), where the export of 23 images had finished
+    in 8. How much of that was memory is not known; fewer images makes both time and memory smaller."""
+    val = data_yaml.parent / "images" / "val"
+    n = sum(1 for p in val.iterdir() if p.is_file()) if val.is_dir() else 0
+    return min(1.0, wanted / n) if n else 1.0
+
+
 class UltralyticsBackend:
     """The only part that needs torch/ultralytics. Tests swap it for a fake."""
 
@@ -95,7 +107,9 @@ class UltralyticsBackend:
         from ultralytics import YOLO
 
         # `data` supplies the calibration images for int8 quantization.
-        exported = YOLO(str(best_pt)).export(format="imx", data=str(data_yaml), imgsz=cfg["imgsz"], device=self.device)
+        fraction = calibration_fraction(data_yaml)
+        log.info("calibrating the int8 export on %.0f%% of the validation images", fraction * 100)
+        exported = YOLO(str(best_pt)).export(format="imx", data=str(data_yaml), imgsz=cfg["imgsz"], device=self.device, fraction=fraction)
         out = Path(exported)  # the <weights>_imx_model/ folder that imxconv-pt wrote packerOut.zip and labels.txt into
         if not out.is_dir():
             out = best_pt.with_name(best_pt.stem + "_imx_model")
@@ -130,6 +144,43 @@ def extract_dataset(zip_path: Path, dest: Path) -> Path:
     return data_yaml
 
 
+def fetch_dataset(api, url: str, run_dir: Path, say=lambda message: None, tries: int = 3, pause: float = 5.0, link: str | None = None) -> Path:
+    """Download and unpack the dataset. A transfer that was cut short, or an answer that is not a zip, is fetched again: the
+    connection to the backend (a tunnel, for a RunPod pod) is not perfectly steady. The last error says what arrived.
+
+    `link`, when the backend has one, is a signed link to a copy in the dataset bucket: much faster from a RunPod pod than the
+    Mac's upload link. It is tried first, once; anything wrong with it and the backend's route is used instead."""
+    for attempt in range(1, 3 if link else 1):  # two quick tries, not the agent's full patience: the fallback is right there
+        say("downloading the dataset from the bucket")
+        try:
+            return _fetch_once(api, link, run_dir)
+        except Exception as e:  # noqa: BLE001 - the backend route below still works
+            log.warning("the bucket's copy didn't work, try %d (%s)", attempt, e)
+    if link:
+        log.warning("downloading the dataset through the backend instead")
+    zip_path = run_dir / "dataset.zip"
+    for attempt in range(1, tries + 1):
+        say("downloading the dataset" if attempt == 1 else f"downloading the dataset (try {attempt} of {tries})")
+        api.download(url, zip_path)
+        try:
+            return extract_dataset(zip_path, run_dir / "dataset")
+        except zipfile.BadZipFile:
+            size, head = zip_path.stat().st_size, zip_path.read_bytes()[:80]
+            log.warning("the dataset download is not a valid zip (%d bytes, starts with %r)", size, head)
+            if attempt == tries:
+                raise RuntimeError(f"the dataset download is not a valid zip after {tries} tries (last: {size} bytes, starts with {head!r})") from None
+            time.sleep(pause)
+
+
+def _fetch_once(api, url: str, run_dir: Path) -> Path:
+    zip_path = run_dir / "dataset.zip"
+    api.call("GET", url, out=zip_path, retry=False, timeout=60)
+    try:
+        return extract_dataset(zip_path, run_dir / "dataset")
+    except zipfile.BadZipFile:
+        raise RuntimeError(f"not a valid zip ({zip_path.stat().st_size} bytes)") from None
+
+
 def run_task(api: Api, task: dict, workdir: Path, backend, heartbeat_interval: float = 20.0) -> None:
     run_id, cfg = task["run_id"], task["config"]
     log.info("claimed run %s (%s): %s", run_id, task["name"], cfg)
@@ -144,24 +195,41 @@ def run_task(api: Api, task: dict, workdir: Path, backend, heartbeat_interval: f
     run_dir.mkdir(parents=True)
     try:
         with Heartbeat(api, run_id, heartbeat_interval) as hb:
-            hb.update(message="downloading the dataset")
-            api.download(task["dataset_url"], run_dir / "dataset.zip")
-            data_yaml = extract_dataset(run_dir / "dataset.zip", run_dir / "dataset")
+            data_yaml = fetch_dataset(api, task["dataset_url"], run_dir, lambda message: hb.update(message=message),
+                                      link=task.get("dataset_link"))
 
             result = backend.train(cfg, data_yaml, run_dir, hb.update, hb.stopped)
             if hb.stopped():
                 log.info("run %s stopped before finishing; nothing to upload", run_id)
                 return
-            api.upload(run_id, "best_pt", result.best_pt)
+            hb.update(message="uploading the trained weights")  # a stalled upload then shows in the UI, not as a stuck "training"
+            lost_upload = None
+            try:
+                api.upload(run_id, "best_pt", result.best_pt)
+            except ApiError as e:
+                if e.status != 0 or not cfg.get("export_imx", True):  # only "can't get through" is worth going on from
+                    raise
+                lost_upload = e  # still export: it is the part nobody has seen work yet, and the pod is paid for anyway
+                log.error("could not upload best.pt (%s); exporting anyway so the run at least shows whether that works", e.detail)
 
             if cfg.get("export_imx", True):
                 # retry=True: an outage here must not fail the run after the training is already done
                 if api.heartbeat(run_id, {"message": "exporting for the IMX500 (quantizing, takes a few minutes)"}, stage="exporting", retry=True):
                     return
                 hb.update(message="exporting for the IMX500 (quantizing, takes a few minutes)")
-                packer, labels = backend.export_imx(result.best_pt, data_yaml, cfg, run_dir)
+                try:
+                    packer, labels = backend.export_imx(result.best_pt, data_yaml, cfg, run_dir)
+                except Exception as e:  # noqa: BLE001
+                    if lost_upload:
+                        raise RuntimeError(f"best.pt could not be uploaded ({lost_upload.detail}) and the IMX export failed too: {e}") from e
+                    raise
                 if hb.stopped():
                     return
+                if lost_upload:
+                    api.fail(run_id, f"best.pt could not be uploaded ({lost_upload.detail}). The IMX export itself worked "
+                                     f"({packer.name}, {packer.stat().st_size / 2**20:.1f} MB), so the failure is the network path, not the export.")
+                    return
+                hb.update(message="uploading the IMX500 package")
                 api.upload(run_id, "imx_zip", packer)
                 api.upload(run_id, "labels", labels)
             api.complete(run_id, result.metrics)
@@ -194,13 +262,16 @@ def main(argv=None, backend=None) -> int:
     ap.add_argument("--poll", type=float, default=5.0, help="seconds between checks for new runs")
     ap.add_argument("--heartbeat", type=float, default=20.0, help="seconds between lease renewals")
     ap.add_argument("--once", action="store_true", help="do at most one run, then exit (also exits if none is waiting)")
+    ap.add_argument("--patience", type=float, default=float(os.environ.get("MT_PATIENCE") or 6 * 3600),
+                    help="seconds a request keeps being retried while the backend can't be reached, before the run is given up (default 6 h, "
+                         "or MT_PATIENCE; the RunPod launcher sets 15 minutes because a rented GPU bills while it waits)")
     args = ap.parse_args(argv)
     token = os.environ.get("MT_WORKER_TOKEN")  # from the environment, so it never shows up in `ps`
     if not args.server or not token:
         ap.error("set MT_SERVER (or --server) and MT_WORKER_TOKEN")
 
     setup_logging()
-    api = Api(args.server, token, args.name)
+    api = Api(args.server, token, args.name, max_wait=args.patience)
     try:
         api.ping()
     except ApiError as e:

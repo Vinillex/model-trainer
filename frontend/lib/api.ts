@@ -20,16 +20,111 @@ export interface Project {
 
 export type ReviewStatus = "pending" | "reviewed" | "rejected";
 
+export type AiVerdict = "ok" | "adjust" | "suspect" | "missing" | "too_small" | "none";
+export type AiStatusValue = AiVerdict | "stale" | "dismissed";
+/** Boxes in the AI check are normalized x1, y1, x2, y2. */
+export type AiBox = [number, number, number, number];
+export interface AiLabelItem {
+  annotation_id: number | null;
+  box: AiBox;
+  side_px: number; // size on the 640 px network input
+  verdict: AiVerdict;
+  reason: string;
+  suggested: AiBox | null;
+  detector_iou: number | null;
+  detector_score: number | null;
+  sam_object: boolean | null;
+}
+export interface AiMissingItem {
+  box: AiBox;
+  detector_box: AiBox;
+  score: number;
+  class_name: string | null;
+  side_px: number;
+  reason: string;
+}
+export interface AiCheck {
+  image_id: number;
+  checked_at: string;
+  model: string;
+  stale: boolean;
+  verdict: AiVerdict;
+  dismissed: boolean; // a person reviewed these boxes despite the verdict: it no longer asks for a look
+  result: { labels: AiLabelItem[]; missing: AiMissingItem[]; summary: Record<string, number> };
+}
+export interface AiServiceStatus {
+  available: boolean;
+  reason: string | null;
+  sam_weights: string;
+  detector: string | null;
+  device: string | null; // what the loaded models run on (the setting until a check has loaded them)
+  fallbacks: number; // GPU calls that failed and were redone on the CPU
+  last_fallback: string | null;
+}
+export interface AiBoxResult {
+  found: boolean;
+  box: AiBox | null;
+  score: number | null;
+}
+export type AiSamSize = "t" | "s" | "b" | "l";
+export interface AiDetector {
+  id: string; // "run:5" or "file:name.pt"
+  label: string;
+  kind: "run" | "file";
+  map50: number | null; // a training run's validation mAP50
+}
+export interface AiSam {
+  size: AiSamSize;
+  file: string;
+  hint: string;
+  downloaded: boolean; // false = downloaded (free, once) the first time it is used
+}
+export interface AiModels {
+  detectors: AiDetector[];
+  default_detector: string | null; // what "default" means right now
+  sams: AiSam[];
+  default_sam: string;
+}
+export interface AiJobParams {
+  mode?: "check" | "autolabel"; // check = the AI's opinion of existing boxes; autolabel = draw boxes on unlabelled pending images
+  detector?: string;
+  sam?: AiSamSize;
+  min_score?: number;
+  class_id?: number;
+  source?: Source;
+  dataset?: string;
+  folder?: string; // an upload folder
+  image_ids?: number[]; // exactly these images (the Images page's selection)
+  review_status?: ReviewStatus;
+  limit?: number;
+  force?: boolean;
+}
+
 export interface ImageRow {
   id: number;
   class_id: number;
   source: Source;
+  dataset: string | null; // the imported dataset the image came from (null unless source is "imported")
+  folder: string | null; // the folder an uploaded image was uploaded in (null for loose uploads and other sources)
+  ai_labelled: boolean; // boxes drawn by the auto-label job that nobody has confirmed yet
+  manually_checked: boolean | null; // imported images only: has the person opened it in the review window?
+  ai_status: AiStatusValue | null; // the AI check's verdict, "stale" after the boxes were edited, "dismissed" = flagged but reviewed by a person, null = never checked
   sha256: string;
   width: number;
   height: number;
   group_key: string | null;
   review_status: ReviewStatus;
   created_at: string;
+}
+
+/** One imported dataset and how many of its images are in each review state. */
+export interface ImportedDataset {
+  name: string;
+  total: number;
+  reviewed: number;
+  pending: number;
+  rejected: number;
+  checked: number; // opened in the review window
 }
 
 /** Normalized YOLO-style box: centre and size as fractions of the image. */
@@ -61,6 +156,21 @@ export interface UploadResult {
   added: ImageRow[];
   duplicates: string[];
   rejected: string[];
+  folder: string | null; // the cleaned folder name the images went into
+}
+
+/** One place images live: a class's source and, inside it, an imported dataset or an upload folder (null = loose). */
+export interface FolderRow {
+  class_id: number;
+  source: Source;
+  folder: string | null;
+  total: number;
+  reviewed: number;
+  pending: number;
+  rejected: number;
+  ai_ok: number; // the AI agrees with the boxes
+  ai_flagged: number; // "needs a look": the same rule as the gallery filter
+  ai_unchecked: number; // the AI has never looked at them
 }
 
 export interface StatRow {
@@ -250,27 +360,67 @@ export const api = {
     req<BulkClassResult>(`/projects/${projectId}/classes/bulk`, json("POST", { names, is_negative: isNegative })),
   deleteClass: (projectId: number, classId: number) => req<void>(`/projects/${projectId}/classes/${classId}`, { method: "DELETE" }),
   stats: (projectId: number) => req<StatRow[]>(`/projects/${projectId}/stats`),
-  listImages: (projectId: number, p: { classId?: number; source?: Source; reviewStatus?: ReviewStatus; limit: number; offset: number }) => {
+  listImages: (
+    projectId: number,
+    p: { classId?: number; source?: Source; dataset?: string; folder?: string; manuallyChecked?: boolean; ai?: string; reviewStatus?: ReviewStatus; limit: number; offset: number },
+  ) => {
     const q = new URLSearchParams({ limit: String(p.limit), offset: String(p.offset) });
-    if (p.classId !== undefined) q.set("class_id", String(p.classId));
+    if (p.classId != null) q.set("class_id", String(p.classId));
     if (p.source) q.set("source", p.source);
+    if (p.dataset) q.set("dataset", p.dataset);
+    if (p.folder) q.set("folder", p.folder);
+    if (p.manuallyChecked !== undefined) q.set("manually_checked", String(p.manuallyChecked));
+    if (p.ai) q.set("ai", p.ai);
     if (p.reviewStatus) q.set("review_status", p.reviewStatus);
     return req<ImageRow[]>(`/projects/${projectId}/images?${q}`);
   },
-  upload: (projectId: number, classId: number, files: File[]) => {
+  /** The review window calls this for an imported image it shows: opening it there is what counts as a manual check. */
+  markManuallyChecked: (id: number) => req<ImageRow>(`/images/${id}/manual-check`, { method: "POST" }),
+  importedDatasets: (projectId: number) => req<ImportedDataset[]>(`/projects/${projectId}/imported-datasets`),
+  /** `folder` files the images under <class>/uploaded/<folder>; `paths` (one per file) is where each sat inside it. */
+  upload: (projectId: number, classId: number, files: File[], folder?: string, paths?: string[]) => {
     const form = new FormData();
     files.forEach((f) => form.append("files", f));
-    return req<UploadResult>(`/projects/${projectId}/classes/${classId}/images`, { method: "POST", body: form });
+    paths?.forEach((p) => form.append("relative_paths", p));
+    const q = folder ? `?${new URLSearchParams({ folder })}` : "";
+    return req<UploadResult>(`/projects/${projectId}/classes/${classId}/images${q}`, { method: "POST", body: form });
   },
+  folders: (projectId: number) => req<FolderRow[]>(`/projects/${projectId}/folders`),
+  /** Reject several images exactly as the review screen's Reject does for one. There is no bulk accept: accepting means a person looked. */
+  rejectImages: (projectId: number, imageIds: number[]) => req<{ rejected: number }>(`/projects/${projectId}/images/reject`, json("POST", { image_ids: imageIds })),
   getImage: (id: number) => req<ImageDetail>(`/images/${id}`),
-  putAnnotations: (id: number, boxes: BoxIn[], reviewStatus?: ReviewStatus) =>
-    req<ImageDetail>(`/images/${id}/annotations`, json("PUT", { boxes, review_status: reviewStatus ?? null })),
+  /** `aiDismiss`: these boxes are the person's decision on the AI's doubts (Accept / Reject): a flagged image leaves "AI: needs a look". */
+  putAnnotations: (id: number, boxes: BoxIn[], reviewStatus?: ReviewStatus, aiDismiss?: boolean) =>
+    req<ImageDetail>(`/images/${id}/annotations`, json("PUT", { boxes, review_status: reviewStatus ?? null, ai_dismiss: aiDismiss ?? false })),
   createScrapeJob: (projectId: number, p: Partial<ScrapeParams> & Pick<ScrapeParams, "class_id" | "query">) =>
     req<Job>(`/projects/${projectId}/jobs/scrape`, json("POST", p)),
   searchHistory: (projectId: number, query: string) =>
     req<SearchHistory>(`/projects/${projectId}/searches?${new URLSearchParams({ query })}`),
   serpapiAccount: () => req<SerpApiAccount>("/serpapi/account"),
-  listJobs: (projectId: number) => req<Job[]>(`/projects/${projectId}/jobs?limit=10`),
+  listJobs: (projectId: number, type?: string) => req<Job[]>(`/projects/${projectId}/jobs?limit=10${type ? `&type=${type}` : ""}`),
+  aiStatus: () => req<AiServiceStatus>("/ai/status"),
+  /** Check one image now. The first call loads the models, so it can take a minute. Stores a suggestion; never changes boxes. */
+  aiCheck: (id: number) => req<AiCheck>(`/images/${id}/ai-check`, { method: "POST" }),
+  /** Put a dismissed image back in "AI: needs a look". */
+  aiUndismiss: (id: number) => req<AiCheck>(`/images/${id}/ai-dismiss`, { method: "DELETE" }),
+  /** The stored check of an image, or null if it has none. */
+  getAiCheck: async (id: number) => {
+    const res = await fetch(`${API}/images/${id}/ai-check`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? res.statusText);
+    return (await res.json()) as AiCheck;
+  },
+  /** Click-to-box: SAM's tight box around a click and/or a rough box (all normalized). */
+  aiBox: (id: number, p: { x?: number; y?: number; box?: AiBox }) => req<AiBoxResult>(`/images/${id}/ai-box`, json("POST", p)),
+  aiModels: () => req<AiModels>("/ai/models"),
+  /** The weights are only stored, never opened, when they arrive. The header is what the server checks to know the upload came from this app. */
+  aiUploadModel: (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return req<AiDetector>("/ai/models/upload", { method: "POST", body: form, headers: { "X-MT-Upload": "1" } });
+  },
+  aiPreview: (projectId: number, p: AiJobParams) => req<{ count: number }>(`/projects/${projectId}/jobs/ai-check/preview`, json("POST", p)),
+  createAiJob: (projectId: number, p: AiJobParams) => req<Job>(`/projects/${projectId}/jobs/ai-check`, json("POST", p)),
   cancelJob: (id: number) => req<Job>(`/jobs/${id}/cancel`, { method: "POST" }),
   datasetPreview: (projectId: number, sel?: DataSelection) =>
     req<DatasetPreview>(

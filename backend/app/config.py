@@ -33,11 +33,29 @@ class Settings(BaseSettings):
     # RunPod (GPU pods for training, serverless for auto-labeling). Set MT_RUNPOD_API_KEY in backend/.env.
     runpod_api_key: str | None = None
     runpod_graphql_url: str = "https://api.runpod.io/graphql"
+    runpod_rest_url: str = "https://rest.runpod.io/v1"  # pods are started and deleted here
+
+    # Optional private bucket (Cloudflare R2 or any S3-compatible store) holding a copy of each training zip, so pods download
+    # it from there instead of through this Mac's slow upload link (app/dataset_bucket.py). All four set = used.
+    dataset_bucket: str = ""
+    dataset_bucket_endpoint: str | None = None  # R2: https://<account id>.r2.cloudflarestorage.com
+    dataset_bucket_access_key: str | None = None
+    dataset_bucket_secret_key: str | None = None
 
     # Remote workers (GPU PC for training/export, Raspberry Pi for .rpk packaging) call /workers/* with this token.
     # Unset = the worker API is disabled. Set MT_WORKER_TOKEN in backend/.env.
     worker_token: str | None = None
     worker_lease_seconds: int = 900  # a worker silent for this long loses its run (heartbeats renew the lease)
+    # Setup lines a RunPod pod reports before its agent runs (POST /workers/log), one file per worker. The launcher prints them, so
+    # a pod that stalls while installing says where; its own logs are gone once the pod is deleted.
+    worker_log_dir: str = "./data/worker_logs"
+
+    # AI check (app/ai/): SAM 2.1 refines boxes, the trained YOLO is the detector. Needs `pip install -r requirements-ai.txt`; the weights live
+    # under ai_dir (git-ignored with the rest of data/). Official weights names are downloaded there on first use: sam2.1_t.pt, _s.pt, _b.pt, _l.pt.
+    ai_dir: str = "./data/ai"
+    ai_sam_weights: str = "sam2.1_s.pt"
+    ai_device: str | None = None  # None = the Mac's GPU (mps) when torch has it, else the CPU
+    ai_detector_weights: str | None = None  # a .pt path; None = best.pt of the newest finished training run
 
 
 settings = Settings()

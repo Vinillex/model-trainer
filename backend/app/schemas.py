@@ -4,9 +4,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .ai.registry import DETECTOR_PATTERN
 from .models import AnnotationStatus, JobStatus, ReviewStatus, RunStage, Source
 
 NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
+FOLDER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"  # what clean_folder() produces
 
 
 class ClassCreate(BaseModel):
@@ -45,6 +47,11 @@ class ImageOut(BaseModel):
     id: int
     class_id: int
     source: Source
+    dataset: str | None = None  # which imported dataset the image belongs to
+    folder: str | None = None  # the folder an uploaded image was uploaded in
+    ai_labelled: bool = False  # boxes drawn by the auto-label job that nobody has confirmed yet
+    manually_checked: bool | None = None  # imported images only: opened in the review window by the person
+    ai_status: str | None = None  # the AI check's verdict (ok, adjust, suspect, missing, too_small, none), "stale" after an edit, "dismissed" = flagged but the person reviewed those boxes, null = never checked
     sha256: str
     width: int
     height: int
@@ -53,10 +60,43 @@ class ImageOut(BaseModel):
     created_at: datetime
 
 
+class ImportedDatasetOut(BaseModel):
+    name: str
+    total: int
+    reviewed: int
+    pending: int
+    rejected: int
+    checked: int  # opened in the review window by the person
+
+
+class ImageIdsIn(BaseModel):
+    image_ids: list[int] = Field(min_length=1, max_length=500)
+
+
+class RejectResult(BaseModel):
+    rejected: int
+
+
 class UploadResult(BaseModel):
     added: list[ImageOut]
     duplicates: list[str]
     rejected: list[str]
+    folder: str | None = None  # the cleaned folder name the images went into (null for loose files)
+
+
+class FolderOut(BaseModel):
+    """One place images live: a class's source, and inside it an imported dataset or an upload folder (folder null = loose)."""
+
+    class_id: int
+    source: Source
+    folder: str | None
+    total: int
+    reviewed: int
+    pending: int
+    rejected: int
+    ai_ok: int = 0  # the AI agrees with the boxes (or found nothing on an unlabelled image)
+    ai_flagged: int = 0  # "needs a look": same rule as the gallery filter ai=flagged
+    ai_unchecked: int = 0  # the AI has never looked at them
 
 
 class StatRow(BaseModel):
@@ -111,10 +151,93 @@ class AnnotationsPut(BaseModel):
 
     boxes: list[BoxIn] = Field(max_length=200)
     review_status: ReviewStatus | None = None
+    # The person saves these boxes as their decision on the AI's doubts (the review screen sends it with Accept and Reject). Only takes
+    # effect where the image has a flagged AI check; the image then leaves "AI: needs a look" for these boxes (see AiDismissal).
+    ai_dismiss: bool = False
 
 
 class ImageDetail(ImageOut):
     annotations: list[AnnotationOut]
+
+
+class AiCheckOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    image_id: int
+    checked_at: datetime
+    model: str
+    stale: bool
+    verdict: str
+    dismissed: bool  # a person saved these boxes as reviewed despite the verdict: it no longer asks for a look
+    result: dict  # {"labels": [...], "missing": [...], "summary": {...}}, boxes normalized x1,y1,x2,y2
+
+
+class AiStatus(BaseModel):
+    available: bool  # the AI extras are installed
+    reason: str | None  # why not, and what to run
+    sam_weights: str
+    detector: str | None  # which weights find the drones, None until a training run has finished
+    device: str | None  # what the loaded models run on (the setting until a check has loaded them)
+    fallbacks: int = 0  # GPU calls that failed and were redone on the CPU since the models loaded
+    last_fallback: str | None = None
+
+
+class AiDetectorOut(BaseModel):
+    id: str
+    label: str
+    kind: Literal["run", "file"]
+    map50: float | None = None  # a training run's validation mAP50
+
+
+class AiSamOut(BaseModel):
+    size: Literal["t", "s", "b", "l"]
+    file: str
+    hint: str
+    downloaded: bool  # false = downloaded (free, once) the first time it is used
+
+
+class AiModelsOut(BaseModel):
+    detectors: list[AiDetectorOut]
+    default_detector: str | None  # what "default" means right now (a label), None = no detector yet
+    sams: list[AiSamOut]
+    default_sam: str
+
+
+class AiPreviewOut(BaseModel):
+    count: int  # images the job would process
+
+
+class AiBoxIn(BaseModel):
+    """Click-to-box: a point (normalized) on the thing to box, and/or a rough box (normalized x1,y1,x2,y2) around it."""
+
+    x: float | None = Field(None, ge=0, le=1)
+    y: float | None = Field(None, ge=0, le=1)
+    box: list[float] | None = Field(None, min_length=4, max_length=4)
+
+
+class AiBoxOut(BaseModel):
+    found: bool
+    box: list[float] | None = None  # normalized x1,y1,x2,y2
+    score: float | None = None
+
+
+class AiJobCreate(BaseModel):
+    """A batch AI run over the images the filters select: `check` stores the AI's opinion of existing boxes, `autolabel` draws boxes on
+    unlabelled pending images (as unconfirmed `auto` boxes)."""
+
+    mode: Literal["check", "autolabel"] = "check"
+    detector: str | None = Field(None, pattern=DETECTOR_PATTERN)  # "run:5" or "file:name.pt"; None = the default detector
+    sam: Literal["t", "s", "b", "l"] | None = None  # SAM 2.1 size; None = the MT_AI_SAM_WEIGHTS setting
+    min_score: float = Field(0.5, ge=0.25, le=0.95)  # autolabel: the least sure detection that becomes a box
+
+    class_id: int | None = None
+    source: Source | None = None
+    dataset: str | None = Field(None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    folder: str | None = Field(None, pattern=FOLDER_PATTERN)  # an upload folder
+    image_ids: list[int] | None = Field(None, min_length=1, max_length=500)  # exactly these images (an empty list is refused, never "everything")
+    review_status: ReviewStatus | None = None
+    limit: int = Field(500, ge=1, le=20000)
+    force: bool = False  # also redo images whose boxes have not changed since their last check
 
 
 class ScrapeJobCreate(BaseModel):

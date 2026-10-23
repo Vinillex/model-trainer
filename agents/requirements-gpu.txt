@@ -3,4 +3,6 @@
 # The default Linux torch wheels include CUDA, so the NVIDIA GPU is used inside WSL2.
 torch>=2.9,<2.12
 torchvision
-ultralytics
+# Pinned: agents/runpod_start.sh installs the IMX export's own requirements up front, and that list belongs to this version
+# (ultralytics/utils/export/imx.py). Change both together.
+ultralytics==8.4.183

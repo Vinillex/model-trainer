@@ -19,7 +19,7 @@ Decisions already made (don't re-litigate without a reason):
 
 | Decision | Detail |
 |---|---|
-| Compute | **Local GPUs** (RTX 4060 Ti 8 GB and RTX 3060 12 GB, both in Windows PCs). **RunPod is not on the training path.** An optional API key setting exists (`MT_RUNPOD_API_KEY`, read-only account check only) and is unused. Keep RunPod as an option for FLUX or large auto-labeling jobs only. |
+| Compute | **Rented RunPod GPUs** (decided 2026-10-22: the user has no GPU access). `python -m scripts.runpod launch --yes` rents one for the length of a run and deletes the pod afterwards; see `agents/RUNPOD.md`. The launch path has run on four real pods (1-epoch tests, $0.45 in all, see the status below); the IMX export has still never finished. Earlier plan, still supported by `agents/README.md`: local GPUs (RTX 4060 Ti 8 GB and RTX 3060 12 GB in Windows PCs). |
 | Model | **YOLO11n / YOLOv8n only.** Ultralytics' IMX export supports nothing else, and the sensor has about 8 MB of model memory. Input up to 640x640. |
 | Labeling | Built-in review UI (box editor), not CVAT or Label Studio. |
 | Auth | **None.** Single user, trusted network. The only protection is a loopback guard plus a worker token (section 4.6). |
@@ -39,18 +39,28 @@ backend/            FastAPI + SQLAlchemy 2 (SQLite by default). Python.
     api/            projects, images, annotations, jobs (scrape + quota), datasets, training (UI side), workers (agent side)
     scrape.py       SerpAPI client, image download (SSRF-guarded), the scrape job, dedupe layers
     imagehash.py    64-bit dHash for near-duplicate detection
-    jobs.py         tiny DB-backed queue + in-process worker thread (scrape jobs only)
+    jobs.py         tiny DB-backed queue + in-process worker thread (scrape and ai_check jobs)
     datasets.py     dataset versions: grouped/stratified train-val-test split, stats, warnings
     yolo_export.py  frozen manifest -> YOLO zip (no DB access, reusable)
     training.py     training-run state machine: stages, leases, claim/heartbeat/complete (section 4.5)
     security.py     LoopbackOnly middleware + worker-token check
-    runpod_client.py   read-only RunPod balance query
+    runpod_client.py   RunPod: balance and GPU prices (GraphQL), start/list/delete pods (REST, https://rest.runpod.io/v1)
+    runpod_pod.py   what a training pod is: pinned image, GPU preference list, the POST /pods body
+    ai/             the AI check (section 4.8): geometry.py, verdict.py, check.py (the rules), service.py (glue, model cache, auto-label), job.py (batch),
+                    registry.py (which models a run can pick, uploaded weights),
+                    sam.py + detector.py (the heavy models, imported only when a check runs)
   scripts/
+    runpod.py       the launcher: status / gpus / launch (dry run unless --yes) / stop; tunnel, pod, watch, always delete
     bundle.py       export/import the whole database + files as a portable bundle
+    ai_spike.py     calibration for the AI check: SAM on jittered/loose/wrong boxes, by drone size (re-run it before changing thresholds)
     seed_synthetic.py  make a synthetic project so the pipeline can be tested with no real data
-  tests/            119 tests (pytest)
-agents/             what runs on the GPU PC and the Pi: gpu_agent.py, pi_agent.py, common.py, README.md
+  tests/            421 tests (pytest)
+agents/             what runs on the GPU and the Pi: gpu_agent.py, pi_agent.py, common.py, README.md, runpod_start.sh (the pod's
+                    start command), RUNPOD.md
 frontend/           Next.js 15 (app router, TypeScript, Tailwind 3). Talks to the API at NEXT_PUBLIC_API_URL (default http://localhost:8000)
+  app/projects/[id]/(main)/   the project's sections behind a left drawer (components/Drawer.tsx): / (Overview), images, add (Upload | Scrape),
+                    ai, datasets, training; layout.tsx provides the project once (lib/projectContext.tsx: project, stats, refreshKey,
+                    imagesChanged(), classesChanged()). app/projects/[id]/review is outside the group: full screen, no drawer.
 handover-data/      the data bundle (db.json + files + checksums). Restore with `python -m scripts.bundle import`.
 HANDOVER.md         this file
 ```
@@ -82,9 +92,9 @@ export is Linux-only. If this machine is already native Linux, ignore the WSL no
 4. **Secrets.** Copy `backend/.env.example` to `backend/.env`. **Do not copy the Mac's `.env`.**
    - `MT_WORKER_TOKEN`: generate a fresh one: `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Required for any worker.
    - `MT_SERPAPI_KEY`: only needed for scraping. Ask Vinit. The free plan is 250 searches/month **shared** with their Mac.
-   - `MT_RUNPOD_API_KEY`: leave empty.
+   - `MT_RUNPOD_API_KEY`: only on the machine that runs `scripts.runpod` (the Mac). Leave it empty here.
    Never print or log these values. `.env` is gitignored; keep it that way.
-5. **Run the tests first.** `python -m pytest -q` from `backend/` should say **119 passed**. If not, stop and tell Vinit.
+5. **Run the tests first.** `python -m pytest -q` from `backend/` should say **230 passed**. If not, stop and tell Vinit.
    (The tests are isolated from real data by `tests/conftest.py`; see gotchas.)
 6. **Restore the data.** From `backend/`: `python -m scripts.bundle import`. It needs an **empty** database and prints
    counts only. Expect: project `drone-detector` with 13 classes, 52 images (6 reviewed), 8 box rows, 57 remembered scrape URLs.
@@ -123,7 +133,7 @@ their images count as background; `index` = creation-order position among the po
 `images` (`source` uploaded|scraped|generated, `review_status` pending|reviewed|rejected, `storage_key`, `sha256`,
 `group_key`) -> `annotations` (normalized YOLO boxes cx,cy,w,h; `status` auto|auto_exact|reviewed|rejected).
 Also `image_hashes`, `scrape_records` (provenance: query, original URL, page URL), `scraped_urls` (every URL ever tried),
-`search_log`, `jobs`, `dataset_versions`, `training_runs`. Images live on disk under
+`search_log`, `jobs`, `dataset_versions`, `training_runs`, `upload_records` (an uploaded image's folder, see below). Images live on disk under
 `backend/data/storage/projects/<id>/raw/<class>/<source>/<sha256>.<ext>` (the per-class `uploaded/scraped/generated`
 layout the user asked for); the DB is `backend/data/model_trainer.db`.
 
@@ -136,6 +146,31 @@ and nothing is scraped, uploaded or boxed into it by hand. The move is the last 
 first, then the file is copied, the row switched, and the old copy deleted, so a failed move leaves the image where it was.
 `POST /projects/{id}/images/refile?dry_run=false` applies the rule to images reviewed before it existed (dry run by default).
 
+**Images page extras.** Active filters show as removable chips with "Clear filters" and a "Review these" button (the queue those filters
+describe). Cards have a checkbox (always visible below 768 px, on hover above it): the bar offers **Reject** (inline confirm, `POST
+/projects/{id}/images/reject`, up to 500, all or nothing, ids of another project refuse the whole request; it goes through the same
+`apply_annotations()` as the editor's save, so a rejected image leaves "AI: needs a look" and "AI drew the boxes" exactly as a single Reject
+does; boxes stay as they are) and **Run AI on these** (hands the ids to the AI page through `sessionStorage`, `image_ids` in the job; the mode's
+rules still apply, an empty list is refused, never "everything"). There is **no bulk accept**: accepting means a person looked, and it would
+turn unchecked boxes into training data. The selection is cleared whenever a filter changes and pruned to the images on screen after every reload.
+There is no "move to folder": moving existing images between folders is not built.
+**Overview.** `PlacesTable.tsx` (from `GET /projects/{id}/folders`, which now also returns `ai_ok`, `ai_flagged`, `ai_unchecked` per place): images,
+reviewed %, AI ok %, needs a look, not checked, with "Review N" and "Open". The AI counts use `ai_condition()` in `app/ai/filters.py`, the one
+SQL rule behind every AI filter (the gallery list, these counts and the drawer's "needs a look" badge); `Image.ai_status` is the same rule in
+Python, and a test compares the counts with what the gallery filter lists. The drawer polls every 10 s while the tab is visible for that badge,
+a running AI run and a running training run.
+**Upload hint.** Picking a folder starts the upload at once, and a negative class files images as already reviewed background, so a folder whose
+name and class disagree (`lib/uploadHints.ts`, a name heuristic) waits for "Upload anyway" / Cancel before anything is sent.
+
+**Upload folders.** Uploading a folder files its images under `raw/<class>/uploaded/<folder>/` (`POST /projects/{id}/classes/{class_id}/images?folder=NAME`,
+`relative_paths` = one form field per file saying where it sat inside the folder, kept in `upload_records.original_path`, never used as a path). The
+folder name is cleaned by `clean_folder()` (A-Z a-z 0-9 . - _, others become `-`, no leading dot, at most 80; a name with nothing usable is a 422, not a
+guess); nested subfolders all go into the top folder. `refile` keeps the folder when a reviewed image changes class (like an imported dataset's name).
+`GET /projects/{id}/folders` lists every class/source/(dataset or folder) with review counts; `GET .../images?folder=` and the AI batch's `folder`
+param select one. The UI: Choose folder / drop a folder (`lib/dropFiles.ts` walks `webkitGetAsEntry`, 100 entries per read), non-images skipped,
+then the gallery opens on `folder:<name>` (scope value in `lib/galleryFilters.ts`) with a one-line notice. The same picture is never filed twice,
+even into another folder (sha256 per project).
+
 **Removing a class** (`DELETE /projects/{id}/classes/{class_id}`, the Remove button in the class table) is allowed only when
 nothing uses it: no images, no boxes drawn with it on any image, and no queued/running scrape job aimed at it. Dataset
 versions are self-contained snapshots, so existing ones are unaffected. New positive classes get `index = max + 1`, never a
@@ -145,7 +180,23 @@ There are **no migrations**. `create_all` makes missing *tables* on startup; a n
 manual `ALTER TABLE`. Alembic is a known to-do. `scripts/bundle.py` tolerates schema drift (section 4.7).
 
 ### 4.2 Review UI
-`/projects/<id>/review?...` queue with filters, hotkeys (1-9 pick class, Enter accept, X reject, arrows, Delete), box
+**The review screen never scrolls** (`ReviewScreen.tsx`): it is a fixed full-window layer (`fixed inset-0`, the page behind is locked while it is
+open), the image on the left and every control in a panel on the right (two columns from 768 px; stacked below that). `BoxEditor` fills the
+space its parent gives it (measured with a ResizeObserver; at zoom 100% the whole image fits, enlarged at most 2x) instead of a share of the
+window height. Windows under 700 px tall get a denser panel (the `short:` Tailwind variant in `tailwind.config.ts`); only the list of AI
+suggestions scrolls, inside its own box, and the panel itself scrolls only as a last resort rather than clipping a button. Measured on a wide, a
+tall and a panorama image at 1440x900, 1280x720, 1024x640, 900x560, 800x500 and a 400x800 phone: no page scroll, every button on screen.
+`?` opens the shortcuts list (`ShortcutsHelp.tsx`); while it is open the screen ignores every other key (Enter would otherwise accept the image
+behind it). The A (AI check) and S (snap box) keys are wired in the same handler.
+`/projects/<id>/review` (the queue opens from the Images page's "Review these", the Overview table's "Review N", a card, or the stats table) shows the queue the **Images page's gallery filters** select (class, source, one imported dataset or upload folder,
+manual check, AI check, review status). It has no filters of its own: the gallery keeps them in `sessionStorage` (`lib/galleryFilters.ts`)
+and the review screen reads them; both build the image query with the one `imageQuery()` there (a filter added to only one of them once
+made the review queue ignore the AI filter). The gallery reloads on return to its tab (focus / visibility) so it shows the current list; the stats table's "To review" link sets them to that class + not reviewed. Opening an
+**imported** image there records a **manual check** (`manual_checks` table, `POST /images/{id}/manual-check`), shown as a tag
+in the gallery and filterable per imported dataset; it is how you tell which imported images a person has really looked at.
+Hotkeys (1-9 pick class, Enter accept, X reject, arrows, Delete, +/- zoom, 0 fit; scrolling over the image zooms at the cursor
+(no key needed; a trackpad pinch does too) and holding the middle button while dragging pans it; a draw drag under 4 screen
+pixels is a click, so zoom in to draw tiny boxes), box
 drawing/moving/resizing (`BoxEditor`, pointer-capture, normalized corners), autosaves on navigation. Saving boxes replaces
 all boxes of an image (`PUT /images/{id}/annotations`) and sets its review status.
 
@@ -200,6 +251,12 @@ everything except `/workers/*`, where it must present `MT_WORKER_TOKEN` (unset =
 binds `127.0.0.1` by default. **If you bind `0.0.0.0` so the Pi can connect, tell Vinit.** Still no user auth: anyone who
 can run a browser *on the machine* can do anything.
 
+A request that carries a proxy or tunnel header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP`, `CF-Ray`, ...)
+counts as **not local even when it comes from 127.0.0.1**: a tunnel client such as cloudflared (used for RunPod) connects from
+loopback, and without this the whole API would be open to the internet through it. Only the headers' presence is checked, never
+their values. Keep any new proxy header in `PROXY_HEADERS`. `scripts/runpod.py` also tests this through the live tunnel before
+it starts a pod. `GET /workers/agent` (token required) serves the three agent files so a fresh pod runs the code on the Mac.
+
 ### 4.6b Importing public datasets (`scripts/import_yolo.py`)
 `python -m scripts.import_yolo import <folder> --dataset anti-uav --map UAV=multirotor --author "..." [--dry-run --sample-sheet out.jpg]`
 imports a YOLO-format export (Roboflow layout: `<split>/images`, `<split>/labels`, `data.yaml`) as **reviewed** images with boxes,
@@ -243,6 +300,108 @@ the current schema doesn't know are skipped and counted. **It is a snapshot, not
    rejects any file over 100 MB, warns over 50 MB, and recommends keeping a repo under about 1 GB. Beyond that, move images
    out of git (a bucket, rsync, or Git LFS, whose free bandwidth is small) and commit only `db.json`.
 
+### 4.8 AI check and AI labelling (`app/ai/`, `components/AiLabelling.tsx`, the review screen)
+A second opinion on an image's boxes, made on this Mac, shown next to the manual check. **It only suggests.** Nothing it does edits a
+box or a review status: results live in their own table (`ai_checks`, one row per image), never in `annotations`, because the review
+screen loads every annotation as a real box and saves them all back as `reviewed`. Accepting a suggestion edits the boxes in the
+editor (unsaved) like drawing would; Save / Accept & next persists them and `put_annotations` then marks the check **stale**
+(`ai_checks.stale`, set when the box set's fingerprint no longer matches the one that was checked).
+
+- **AI labelling page** (`/projects/<id>/ai`, `AiLabelling.tsx`; one run = what + models + images). *What*: `mode` **check** (the opinion described
+  here) or **autolabel**. *Models*: any detector (`GET /ai/models`: every finished run's `best.pt`, newest first with its mAP50, plus `.pt`
+  files in `backend/data/ai/models/custom/`; id `run:5` or `file:name.pt`, default = the setting / newest run) and a SAM size (`t s b l`;
+  `get_models(db, detector, sam)` keeps the last 2 loaded sets, keyed by both, so switching needs no restart; a running job keeps the set it
+  started with; `set_models` fakes win in tests). *Images*: a class, one source / imported dataset / upload folder, "only not reviewed", a
+  limit; `POST /projects/{id}/jobs/ai-check/preview` counts what the run would take (same selection code) for the estimate. Bad choices
+  (unknown detector id, a run with no model) are refused when the job is created (422), not after it was queued.
+- **Auto-label** (`service.autolabel_image`). Only images that are **pending and have no boxes** (a reviewed image with none is a deliberate
+  background picture; nobody's boxes are replaced; checked again right before writing, because the person may be editing in review). The
+  detector's class **names** map to the project's trainable classes (never indexes: dataset versions renumber them); a detection of any other
+  name is left out and counted (`unmapped`), and a model sharing no class name with the project fails the job before the first image.
+  Detections under `min_score` (default 0.5) are ignored, the same drone seen as two classes keeps the surer box, SAM tightens each box
+  (the detector's own box when SAM's is not believable), boxes are clipped to the image. Boxes are written as `AnnotationStatus.auto`
+  (+ confidence) on an image that stays `pending`; an earlier AI check of that image is marked stale. **They cannot reach training**:
+  dataset versions keep only `reviewed`/`auto_exact` boxes (`KEPT_BOX_STATUSES`) on `reviewed` images. A save in review (any edit, Accept or
+  Reject) rewrites every box as `reviewed`; navigating without editing saves nothing. `ImageOut.ai_labelled` = some box is still `auto`;
+  gallery tag, filter `ai=autolabelled` ("AI drew the boxes (not confirmed)"), a note in the review screen; Accept takes the image out of
+  that queue.
+- **Uploaded `.pt` files** (`POST /ai/models/upload`, `registry.save_upload`). A YOLO `.pt` is a pickle: **loading one runs code**. So an
+  upload is only stored (cleaned name, `.pt`, starts with the zip magic, 300 MB cap, written to a temporary name then renamed, never
+  overwrites) and is opened only when a run picks it. The endpoint requires the header `X-MT-Upload: 1`: a multipart POST from another web
+  page is a "simple" request that needs no CORS preflight, but a custom header forces one, and the allow-list only names this app's own
+  origin. No pickle scanner (a heuristic would give false comfort): the UI says to upload only weights you trust.
+- **Models.** *Detector* = `best.pt` of the newest finished training run (copied once to `backend/data/ai/models/detector-run<N>.pt`;
+  `MT_AI_DETECTOR_WEIGHTS` overrides). *SAM 2.1 small* through Ultralytics (`sam2.1_s.pt`, 92 MB, downloaded on first use from
+  Ultralytics' official GitHub assets into `backend/data/ai/models/`; `MT_AI_SAM_WEIGHTS` picks `_t/_s/_b/_l`). Both run on the
+  Mac's GPU (`mps`). A call the GPU refuses is redone on the CPU for that call only; five failures in a row move everything to the
+  CPU for good (`device.py`). `GET /ai/status` and every batch job's progress report the live device, the number of fallbacks and the
+  last reason, so a slow batch can be explained. Speed: 0.5 s per image in a batch (first project-wide run: 954 images in 7.6 minutes;
+  scraped images with many drones are slower because SAM runs once per box), so the ~7,300 reviewed images take about an hour.
+- **Why not RF-DETR.** It has no drone class (COCO), so it needs a GPU fine-tune on our data (money, not done). The detector is
+  one small class (`detector.py`, `.detect(image_rgb) -> [Detection]`): a fine-tuned RF-DETR drops in by writing that one class.
+- **What SAM can and cannot do** (`scripts/ai_spike.py`, 14 images per size bin, anti-uav, sam2.1_s): given a box it segments
+  whatever fills the box, so it **polishes** a sloppy box (better than the drawn box 77% of the time, median IoU 0.53 -> 0.65;
+  exact labels: 0 of 97 under IoU 0.6 against SAM's tight box, 0.82-0.94 median at every size, even under 8 px, because each box is
+  cropped with context and upscaled) but it **cannot fix a loose box** (a 2x box comes back as about the same box) and it **cannot tell
+  a right box from a wrong place** (SAM's score: exact 0.87, wrong place 0.63; it finds nothing in 41 of 98 wrong places). So the
+  verdict about a label comes from the detector; SAM only tightens suggestions and says whether there is any compact object in a box.
+- **Verdicts** (`check.py`, `Policy`, `POLICY_VERSION`): `ok` (a detection overlaps IoU >= 0.6 and SAM's tight box is within IoU 0.45 of the label),
+  `adjust` (the detector finds that drone but the box is loose / off / partly on it: suggests SAM's tight box; a detection sitting
+  inside a bigger label counts as that label's drone), `suspect` (no detection at the box: either the model sees a drone elsewhere
+  and suggests it, or finds none, and says whether SAM sees an object there), `too_small` (nothing confirms it and it is under
+  16 px on the 640 px input: the detector finds only 48% / 69% / 82% of drones under 8 / 8-12 / 12-16 px, so "wrong" would be
+  mostly false alarms), `missing` (a detection >= 0.5 with no label: a possible unlabelled drone, with SAM's box), `none`. An image's
+  verdict is the worst of its items (suspect > missing > adjust > too_small > ok).
+  **Rules version:** `POLICY_VERSION` is stored in every check's `model` ("... · rules v2"); bump it when a rule or threshold changes and the
+  batch job redoes older checks by itself. History: v1 had `tight_iou` 0.55, taken from exact anti-uav labels (SAM's box agreed with
+  all 97 of them). The first project-wide run showed human-drawn labels are looser: 23 of 52 `adjust` flags came from SAM alone while the
+  detector agreed with the label, and 83% of those sat at IoU 0.45-0.55 (ordinary looseness, not an error), so v2 uses 0.45.
+- **API** (all loopback-only like the rest of the UI API): `GET /ai/status`, `POST|GET /images/{id}/ai-check`,
+  `POST /images/{id}/ai-box` (click-to-box: SAM's tight box for a click and/or a rough box; stores nothing),
+  `POST /projects/{id}/jobs/ai-check` (batch: the gallery's class/source/dataset/review filters, `limit`, `force`; skips images whose
+  boxes and models are unchanged, so it resumes after a restart; hard-negative images are left out), `GET .../jobs?type=ai_check`,
+  and `GET .../images?ai=unchecked|stale|ok|flagged|dismissed|too_small`. `ImageOut.ai_status` is the verdict, `stale`, `dismissed`, or null.
+- **Dismissed** (so reviewed images leave "AI: needs a look"). Accept & next and Reject in the review screen send `ai_dismiss: true` with the
+  save (`PUT /images/{id}/annotations`); where the image has a **flagged** check (suspect / missing / adjust) the server records
+  `ai_dismissals(image_id, fingerprint)` with the fingerprint **of the boxes saved**. A current flagged check whose fingerprint equals
+  that one is `dismissed` (`AiCheck.dismissed`, `Image.ai_status`, and the SQL in `list_images`: the same rule written twice, tested to
+  agree). So a forced re-run or new rules never bring a reviewed image back, whatever they say about those boxes; it is listed again
+  only when its boxes change *without* a new decision and the new boxes are flagged. Nothing is recorded for an image the AI had not
+  flagged (a later check may raise doubts the person never saw), nor on plain Save or Next. `DELETE /images/{id}/ai-dismiss` undoes it
+  ("Put it back in the list" on the review screen); filter `AI: dismissed` finds them. It is its own table because there are no
+  migrations: a column on `ai_checks` would not exist in the live database.
+- **UI.** Review screen: `A` runs the check (first call loads the models, 10-60 s), suggestions are dashed boxes on the image plus a
+  list with "Use this box" / "Add box" / Dismiss / Accept all; `S` snaps the selected box to the object; **Alt/Option + click** on a drone
+  draws a SAM box around it. Gallery: an "AI check" filter and a tag on every card. Project page: "AI check" panel (batch job).
+- **Install.** `cd backend && .venv/bin/pip install -r requirements-ai.txt` (ultralytics, which brings torch), then restart the backend.
+  Without it the backend, its tests and every other feature work as before; the AI endpoints answer 503 with that instruction, and a
+  test checks that importing the app loads neither torch nor ultralytics.
+- **First real results** (project-wide batch, rules v2, all 7,306 reviewed images in ~45 minutes, 0 failures, no GPU fallbacks):
+
+  | dataset | images | ok | adjust | suspect | missing | too small |
+  |---|---|---|---|---|---|---|
+  | anti-uav | 4,859 | 4,330 (89%) | 123 | 70 | 41 | 295 |
+  | cmy-uav | 2,095 | 1,381 (66%) | 256 | 216 | 20 | 222 |
+  | scraped | 350 | 214 | 4 | 7 | 83 | 2 (+40 with no boxes and nothing found) |
+
+  **anti-uav** is optimistic (the detector trained on it). **cmy-uav** (never trained on) agrees with the earlier finding that its boxes are
+  displaced: of its labels on drones >= 64 px on the 640 input, **51% are doubtful** (28% at 32-64 px, 11% at 16-32, 3% under 16), and
+  on a contact sheet the label box sits on empty sky / trees / a wall while the detector's box sits on the drone (68 of the 82 large
+  doubtful labels come with a suggested box elsewhere); the rest are real drones the detector misses (a delivery drone, a hexacopter).
+  Overall about a third of cmy-uav's labels are flagged (suspect or adjust or too small to judge). **Do not trust a small contiguous
+  sample**: the first 200 cmy-uav images (ids 5229-5391, probably a few scenes) looked 87% ok and gave the wrong impression.
+  **Scraped images** carry many unlabelled drones (270 `missing` items in 350 images: swarms, product shots and pending images with no
+  boxes; the 12 inspected by eye were all real) and a few loose boxes. Large objects sometimes get an odd suggestion (a long fixed-wing
+  UAV came back with a near-full-image box), which is why every suggestion is optional. Nothing was accepted or saved from any of this.
+- **Operating notes.** The job worker is one thread: a long AI batch makes scrape jobs wait behind it. The detector is chosen once per
+  backend run (a newer finished training run is used only after a restart). If the backend restarts mid-batch the job ends as
+  "Interrupted by a server restart"; start it again (`POST /projects/1/jobs/ai-check {"limit": 20000}` or the AI panel): finished
+  images are skipped, so it resumes. Restart by port: `lsof -ti tcp:8000 | xargs kill`, then `cd backend && source .venv/bin/activate &&
+  uvicorn app.main:app --host 0.0.0.0 --port 8000`.
+- **Not exercised:** the S3 storage path with AI checks, a non-Mac machine (CUDA/CPU only through the same code), the `_t/_b/_l`
+  SAM sizes, and tiny-drone behaviour of the detector on images it was trained on (run 5 saw anti-uav, so its agreement there is
+  optimistic).
+
 ## 5. State of the data (honest)
 
 *The numbers below describe the first snapshot. See "Data added after the handover snapshot" just before section 6 for the current state.*
@@ -274,8 +433,25 @@ augmented copies, is deliberately not in git). If you re-download it anyway (YOL
 ## 6. What has and hasn't been verified
 
 Verified on the previous machine (a Mac mini M2, CPU only):
-- 119 backend tests including mutation checks (deliberately breaking the code to confirm tests fail) on the state
-  machine, LAN guard, leases, agents, retries and the bundle.
+- 230 backend tests including mutation checks (deliberately breaking the code to confirm tests fail) on the state
+  machine, LAN guard, leases, agents, retries and the bundle, and (2026-10-22) on the RunPod launcher's pod clean-up, the tunnel
+  security check, the pod script's exit trap and the proxy-header guard.
+- RunPod, read-only and against the live API: balance, GPU prices, `GET /pods`, and the dry-run launcher. cloudflared is installed
+  (Homebrew) and a real quick tunnel was checked 3 times: only `/workers/*` answers through it, the rest gives 403, the agent bundle
+  downloads. The Mac's own DNS often can't resolve a new trycloudflare.com name, so `scripts/runpod.py` falls back to Cloudflare's
+  resolver for its self-test. **First real run (2026-10-22, run 1, 1 epoch, A4000, ~$0.04):** pod creation, the start script, the
+  agent claiming the run through the tunnel, dataset download, training (mAP50 0.116 after one epoch) and the artifact upload
+  worked, and the pod was deleted. The IMX export failed on a matplotlib version swap (fixed in `runpod_start.sh`, untested on a pod).
+  Run 2 (~$0.05): setup with the export tools passed, then the dataset download arrived cut short ("not a zip file"); the agent
+  now checks the received size, retries, and reports what arrived. Pod 3 (run 3, ~$0.09): the launcher deleted the pod in the middle of the
+  export after one failed look at RunPod (a blip in the Mac's internet); it now tolerates 10 minutes of that. Pod 4 (run 3 again,
+  ~$0.26, the pod's whole hour): trained, then the upload of `best.pt` was cut off 13 times in a row (heartbeats on the same tunnel
+  were fine, and the same upload had worked twice before) until the pod's time limit killed it; cause unknown, candidates in
+  `agents/RUNPOD.md`. Since then: the agent gives up on an unreachable backend after 15 minutes on a pod (`MT_PATIENCE`), still runs
+  the IMX export if only the `best.pt` upload failed and says so in the run's error, and the launcher reports an unfinished run
+  instead of "ended by itself". **Pod 5 (run 4, ~$0.07) passed end to end:** dataset from the R2 bucket, training, `best.pt` upload, and the **IMX export**
+  (`packerOut.zip` + `labels.txt`); the pod deleted itself. **Not verified:** `imx500-package` on the Pi and the box format. Four pods on three runs cost $0.45; balance $14.55 of $15.00. Run 3 is dead (stage `training`, lease expired about 06:36 IST;
+  the next launch releases it) and its `best_pt` is from pod 3.
 - Real Ultralytics training and mid-training cancel on CPU, with correct metrics reaching the backend.
 - The whole UI end to end in a browser on throwaway data: queue, live progress, stages, cancel, delete, downloads.
 - Bundle export -> import round trip, row for row and byte for byte.
@@ -295,7 +471,8 @@ Verified on the previous machine (a Mac mini M2, CPU only):
 
 In rough priority order:
 1. **Prove the toolchain** (section 3, steps 8-10).
-2. **Auto-labeling** (the biggest time saver): propose boxes with an open-vocabulary detector (Grounding DINO or OWLv2),
+2. **Auto-labeling** (the biggest time saver; the AI check, section 4.8, already proposes boxes for images with none, from the
+   trained detector + SAM; still to do: an open-vocabulary detector for classes the YOLO cannot see yet): propose boxes with (Grounding DINO or OWLv2),
    optionally refine with SAM 2, store as `annotations` with `status=auto` and a confidence, and let the user correct in
    the review UI. The local 3060 12 GB is plenty. Implement as a new job type or a worker kind, like the training agents.
 3. **Composite generator** (v1 generation): SAM-cut drones from reviewed images pasted onto sky/background images at random
@@ -330,6 +507,11 @@ In rough priority order:
 - Windows/WSL: `.gitattributes` forces LF and marks images binary. If the bundle import says "corrupted", a checkout
   rewrote bytes; re-clone with `git config core.autocrlf false`.
 - Don't let two backends (or two machines) edit the same project. The bundle is one-way.
+- **Mutation-testing by rewriting a source file and rerunning pytest can leave stale bytecode**: a pyc records the source's mtime in
+  whole seconds and its size, so a mutation and its restoration made in the same second with the same size keep the mutated pyc. Run the
+  mutated tests with `python -B` / `PYTHONDONTWRITEBYTECODE=1` and delete `__pycache__` afterwards (this once left two tests failing
+  against restored source).
+- macOS clears `/tmp` on reboot (and the Claude Code scratchpad lives there): keep anything you need in `backend/data/` (git-ignored) or the repo.
 
 ## 9. Rules for working here
 

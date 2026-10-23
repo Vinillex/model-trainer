@@ -8,6 +8,8 @@ export default {
   ],
   theme: {
     extend: {
+      // "short:" = a window under 700 px tall: the review screen's panel gets denser so every button still fits.
+      screens: { short: { raw: "(max-height: 700px)" } },
       colors: {
         background: "var(--background)",
         foreground: "var(--foreground)",

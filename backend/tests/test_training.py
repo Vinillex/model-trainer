@@ -91,6 +91,34 @@ def test_lan_clients_reach_only_worker_routes_and_need_the_token(client, lan):
     assert client.get("/workers/ping").status_code == 401                  # even locally the worker API needs the token
 
 
+@pytest.mark.parametrize("header", ["X-Forwarded-For", "x-forwarded-host", "Forwarded", "X-Real-IP", "CF-Connecting-IP", "CF-Ray",
+                                    "CDN-Loop", "True-Client-IP"])
+def test_a_request_through_a_tunnel_on_this_machine_is_not_trusted_as_local(client, lan, header):
+    # A tunnel client (cloudflared) connects from 127.0.0.1, so the headers it adds are the only sign the request came
+    # from the internet. Without this check, the whole unauthenticated API would be reachable through the tunnel.
+    assert client.get("/projects", headers={header: "203.0.113.9"}).status_code == 403
+    assert client.get("/health", headers={header: "127.0.0.1"}).status_code == 403           # a forged "local" value changes nothing
+    assert client.delete("/datasets/1", headers={**hdr(), header: "203.0.113.9"}).status_code == 403
+    assert client.get("/workers/ping", headers={**hdr(), header: "203.0.113.9"}).json() == {"ok": True}   # workers still get in
+    assert client.get("/workers/ping", headers={header: "203.0.113.9"}).status_code == 401                # but only with the token
+    assert client.get("/projects").status_code == 200                                        # and the local browser is unaffected
+
+
+def test_a_new_machine_can_fetch_the_agent_code_with_the_token_only(client, lan, tmp_path):
+    import io
+    import tarfile
+    from pathlib import Path
+
+    assert lan.get("/workers/agent").status_code == 401
+    r = lan.get("/workers/agent", headers=hdr())
+    assert r.status_code == 200 and r.headers["content-type"] == "application/gzip"
+    with tarfile.open(fileobj=io.BytesIO(r.content)) as tar:
+        names = sorted(m.name for m in tar.getmembers())
+        assert names == ["common.py", "gpu_agent.py", "requirements-gpu.txt"]          # only what a pod needs, nothing else from the repo
+        agents = Path(__file__).resolve().parents[2] / "agents"
+        assert tar.extractfile("gpu_agent.py").read() == (agents / "gpu_agent.py").read_bytes()   # the current local file
+
+
 def test_worker_api_is_disabled_without_a_token(client, monkeypatch):
     monkeypatch.setattr(settings, "worker_token", None)
     lan = TestClient(from_ip(app, "192.168.1.50"))
@@ -369,3 +397,24 @@ def test_unauthenticated_requests_do_not_count_as_the_server_serving_workers(cli
     training._last_served = datetime.now(timezone.utc) - timedelta(minutes=20)
     assert lan.get("/workers/ping").status_code == 401                             # no token
     assert training._last_served < datetime.now(timezone.utc) - timedelta(minutes=19)
+
+
+# ---------- setup lines from a pod (POST /workers/log) ----------
+
+def test_a_worker_can_report_setup_lines_and_they_land_in_its_own_file(lan):
+    from app.api.workers import worker_log_path
+    for line in ("[mt-pod 10:00:01] installing system packages", "[mt-pod 10:03:12] installing Python 3.11 and torch 2.9.1 (cu128)"):
+        assert lan.post("/workers/log", content=line.encode(), headers=hdr("runpod-mt-1022-1000")).status_code == 204
+    assert worker_log_path("runpod-mt-1022-1000").read_text().splitlines()[-1].endswith("(cu128)")
+    assert lan.post("/workers/log", content=b"x", headers={"X-Worker-Name": "pod"}).status_code == 401      # the token is required
+
+
+def test_a_worker_log_cannot_escape_its_folder_or_grow_without_limit(lan):
+    from app.api import workers
+    path = workers.worker_log_path("../../etc/passwd")
+    assert path.parent == workers.worker_log_path("ok").parent and path.name == "etc_passwd.log"
+    lan.post("/workers/log", content=b"a" * 5000 + b"\nsecond line", headers=hdr("big"))
+    assert workers.worker_log_path("big").read_text() == "a" * 2000 + "\n"                   # one line, cut at 2000 bytes
+    workers.worker_log_path("big").write_text("x" * workers.WORKER_LOG_MAX_BYTES)
+    lan.post("/workers/log", content=b"more", headers=hdr("big"))
+    assert workers.worker_log_path("big").stat().st_size == workers.WORKER_LOG_MAX_BYTES        # full: nothing more is kept

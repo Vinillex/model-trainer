@@ -72,7 +72,7 @@ export default function ScrapePanel({ projectId, classes, onImagesChanged }: { p
 
   const refresh = useCallback(async () => {
     try {
-      const next = await api.listJobs(projectId);
+      const next = await api.listJobs(projectId, "scrape");
       setJobs(next);
       // Reload stats/gallery when a job has added images, and the quota when a job finishes (it spent searches).
       let changed = false;

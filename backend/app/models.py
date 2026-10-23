@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from sqlalchemy import JSON, Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from .ai.verdict import FLAGGED
 from .db import Base
 
 
@@ -97,6 +98,39 @@ class Image(Base):
     hash: Mapped["ImageHash | None"] = relationship(cascade="all, delete-orphan", uselist=False)
     scrape_record: Mapped["ScrapeRecord | None"] = relationship(cascade="all, delete-orphan", uselist=False)
     import_record: Mapped["ImportRecord | None"] = relationship(cascade="all, delete-orphan", uselist=False)
+    upload_record: Mapped["UploadRecord | None"] = relationship(cascade="all, delete-orphan", uselist=False)
+
+    manual_check: Mapped["ManualCheck | None"] = relationship(cascade="all, delete-orphan", uselist=False)
+    ai_check: Mapped["AiCheck | None"] = relationship(back_populates="image", cascade="all, delete-orphan", uselist=False)
+    ai_dismissal: Mapped["AiDismissal | None"] = relationship(cascade="all, delete-orphan", uselist=False)
+
+    @property
+    def dataset(self) -> str | None:
+        """The public dataset an imported image came from; None for every other source."""
+        return self.import_record.dataset if self.source == Source.imported and self.import_record else None
+
+    @property
+    def ai_labelled(self) -> bool:
+        """Some of its boxes were drawn by the auto-label job and no person has saved them since (a save makes every box `reviewed`)."""
+        return any(a.status == AnnotationStatus.auto for a in self.annotations)
+
+    @property
+    def folder(self) -> str | None:
+        """The folder an uploaded image was uploaded in (<class>/uploaded/<folder>); None for loose uploads and every other source."""
+        return self.upload_record.folder if self.source == Source.uploaded and self.upload_record else None
+
+    @property
+    def ai_status(self) -> str | None:
+        """None = not checked by the AI; "stale" = the boxes were edited since; "dismissed" = a person reviewed these boxes
+        despite the AI's doubts (see AiDismissal); else the check's verdict (see AiCheck)."""
+        if self.ai_check is None:
+            return None
+        return "stale" if self.ai_check.stale else "dismissed" if self.ai_check.dismissed else self.ai_check.verdict
+
+    @property
+    def manually_checked(self) -> bool | None:
+        """Whether the person has opened this imported image in the review window; None where the tag doesn't apply."""
+        return None if self.source != Source.imported else self.manual_check is not None
 
 
 class Annotation(Base):
@@ -176,6 +210,69 @@ class ImportRecord(Base):
     dataset_url: Mapped[str] = mapped_column(String(500))
     license: Mapped[str] = mapped_column(String(80))
     author: Mapped[str] = mapped_column(String(200))
+
+
+class UploadRecord(Base):
+    """An uploaded image that came in with a folder: which folder (it is also the last part of the image's storage path) and where it
+    sat inside it. Its own table because there are no migrations (create_all never adds a column)."""
+
+    __tablename__ = "upload_records"
+
+    image_id: Mapped[int] = mapped_column(ForeignKey("images.id"), primary_key=True)
+    folder: Mapped[str] = mapped_column(String(80), index=True)
+    original_path: Mapped[str] = mapped_column(String(500))  # relative to where the folder was picked, e.g. "flight-1/day2/img001.jpg"
+
+
+class ManualCheck(Base):
+    """An imported image the person has opened in the review window, i.e. looked at themselves.
+
+    Its own table because there are no migrations: create_all adds a table at startup but never a column to an existing one."""
+
+    __tablename__ = "manual_checks"
+
+    image_id: Mapped[int] = mapped_column(ForeignKey("images.id"), primary_key=True)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class AiCheck(Base):
+    """What the AI check last found on an image: a second opinion on its boxes, never part of them.
+
+    Its own table, not `annotations`: the review screen loads every annotation as a real box and saves them all back as `reviewed`, so a
+    suggestion stored there would turn into a label by accident. Nothing here changes a box or a review status. Own table also because
+    there are no migrations (create_all adds a table at startup, never a column)."""
+
+    __tablename__ = "ai_checks"
+
+    image_id: Mapped[int] = mapped_column(ForeignKey("images.id"), primary_key=True)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    model: Mapped[str] = mapped_column(String(120))  # which models made it, e.g. "sam2.1_s.pt + yolo run 5"
+    fingerprint: Mapped[str] = mapped_column(String(40))  # of the image's boxes when it was checked (app/ai/verdict.py)
+    stale: Mapped[bool] = mapped_column(Boolean, default=False, index=True)  # the boxes were edited after the check
+    verdict: Mapped[str] = mapped_column(String(16), index=True)  # the worst item: suspect > missing > adjust > too_small > ok > none
+    result: Mapped[dict] = mapped_column(JSON, default=dict)  # per-box items and suggestions, see app/ai/verdict.py
+
+    image: Mapped["Image"] = relationship(back_populates="ai_check")
+
+    @property
+    def dismissed(self) -> bool:
+        """A flagged, current check whose boxes a person has since saved as reviewed (see AiDismissal): it no longer asks for a look."""
+        d = self.image.ai_dismissal
+        return not self.stale and self.verdict in FLAGGED and d is not None and d.fingerprint == self.fingerprint
+
+
+class AiDismissal(Base):
+    """A person saved an image as reviewed (accepted or rejected) while the AI had flagged it: they have seen its doubts and decided.
+
+    The fingerprint is of the boxes they saved. The image stays out of "needs a look" for exactly those boxes, whatever a later check
+    (a forced re-run, new rules) says about them, and is listed again only once its boxes change and a new check flags the new boxes.
+    Never recorded for an image the AI had not flagged, so a later check can still raise doubts the person never saw.
+    Its own table for the same reason as ManualCheck: there are no migrations, so a column on ai_checks would not exist in the live database."""
+
+    __tablename__ = "ai_dismissals"
+
+    image_id: Mapped[int] = mapped_column(ForeignKey("images.id"), primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(40))
+    dismissed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class UrlOutcome(str, enum.Enum):

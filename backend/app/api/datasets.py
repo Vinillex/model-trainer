@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
-from .. import datasets
+from .. import dataset_bucket, datasets
 from ..db import get_db
 from ..models import DatasetVersion, TrainingRun
 from ..schemas import DatasetCreate, DatasetOut
@@ -96,6 +96,7 @@ def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
     version = get_version(db, dataset_id)
     if db.scalar(select(TrainingRun.id).where(TrainingRun.dataset_id == dataset_id).limit(1)) is not None:
         raise HTTPException(409, "Training runs use this dataset version. Delete those runs first.")
+    dataset_bucket.forget(version)  # before the manifest goes: the bucket's key is derived from it
     get_storage().delete(version.manifest_key)
     db.delete(version)
     db.commit()

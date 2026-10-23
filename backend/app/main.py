@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import annotations, datasets as datasets_api, images, jobs as jobs_api, projects, training as training_api, workers
+from .api import ai as ai_api, annotations, datasets as datasets_api, images, jobs as jobs_api, projects, training as training_api, workers
 from . import jobs
 from .config import settings
 from .db import Base, engine
@@ -30,6 +30,7 @@ app.add_middleware(LoopbackOnly)  # added last = outermost: LAN clients reach no
 app.include_router(projects.router)
 app.include_router(images.router)
 app.include_router(annotations.router)
+app.include_router(ai_api.router)
 app.include_router(jobs_api.router)
 app.include_router(datasets_api.router)
 app.include_router(training_api.router)

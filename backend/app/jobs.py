@@ -10,12 +10,14 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
+from .ai.job import handle_ai_check
 from .db import SessionLocal
 from .models import Job, JobStatus
 from .scrape import handle_scrape
 
 HANDLERS: dict[str, Callable[[Session, Job], None]] = {
     "scrape": handle_scrape,
+    "ai_check": handle_ai_check,
 }
 
 

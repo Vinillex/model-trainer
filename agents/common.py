@@ -37,7 +37,9 @@ class Api:
         self.backoff_base, self.backoff_max, self.max_wait = backoff_base, backoff_max, max_wait
 
     def _once(self, method: str, path: str, body, file: Path | None, timeout: float, out: Path | None) -> bytes:
-        headers = dict(self.headers)
+        # A full https address is a signed link to somewhere else (the dataset bucket): it must never get the worker token.
+        external = path.startswith(("https://", "http://"))
+        headers = {} if external else dict(self.headers)
         data = None
         if body is not None:
             data, headers["Content-Type"] = json.dumps(body).encode(), "application/json"
@@ -45,14 +47,21 @@ class Api:
         try:
             if fh:
                 data, headers["Content-Length"] = fh, str(file.stat().st_size)
-            req = urllib.request.Request(self.server + path, data=data, method=method, headers=headers)
+            req = urllib.request.Request(path if external else self.server + path, data=data, method=method, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if out is None:
                     return resp.read()
+                expected = resp.headers.get("Content-Length")
                 part = out.with_name(out.name + ".part")
+                got = 0
                 with open(part, "wb") as f:
                     while chunk := resp.read(1 << 20):
                         f.write(chunk)
+                        got += len(chunk)
+                if expected is not None and got != int(expected):
+                    # A connection that dies mid-transfer just ends the stream: without this check a cut-off file is kept as if complete.
+                    part.unlink(missing_ok=True)
+                    raise http.client.IncompleteRead(b"", int(expected) - got)
                 os.replace(part, out)
                 return b""
         finally:
@@ -63,24 +72,27 @@ class Api:
              retry: bool = True, timeout: float = 120) -> bytes:
         """One API call. With retry=True, outages and 5xx responses are retried with backoff (up to max_wait)."""
         started, attempt = time.monotonic(), 0
+        external = path.startswith(("https://", "http://"))
+        # A signed link is a password for one file until it expires: logs and errors show it without its signature.
+        shown, where = (path.split("?", 1)[0], "the dataset bucket") if external else (path, self.server)
         while True:
             try:
                 return self._once(method, path, body, file, timeout, out)
             except urllib.error.HTTPError as e:  # before URLError: HTTPError is a subclass of it
                 detail = _detail(e.read())
-                if e.code == 409:
+                if e.code == 409 and not external:
                     raise LeaseLost(e.code, detail) from None
                 if e.code < 500 or not retry:
-                    raise ApiError(e.code, detail) from None
+                    raise ApiError(e.code, f"{shown}: {detail}" if external else detail) from None
                 problem = f"HTTP {e.code}: {detail}"
             except _NETWORK_ERRORS as e:
                 if not retry:
-                    raise ApiError(0, f"can't reach {self.server} ({type(e).__name__}: {e})") from None
-                problem = f"can't reach {self.server} ({type(e).__name__})"
+                    raise ApiError(0, f"can't reach {where} ({type(e).__name__}: {e})") from None
+                problem = f"can't reach {where} ({type(e).__name__})"
             wait = min(self.backoff_base * 2 ** attempt, self.backoff_max)
             if time.monotonic() - started + wait > self.max_wait:
-                raise ApiError(0, f"gave up on {method} {path} after {self.max_wait:.0f}s: {problem}")
-            log.warning("%s %s: %s; retrying in %.0fs", method, path, problem, wait)
+                raise ApiError(0, f"gave up on {method} {shown} after {self.max_wait:.0f}s: {problem}")
+            log.warning("%s %s: %s; retrying in %.0fs", method, shown, problem, wait)
             time.sleep(wait)
             attempt += 1
 
