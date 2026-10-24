@@ -375,6 +375,30 @@ class DatasetOut(BaseModel):
     stats: dict
 
 
+class CloudCopyOut(BaseModel):
+    key: str
+    size: int
+    modified: datetime
+    dataset_id: int | None  # the version this is the copy of; None = no version of this project matches (deleted, or from an earlier database)
+    dataset_name: str | None
+    in_use: bool  # a run on that version is waiting for a worker or training: its pod may still need the zip
+
+
+class CloudCopiesOut(BaseModel):
+    enabled: bool  # the bucket is set up (MT_DATASET_BUCKET*)
+    copies: list[CloudCopyOut]
+    total_bytes: int
+
+
+class CloudDeleteIn(BaseModel):
+    keys: list[str] = Field(min_length=1, max_length=200)
+
+
+class CloudDeleteOut(BaseModel):
+    deleted: int
+    freed_bytes: int
+
+
 class TrainingRunCreate(BaseModel):
     dataset_id: int
     name: str | None = Field(None, min_length=1, max_length=120)  # defaults to run-<id>

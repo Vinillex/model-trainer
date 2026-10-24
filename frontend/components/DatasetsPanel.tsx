@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import CloudCopies from "@/components/CloudCopies";
 import { SELECTABLE_SOURCES, api, datasetDownloadUrl, parseUtc, type DataSelection, type DatasetPreview, type DatasetVersion } from "@/lib/api";
 
 const SPLITS = ["train", "val", "test"] as const;
@@ -238,6 +239,8 @@ export default function DatasetsPanel({ projectId, refreshKey }: { projectId: nu
         </button>
       </form>
       {error && <p className="text-sm text-red-600">{error}</p>}
+      {/* Shown only with a bucket set up. Reloads when a version is created or deleted (deleting one also deletes its copy). */}
+      <CloudCopies projectId={projectId} refreshKey={refreshKey + versions.length} />
       <ul className="space-y-3">
         {versions.map((v) => (
           <VersionCard key={v.id} v={v} onDeleted={load} />

@@ -10,8 +10,8 @@ from starlette.background import BackgroundTask
 
 from .. import dataset_bucket, datasets
 from ..db import get_db
-from ..models import DatasetVersion, TrainingRun
-from ..schemas import DatasetCreate, DatasetOut
+from ..models import DatasetVersion, RunStage, TrainingRun
+from ..schemas import CloudCopiesOut, CloudCopyOut, CloudDeleteIn, CloudDeleteOut, DatasetCreate, DatasetOut
 from ..storage import get_storage
 from ..yolo_export import MissingImages, make_zip_file
 from .projects import get_project
@@ -68,6 +68,61 @@ def create_dataset(project_id: int, body: DatasetCreate, db: Session = Depends(g
 def list_datasets(project_id: int, db: Session = Depends(get_db)):
     get_project(db, project_id)
     return db.scalars(select(DatasetVersion).where(DatasetVersion.project_id == project_id).order_by(DatasetVersion.id.desc())).all()
+
+
+def _cloud_state(db: Session, project_id: int) -> list[CloudCopyOut]:
+    """The project's zips in the bucket, each with the dataset version it is the copy of (matched the way they are named) and whether a run needs it."""
+    versions = db.scalars(select(DatasetVersion).where(DatasetVersion.project_id == project_id)).all()
+    busy = set(db.scalars(select(TrainingRun.dataset_id).where(TrainingRun.project_id == project_id,
+                                                               TrainingRun.stage.in_([RunStage.queued, RunStage.training]))))
+    by_key = {}
+    for v in versions:
+        try:
+            by_key[dataset_bucket.key_for(v)] = v
+        except Exception:  # noqa: BLE001 - a version whose manifest is gone has no key to match
+            pass
+    try:
+        copies = dataset_bucket.list_copies(project_id)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"The cloud storage did not answer: {e}")
+    out = []
+    for c in copies:
+        v = by_key.get(c["key"])
+        out.append(CloudCopyOut(**c, dataset_id=v.id if v else None, dataset_name=v.name if v else None, in_use=v is not None and v.id in busy))
+    return out
+
+
+@router.get("/projects/{project_id}/datasets/cloud", response_model=CloudCopiesOut)
+def cloud_copies(project_id: int, db: Session = Depends(get_db)):
+    """The dataset zips this project has in the cloud bucket (Cloudflare R2), for RunPod pods to download. Empty and `enabled: false` without a bucket."""
+    get_project(db, project_id)
+    if not dataset_bucket.enabled():
+        return CloudCopiesOut(enabled=False, copies=[], total_bytes=0)
+    copies = _cloud_state(db, project_id)
+    return CloudCopiesOut(enabled=True, copies=copies, total_bytes=sum(c.size for c in copies))
+
+
+@router.post("/projects/{project_id}/datasets/cloud/delete", response_model=CloudDeleteOut)
+def delete_cloud_copies(project_id: int, body: CloudDeleteIn, db: Session = Depends(get_db)):
+    """Delete these cloud copies. The dataset versions stay: the next RunPod run on one uploads its zip again (slow from this Mac). All or nothing
+    before anything is deleted: a key that is not a copy of this project's, or one a run is waiting for, refuses the whole request."""
+    get_project(db, project_id)
+    if not dataset_bucket.enabled():
+        raise HTTPException(409, "No cloud storage is set up.")
+    keys = sorted(set(body.keys))
+    bad = [k for k in keys if not dataset_bucket.is_copy_key(project_id, k)]
+    if bad:
+        raise HTTPException(422, f"not a dataset copy of this project: {bad[0]}")
+    state = {c.key: c for c in _cloud_state(db, project_id)}
+    busy = [state[k] for k in keys if k in state and state[k].in_use]
+    if busy:
+        raise HTTPException(409, f"A training run on {busy[0].dataset_name} is still waiting or training and may need the zip. Delete its cloud copy once that run has finished or been cancelled.")
+    found = [k for k in keys if k in state]  # one that is already gone is just not counted
+    try:
+        dataset_bucket.delete_copies(found)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"The cloud storage refused or did not answer: {e}")
+    return CloudDeleteOut(deleted=len(found), freed_bytes=sum(state[k].size for k in found))
 
 
 @router.get("/datasets/{dataset_id}", response_model=DatasetOut)

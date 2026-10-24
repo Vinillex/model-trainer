@@ -9,6 +9,7 @@ Separate from MT_STORAGE_BACKEND: images and artifacts stay where they are; only
 """
 
 import hashlib
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -120,6 +121,35 @@ def link_if_stored(version: DatasetVersion) -> str | None:
         return link(key) if stored_size(key) is not None else None
     except Exception:  # noqa: BLE001 - the bucket is an optimisation; the backend route always works
         return None
+
+
+def project_prefix(project_id: int) -> str:
+    return f"datasets/{project_id}-"
+
+
+def is_copy_key(project_id: int, key: str) -> bool:
+    """Only keys that key_for() could have made for this project: a request can never name some other object of the bucket."""
+    return re.fullmatch(rf"datasets/{project_id}-[0-9a-f]{{20}}\.zip", key) is not None
+
+
+def list_copies(project_id: int) -> list[dict]:
+    """Every dataset zip the bucket holds for this project, newest first: {key, size, modified}."""
+    out, token = [], None
+    while True:
+        args = {"Bucket": settings.dataset_bucket, "Prefix": project_prefix(project_id)}
+        if token:
+            args["ContinuationToken"] = token
+        page = client().list_objects_v2(**args)
+        out += [{"key": o["Key"], "size": int(o["Size"]), "modified": o["LastModified"]} for o in page.get("Contents", []) if is_copy_key(project_id, o["Key"])]
+        if not page.get("IsTruncated"):
+            return sorted(out, key=lambda c: c["modified"], reverse=True)
+        token = page["NextContinuationToken"]
+
+
+def delete_copies(keys: list[str]) -> None:
+    """Delete these objects. Not best effort like forget(): a failure is raised, so the person is told it is still there."""
+    for key in keys:
+        client().delete_object(Bucket=settings.dataset_bucket, Key=key)
 
 
 def forget(version: DatasetVersion) -> None:

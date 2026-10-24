@@ -263,6 +263,22 @@ export interface DatasetPreview {
 
 type SplitName = "train" | "val" | "test";
 
+/** A dataset zip in the cloud bucket (Cloudflare R2): what RunPod pods download. */
+export interface CloudCopy {
+  key: string;
+  size: number;
+  modified: string;
+  dataset_id: number | null; // null: no version of this project matches it any more
+  dataset_name: string | null;
+  in_use: boolean; // a run on that version is waiting or training, so its copy cannot be deleted yet
+}
+
+export interface CloudCopies {
+  enabled: boolean; // the bucket is set up
+  copies: CloudCopy[];
+  total_bytes: number;
+}
+
 export interface DatasetVersion {
   id: number;
   project_id: number;
@@ -517,6 +533,9 @@ export const api = {
   ) =>
     req<DatasetVersion>(`/projects/${projectId}/datasets`, json("POST", body)),
   deleteDataset: (id: number) => req<void>(`/datasets/${id}`, { method: "DELETE" }),
+  cloudCopies: (projectId: number) => req<CloudCopies>(`/projects/${projectId}/datasets/cloud`),
+  deleteCloudCopies: (projectId: number, keys: string[]) =>
+    req<{ deleted: number; freed_bytes: number }>(`/projects/${projectId}/datasets/cloud/delete`, json("POST", { keys })),
   deleteImage: (id: number) => req<void>(`/images/${id}`, { method: "DELETE" }),
   createTrainingRun: (projectId: number, body: TrainingParams) => req<TrainingRun>(`/projects/${projectId}/training-runs`, json("POST", body)),
   listTrainingRuns: (projectId: number) => req<TrainingRun[]>(`/projects/${projectId}/training-runs`),

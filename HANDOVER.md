@@ -245,6 +245,15 @@ id of a deleted image). Never rely on a manifest's recorded `key` alone.
 A dataset version used by a training run can't be deleted. If images are deleted after a version was made, its zip fails
 with a clear message (create a new version).
 
+**Cloud copies** (`dataset_bucket.py`, `CloudCopies.tsx`, shown on the Datasets page only when the R2 bucket is set up). A version's zip is copied to
+the bucket (`datasets/<project id>-<manifest hash>.zip`) the first time a RunPod run needs it and stays there until its version is deleted.
+`GET /projects/{id}/datasets/cloud` lists this project's copies (newest first, each with the version it belongs to, or none for an orphan from a
+reset database, and `in_use` while a run on that version is queued or training); `POST .../datasets/cloud/delete {keys}` deletes the chosen
+ones: keys must match `datasets/<project id>-<20 hex>.zip` exactly (422 otherwise, so no other object of the bucket can be named), a copy a run
+may still need is refused (409), and a storage failure is a 502, never silent. The versions themselves stay; the next RunPod run on one uploads
+its zip again (slow from this Mac). The UI: a checkbox per copy, "Select all but the newest" (keeps the newest copy that still has a version),
+and an inline confirm. Tested with a fake bucket and in the browser against a throwaway backend; **never run against the real bucket**.
+
 ### 4.5 Training pipeline (`training.py`, `api/workers.py`, `agents/`)
 ```
 UI "Train & export" -> POST /projects/{id}/training-runs   (refused if the version has no val images or no train boxes)
