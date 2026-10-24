@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import Response
 from PIL import Image as PILImage
 from PIL import UnidentifiedImageError
-from sqlalchemy import case, exists, func, select
+from sqlalchemy import and_, case, exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -20,6 +20,7 @@ from ..models import AiDismissal, Annotation, DetClass, Image, ImageHash, Import
 from ..refile import storage_key_for
 from ..schemas import FOLDER_PATTERN, FolderOut, ImageDetail, ImageIdsIn, ImageOut, ImportedDatasetOut, PurgeResult, RestoreResult, TrashDeleteIn, UploadResult
 from ..storage import get_storage
+from .annotations import set_doubts_aside
 from .projects import get_project
 
 router = APIRouter(tags=["images"])
@@ -56,7 +57,7 @@ def ingest_image(db: Session, project_id: int, cls: DetClass, source: Source, da
         with PILImage.open(io.BytesIO(data)) as im:
             fmt, (width, height) = im.format, im.size
         dhash = imagehash.dhash(data)
-    except (UnidentifiedImageError, OSError) as e:
+    except (UnidentifiedImageError, OSError, SyntaxError) as e:  # Pillow raises SyntaxError for a PNG with a bad checksum
         raise ValueError("not a decodable image") from e
     if fmt not in EXT_BY_FORMAT:
         raise ValueError(f"unsupported format {fmt}")
@@ -168,7 +169,8 @@ def list_images(project_id: int, class_id: int | None = None, box_class_id: int 
 
 @router.get("/projects/{project_id}/folders", response_model=list[FolderOut])
 def folders(project_id: int, db: Session = Depends(get_db)):
-    """Where the images live: one row per class, source and (imported dataset or upload folder), with how many are in each review state."""
+    """Where the images live: one row per class, source and (imported dataset or upload folder), with how many are in each review state.
+    `ai_flagged` leaves out the trash, like the Images page does: a rejected image the AI doubted is not waiting for anybody to look."""
     get_project(db, project_id)
     where = func.coalesce(ImportRecord.dataset, UploadRecord.folder)
     count = lambda cond: func.sum(case((cond, 1), else_=0))  # noqa: E731
@@ -176,7 +178,7 @@ def folders(project_id: int, db: Session = Depends(get_db)):
     rows = db.execute(
         select(Image.class_id, Image.source, where, func.count(), count(Image.review_status == ReviewStatus.reviewed),
                count(Image.review_status == ReviewStatus.pending), count(Image.review_status == ReviewStatus.rejected),
-               count(ai_condition("ok")), count(ai_condition("flagged")), count(ai_condition("unchecked")))
+               count(ai_condition("ok")), count(and_(ai_condition("flagged"), Image.review_status != ReviewStatus.rejected)), count(ai_condition("unchecked")))
         .outerjoin(ImportRecord, ImportRecord.image_id == Image.id).outerjoin(UploadRecord, UploadRecord.image_id == Image.id)
         .where(Image.project_id == project_id).group_by(Image.class_id, Image.source, where).order_by(Image.class_id, Image.source, where))
     return [FolderOut(class_id=c, source=s, folder=f, total=t, reviewed=r, pending=p, rejected=x, ai_ok=ok, ai_flagged=fl, ai_unchecked=un)
@@ -277,7 +279,7 @@ def _in_trash(db: Session, project_id: int, image_ids: list[int]) -> list[Image]
     """The rejected images with these ids. All or nothing: an id that is not a rejected image of this project refuses the whole request."""
     ids = sorted(set(image_ids))
     found = db.scalars(select(Image).where(Image.project_id == project_id, Image.id.in_(ids), Image.review_status == ReviewStatus.rejected)
-                       .options(selectinload(Image.ai_dismissal))).all()
+                       .options(selectinload(Image.ai_dismissal), selectinload(Image.ai_check))).all()
     other = set(ids) - {i.id for i in found}
     if other:
         raise HTTPException(422, f"not rejected images of this project: {sorted(other)[:10]}")
@@ -286,13 +288,15 @@ def _in_trash(db: Session, project_id: int, image_ids: list[int]) -> list[Image]
 
 @router.post("/projects/{project_id}/images/restore", response_model=RestoreResult)
 def restore_images(project_id: int, body: ImageIdsIn, db: Session = Depends(get_db)):
-    """Take rejected images out of the trash: they become "not reviewed" again, boxes as they were. The AI's doubts about them come back too
-    (the decision recorded when they were rejected is forgotten), so they are looked at again."""
+    """Take rejected images out of the trash: they stay in the class they were filed under, boxes as they were, and become "not reviewed" again,
+    except a hard-negative picture (no boxes, nothing to review), which is reviewed as it was. Restoring says nothing about the AI: a doubt it
+    had about the picture is set aside, so a restored image never lands on "AI: needs a look"."""
     get_project(db, project_id)
     images = _in_trash(db, project_id, body.image_ids)
+    negatives = set(db.scalars(select(DetClass.id).where(DetClass.project_id == project_id, DetClass.is_negative.is_(True))))
     for image in images:
-        image.review_status = ReviewStatus.pending
-        image.ai_dismissal = None
+        image.review_status = ReviewStatus.reviewed if image.class_id in negatives else ReviewStatus.pending
+        set_doubts_aside(image)
     db.commit()
     return RestoreResult(restored=len(images))
 

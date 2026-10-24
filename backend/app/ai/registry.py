@@ -20,7 +20,10 @@ class AiUnavailable(RuntimeError):
 SAM_FILES = {"t": "sam2.1_t.pt", "s": "sam2.1_s.pt", "b": "sam2.1_b.pt", "l": "sam2.1_l.pt"}
 SAM_HINTS = {"t": "tiny: fastest, roughest boxes", "s": "small: the default", "b": "base: tighter boxes, slower", "l": "large: tightest boxes, slowest"}
 FILE_NAME = r"[A-Za-z0-9][A-Za-z0-9._-]{0,76}\.pt"
-DETECTOR_PATTERN = rf"^(run:\d+|file:{FILE_NAME})$"
+YOLOE_ID = "yoloe:26s"  # the text-prompt detector (app/ai/yoloe.py); its files live in models_dir()/yoloe and are downloaded on first use
+YOLOE_LABEL = "YOLOE-26s (text prompts)"
+YOLOE_DOWNLOAD_MB = 285
+DETECTOR_PATTERN = rf"^(run:\d+|file:{FILE_NAME}|{YOLOE_ID})$"
 MAX_UPLOAD = 300 * 1024 * 1024  # the biggest YOLO11 model is ~120 MB
 
 
@@ -30,6 +33,16 @@ def models_dir() -> Path:
 
 def custom_dir() -> Path:
     return models_dir() / "custom"
+
+
+def yoloe_dir() -> Path:
+    return models_dir() / "yoloe"
+
+
+def yoloe_downloaded() -> bool:
+    from .yoloe import ENCODER_FILE, WEIGHTS_FILE
+
+    return all((yoloe_dir() / f).is_file() for f in (WEIGHTS_FILE, ENCODER_FILE))
 
 
 def clean_model_name(name: str) -> str | None:
@@ -53,7 +66,7 @@ def run_weights(run: TrainingRun) -> Path | None:
 
 
 def list_detectors(db: Session) -> list[dict]:
-    """Every detector a run can use: finished training runs (newest first), then uploaded files."""
+    """Every detector a run can use: finished training runs (newest first), uploaded files, then the text-prompt detector."""
     out = []
     for run in db.scalars(select(TrainingRun).where(TrainingRun.stage == RunStage.done).order_by(TrainingRun.id.desc())):
         if (run.artifacts or {}).get("best_pt", {}).get("key"):
@@ -61,6 +74,7 @@ def list_detectors(db: Session) -> list[dict]:
     if custom_dir().is_dir():
         out += [{"id": f"file:{p.name}", "label": f"{p.name} (uploaded)", "kind": "file", "map50": None}
                 for p in sorted(custom_dir().glob("*.pt")) if re.fullmatch(FILE_NAME, p.name)]
+    out.append({"id": YOLOE_ID, "label": YOLOE_LABEL, "kind": "prompt", "map50": None, "downloaded": yoloe_downloaded()})
     return out
 
 
@@ -73,6 +87,8 @@ def resolve_detector(db: Session, detector: str | None, default) -> tuple[str, P
         return f"default:{found[0]}", found[0], found[1]
     if not re.fullmatch(DETECTOR_PATTERN, detector):
         raise AiUnavailable(f"unknown detector {detector!r}")
+    if detector == YOLOE_ID:
+        return detector, yoloe_dir(), YOLOE_LABEL  # a folder, not a file: it holds the weights and the text encoder
     kind, _, name = detector.partition(":")
     if kind == "run":
         run = db.get(TrainingRun, int(name))

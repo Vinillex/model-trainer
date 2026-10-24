@@ -8,7 +8,7 @@ from .. import refile
 from ..ai.verdict import FLAGGED, fingerprint
 from ..db import get_db
 from ..models import AiDismissal, Annotation, AnnotationStatus, DetClass, Image, ReviewStatus
-from ..schemas import AnnotationsPut, ImageDetail, ImageIdsIn, RejectResult
+from ..schemas import AnnotationsPut, DismissResult, ImageDetail, ImageIdsIn, RejectResult
 from .projects import get_project
 
 router = APIRouter(tags=["annotations"])
@@ -34,6 +34,19 @@ def apply_annotations(db: Session, image: Image, boxes: list[dict], review_statu
                 image.ai_dismissal = AiDismissal(image_id=image.id, fingerprint=saved)
             else:
                 image.ai_dismissal.fingerprint, image.ai_dismissal.dismissed_at = saved, datetime.now(timezone.utc)
+
+
+def set_doubts_aside(image: Image) -> bool:
+    """Record that the AI's doubts about the image's boxes as they are now have been seen and set aside (it leaves "AI: needs a look"). Does
+    nothing, and says so, when there is no current flagged check."""
+    check = image.ai_check
+    if check is None or check.stale or check.verdict not in FLAGGED:
+        return False
+    if image.ai_dismissal is None:
+        image.ai_dismissal = AiDismissal(image_id=image.id, fingerprint=check.fingerprint)
+    else:
+        image.ai_dismissal.fingerprint, image.ai_dismissal.dismissed_at = check.fingerprint, datetime.now(timezone.utc)
+    return True
 
 
 @router.put("/images/{image_id}/annotations", response_model=ImageDetail)
@@ -79,3 +92,20 @@ def reject_images(project_id: int, body: ImageIdsIn, db: Session = Depends(get_d
         apply_annotations(db, image, boxes, ReviewStatus.rejected, ai_dismiss=True)
     db.commit()
     return RejectResult(rejected=len(images))
+
+
+@router.post("/projects/{project_id}/images/ai-dismiss", response_model=DismissResult)
+def dismiss_ai_doubts(project_id: int, body: ImageIdsIn, db: Session = Depends(get_db)):
+    """Keep several images as they are although the AI flagged them: the same record a review Save makes (the AI's doubts about exactly these
+    boxes are set aside, so the images leave "AI: needs a look"), without saving anything. This is how a flagged hard-negative picture, which the
+    review screen only shows, is kept. A later check that flags other boxes brings an image back. All or nothing, like Reject."""
+    get_project(db, project_id)
+    ids = sorted(set(body.image_ids))
+    images = db.scalars(select(Image).where(Image.project_id == project_id, Image.id.in_(ids))
+                        .options(selectinload(Image.ai_check), selectinload(Image.ai_dismissal))).all()
+    unknown = set(ids) - {i.id for i in images}
+    if unknown:
+        raise HTTPException(422, f"not images of this project: {sorted(unknown)[:10]}")
+    count = sum(set_doubts_aside(image) for image in images)
+    db.commit()
+    return DismissResult(dismissed=count)

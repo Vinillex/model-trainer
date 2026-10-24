@@ -8,7 +8,8 @@ export interface GalleryFilters {
   boxClassId?: number;
   /** One choice, so a source, an imported dataset and an upload folder can't be combined: "", "source:scraped", "dataset:anti-uav" or "folder:flight-1". */
   scope: string;
-  reviewStatus?: ReviewStatus;
+  /** Rejected images are in the Trash and never listed on the Images page, so they are not a choice here. */
+  reviewStatus?: Exclude<ReviewStatus, "rejected">;
   /** Imported images only: true = opened in the review window, false = not yet. */
   manualCheck?: boolean;
   /** The AI check: "unchecked", "stale", "ok", "flagged", "dismissed", "too_small" or "autolabelled"; undefined = any. */
@@ -18,25 +19,37 @@ export interface GalleryFilters {
 export const NO_FILTERS: GalleryFilters = { scope: "" };
 
 const key = (projectId: number) => `gallery-filters:${projectId}`;
+const trashKey = (projectId: number) => `trash-filters:${projectId}`;
 
-/** Per tab (sessionStorage), so the review screen and a return to the main page see the same filters. Never throws. */
-export function loadGalleryFilters(projectId: number): GalleryFilters {
+function load(storageKey: string): GalleryFilters {
   try {
-    const raw = sessionStorage.getItem(key(projectId));
-    if (raw) return { ...NO_FILTERS, ...JSON.parse(raw) };
+    const raw = sessionStorage.getItem(storageKey);
+    if (raw) {
+      const { reviewStatus, ...rest } = JSON.parse(raw);
+      return { ...NO_FILTERS, ...rest, ...(reviewStatus === "rejected" ? {} : { reviewStatus }) }; // an older tab may still hold "rejected"
+    }
   } catch {
     // storage blocked or the value is not JSON: fall back to no filters
   }
   return NO_FILTERS;
 }
 
-export function saveGalleryFilters(projectId: number, filters: GalleryFilters) {
+function save(storageKey: string, filters: GalleryFilters) {
   try {
-    sessionStorage.setItem(key(projectId), JSON.stringify(filters));
+    sessionStorage.setItem(storageKey, JSON.stringify(filters));
   } catch {
     // filters then just don't carry over to the review screen
   }
 }
+
+/** Per tab (sessionStorage), so the review screen and a return to the main page see the same filters. Never throws. */
+export const loadGalleryFilters = (projectId: number) => load(key(projectId));
+export const saveGalleryFilters = (projectId: number, filters: GalleryFilters) => save(key(projectId), filters);
+
+/** The Trash page's own filters (where from, class), kept apart from the Images page's: opening a rejected image in the review screen shows the
+ *  trash queue and must not change what the Images page lists. */
+export const loadTrashFilters = (projectId: number) => load(trashKey(projectId));
+export const saveTrashFilters = (projectId: number, filters: GalleryFilters) => save(trashKey(projectId), filters);
 
 export function scopeFilter(scope: string): { source?: Source; dataset?: string; folder?: string } {
   if (scope.startsWith("source:")) return { source: scope.slice("source:".length) as Source };
@@ -47,8 +60,13 @@ export function scopeFilter(scope: string): { source?: Source; dataset?: string;
 
 /** What the gallery and the review screen both send to list images: one place, so the review queue is exactly the gallery's list. */
 export function imageQuery(f: GalleryFilters) {
-  // Rejected images live in the Trash: they stay out of the Images page and the review queue unless a review status is chosen on purpose.
-  return { classId: f.classId, boxClassId: f.boxClassId, excludeRejected: f.reviewStatus === undefined, ...scopeFilter(f.scope), manuallyChecked: f.manualCheck, ai: f.ai, reviewStatus: f.reviewStatus };
+  // Rejected images live in the Trash: they are never on the Images page or in its review queue.
+  return { classId: f.classId, boxClassId: f.boxClassId, excludeRejected: true, ...scopeFilter(f.scope), manuallyChecked: f.manualCheck, ai: f.ai, reviewStatus: f.reviewStatus };
+}
+
+/** The review queue opened from the Trash: the rejected images of the Trash page's filters. */
+export function trashQuery(f: GalleryFilters) {
+  return { classId: f.classId, ...scopeFilter(f.scope), reviewStatus: "rejected" as const };
 }
 
 export const AI_FILTERS: { value: string; label: string }[] = [
@@ -61,7 +79,7 @@ export const AI_FILTERS: { value: string; label: string }[] = [
   { value: "unchecked", label: "AI: not checked" },
 ];
 
-const STATUS_LABEL: Record<ReviewStatus, string> = { reviewed: "Reviewed", pending: "Not reviewed", rejected: "Rejected" };
+const STATUS_LABEL: Record<Exclude<ReviewStatus, "rejected">, string> = { reviewed: "Reviewed", pending: "Not reviewed" };
 
 /** A short read-only description of the filters, for the review screen's heading. */
 export function describeFilters(f: GalleryFilters, className: (id: number) => string): string {

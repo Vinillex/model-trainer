@@ -13,7 +13,7 @@ YOLO11n or YOLOv8n model on your own GPU, and package it as an `.rpk` for the So
 ## Third-party data
 
 See [DATA_LICENSES.md](DATA_LICENSES.md) for the attribution of datasets imported into the project (Anti-UAV, CC BY 4.0).
-Those images are included in `handover-data/` so a new machine gets them with `python -m scripts.bundle import`.
+Those images are included in `handover-data/` so a new machine gets them with `python -m scripts.bundle import`. That snapshot is from before 2026-10-24; datasets added since then are kept on the owner's machine and are not committed (`.gitignore`).
 
 ## About the images in `handover-data/`
 

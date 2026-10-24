@@ -226,6 +226,23 @@ def test_run_scrape_filters_and_stores(client, project):
         assert (p2["already_scraped"], p2["download_failed"], p2["too_small"], p2["added"]) == (7, 1, 1, 0)
 
 
+def test_a_png_with_a_bad_checksum_is_rejected_not_fatal(client, project):
+    """Pillow raises SyntaxError (not OSError) for it; once that aborted a whole scrape job after it had added 52 images."""
+    pid, ids = project
+    broken = bytearray(png(size=(64, 48)))
+    crc_at = broken.index(b"IDAT") + 4 + int.from_bytes(broken[broken.index(b"IDAT") - 4:broken.index(b"IDAT")], "big")
+    broken[crc_at] ^= 0xFF
+    pages = [[sr("https://a.test/broken.png"), sr("https://b.test/fine.jpg")]]
+    downloads = {"https://a.test/broken.png": bytes(broken), "https://b.test/fine.jpg": photo(7)}
+
+    job_id = make_job(client, pid, ids["multirotor"])
+    run(client, job_id, pages, downloads)
+
+    with client.session_factory() as db:
+        progress = db.get(Job, job_id).progress
+        assert (progress["added"], progress["rejected"]) == (1, 1)
+
+
 def test_run_scrape_stops_at_max_images_and_max_pages(client, project):
     pid, ids = project
     pages = [[sr(f"https://s{p}{i}.test/x.jpg") for i in range(5)] for p in range(5)]

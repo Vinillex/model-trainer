@@ -4,7 +4,7 @@ dataset version contains them)."""
 import pytest
 
 from app import storage
-from app.models import AiCheck, Annotation, Image, UploadRecord
+from app.models import AiCheck, Annotation, Image, ReviewStatus, UploadRecord
 
 from .test_ai_check import FakeModels, flagged_image, listed, save_boxes
 from .test_datasets import add, box
@@ -100,16 +100,30 @@ def test_restore_and_delete_only_take_rejected_images_of_this_project_all_or_not
     assert client.get(f"/images/{live}").json()["review_status"] == "reviewed"
 
 
-def test_a_restored_image_gets_the_ais_doubts_back(client, project):
+def test_a_restored_image_never_lands_on_the_ai_needs_a_look_list(client, project):
     pid, ids = project
     m = ids["multirotor"]
-    img = flagged_image(client, pid, m)                                                            # "needs a look"
-    save_boxes(client, img, m, status="rejected", dismiss=True)                                    # the review screen's Reject
-    assert listed(client, pid, "flagged")[0] == [] and listed(client, pid, "dismissed")[0] == [img["id"]]
-    restore(client, pid, [img["id"]])
-    assert listed(client, pid, "flagged")[0] == [img["id"]] and listed(client, pid, "dismissed")[0] == []
+    kept = flagged_image(client, pid, m)                                                           # "needs a look"
+    save_boxes(client, kept, m, status="rejected", dismiss=True)                                   # the review screen's Reject (the AI's doubt is set aside)
+    unseen = flagged_image(client, pid, m)
+    with client.session_factory() as db:                                                           # in the trash with the doubt never looked at
+        db.get(Image, unseen["id"]).review_status = ReviewStatus.rejected
+        db.commit()
+    assert restore(client, pid, [kept["id"], unseen["id"]]).json() == {"restored": 2}
+    assert listed(client, pid, "flagged")[0] == [] and set(listed(client, pid, "dismissed")[0]) == {kept["id"], unseen["id"]}
     with client.session_factory() as db:
-        assert db.get(AiCheck, img["id"]).verdict == "suspect"                                     # the check itself is untouched
+        assert db.get(AiCheck, kept["id"]).verdict == "suspect"                                    # the check itself is untouched
+
+
+def test_a_restored_hard_negative_picture_is_reviewed_as_it_was_and_stays_in_its_class(client, project):
+    pid, ids = project
+    bird = add(client, pid, ids["birds"])["id"]
+    drone = add(client, pid, ids["multirotor"], [box(ids["multirotor"])])["id"]
+    trash_it(client, pid, bird, drone)
+    restore(client, pid, [bird, drone])
+    got = lambda i: (client.get(f"/images/{i}").json()["review_status"], client.get(f"/images/{i}").json()["class_id"])
+    assert got(bird) == ("reviewed", ids["birds"])             # no boxes, nothing to review: it counts for training again at once
+    assert got(drone) == ("pending", ids["multirotor"])        # a picture with boxes is looked at again
 
 
 # ---------- deleting for good ----------

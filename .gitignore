@@ -9,3 +9,12 @@ node_modules/
 .DS_Store
 agents/work/
 agents/work-*/
+
+# Datasets stay on the owner's machine (decided 2026-10-24): downloaded exports, and any new data bundle.
+# Files already committed under handover-data/ stay tracked until `git rm -r --cached` is run on them.
+handover-data/
+*.zip
+
+# A model file Ultralytics fetched into the working directory instead of backend/data/ai (the AI models belong under data/, which is ignored).
+backend/*.pt
+backend/*.ts

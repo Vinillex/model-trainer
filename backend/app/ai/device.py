@@ -1,9 +1,11 @@
 """Which device the AI models run on, and what happens when the GPU refuses a call."""
 
+import threading
 from collections.abc import Callable
 from typing import TypeVar
 
 T = TypeVar("T")
+GPU_LOCK = threading.Lock()  # one GPU, one command stream: Metal aborts the whole backend when two threads (SAM and the detector, a batch job and a preview) encode at once
 GIVE_UP_AFTER = 5  # failures in a row on the GPU before the CPU is used for good
 
 

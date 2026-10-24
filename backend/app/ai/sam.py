@@ -1,12 +1,11 @@
 """SAM 2.1 (through Ultralytics) turns a rough box or a click into a tight box. Imported only when a check runs: needs requirements-ai.txt."""
 
-import threading
 from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
 
-from .device import Device
+from .device import GPU_LOCK, Device
 from .geometry import Box, crop_window, mask_to_box, shift_box
 
 
@@ -18,12 +17,11 @@ class Refined(NamedTuple):
 
 
 class SamRefiner:
-    """One SAM model, loaded on first use. Calls are serialized: the model is not thread-safe and the Mac has one GPU."""
+    """One SAM model, loaded on first use. Calls are serialized (GPU_LOCK, shared with the detector): the model is not thread-safe and the Mac has one GPU."""
 
     def __init__(self, weights: Path, device: str | None = None, context: float = 4.0, min_crop: int = 96):
         self.weights, self.device, self.context, self.min_crop = Path(weights), Device(device), context, min_crop
         self._model = None
-        self._lock = threading.Lock()
 
     def _load(self):
         if self._model is None:
@@ -50,15 +48,15 @@ class SamRefiner:
             args["bboxes"] = [[float(v) for v in shift_box(prompt, -x1, -y1)]]
         if point is not None:
             args |= {"points": [[float(point[0] - x1), float(point[1] - y1)]], "labels": [1]}
-        with self._lock:
+        with GPU_LOCK:  # reading the mask back is GPU work too
             result = self._predict(crop, **args)[0]
-        if result.masks is None or len(result.masks.data) == 0:
-            return None
-        mask = result.masks.data[0].cpu().numpy() > 0.5
+            if result.masks is None or len(result.masks.data) == 0:
+                return None
+            mask = result.masks.data[0].cpu().numpy() > 0.5
+            score = float(result.boxes.conf[0]) if result.boxes is not None and len(result.boxes) else 0.0
         box = mask_to_box(mask)
         if box is None:
             return None
-        score = float(result.boxes.conf[0]) if result.boxes is not None and len(result.boxes) else 0.0
         h, w = mask.shape
         touches = bool(mask[0, :].any() or mask[-1, :].any() or mask[:, 0].any() or mask[:, -1].any())
         return Refined(shift_box(box, x1, y1), score, int(mask.sum()), touches)

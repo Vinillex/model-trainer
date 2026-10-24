@@ -3,14 +3,14 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, imageUrl, type DetClass, type FolderRow, type ImageRow } from "@/lib/api";
-import { NO_FILTERS, saveGalleryFilters, scopeFilter } from "@/lib/galleryFilters";
+import { NO_FILTERS, saveTrashFilters, scopeFilter } from "@/lib/galleryFilters";
 import { useSelection } from "@/lib/useSelection";
 
 const PAGE = 48;
 
 type Step = "idle" | "confirm" | "versions"; // deleting for good: the plain "are you sure", then (only if needed) the dataset-version warning
 
-/** Every rejected image of the project, wherever it came from. Restore puts it back as "not reviewed"; Delete forever removes the file. */
+/** Every rejected image of the project, wherever it came from. Restore puts it back in its class; Delete forever removes the file. */
 export default function TrashPanel({ projectId, classes, refreshKey, onChanged }: { projectId: number; classes: DetClass[]; refreshKey: number; onChanged: () => void }) {
   const [classId, setClassId] = useState<number | "">("");
   const [scope, setScope] = useState("");
@@ -96,8 +96,8 @@ export default function TrashPanel({ projectId, classes, refreshKey, onChanged }
     }
   }
 
-  /** Opening a card reviews the trash: the review screen shows the queue these filters describe. */
-  const openFilters = () => saveGalleryFilters(projectId, { ...NO_FILTERS, scope, classId: classId === "" ? undefined : classId, reviewStatus: "rejected" });
+  /** Opening a card reviews the trash: the review screen (opened with from=trash) shows the queue these filters describe. */
+  const openFilters = () => saveTrashFilters(projectId, { ...NO_FILTERS, scope, classId: classId === "" ? undefined : classId });
 
   return (
     <div className="space-y-3">
@@ -182,10 +182,21 @@ export default function TrashPanel({ projectId, classes, refreshKey, onChanged }
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
         {images.map((img) => (
           <figure key={img.id} className={`group relative overflow-hidden rounded border ${selected.has(img.id) ? "border-blue-500 ring-2 ring-blue-500" : "border-neutral-300 dark:border-neutral-700"}`} data-testid={`trash-card-${img.id}`}>
-            <label className={`absolute left-1 top-1 items-center rounded bg-black/70 p-1 ${selected.size > 0 ? "flex" : "flex md:hidden md:group-hover:flex"}`} title="Select this image">
-              <input type="checkbox" checked={selected.has(img.id)} onChange={() => toggle(img.id)} aria-label={`Select image ${img.id}`} data-testid={`trash-select-${img.id}`} />
+            {/* Always shown and big: the page exists to pick images. z-10 because the faded picture below (opacity) is its own layer and would
+                otherwise sit on top of the box, so a click on it opened the review screen. */}
+            <label className="absolute left-1.5 top-1.5 z-10 flex cursor-pointer items-center rounded bg-black/70 p-2" title="Select this image">
+              <input type="checkbox" className="h-5 w-5 cursor-pointer" checked={selected.has(img.id)} onChange={() => toggle(img.id)} aria-label={`Select image ${img.id}`} data-testid={`trash-select-${img.id}`} />
             </label>
-            <Link href={`/projects/${projectId}/review?image=${img.id}`} onClick={openFilters} title="Open in the review screen">
+            <Link
+              href={`/projects/${projectId}/review?image=${img.id}&from=trash`}
+              onClick={(e) => {
+                if (selected.size > 0) {
+                  e.preventDefault(); // while picking, a click on the picture picks it too
+                  toggle(img.id);
+                } else openFilters();
+              }}
+              title={selected.size > 0 ? "Select this image" : "Open in the review screen"}
+            >
               {/* eslint-disable-next-line @next/next/no-img-element -- served by the API, not optimizable by next/image */}
               <img src={imageUrl(img.id)} alt={`${className(img.class_id)} #${img.id}`} loading="lazy" className="aspect-square w-full object-cover opacity-80" />
             </Link>

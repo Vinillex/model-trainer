@@ -9,8 +9,8 @@ export default function TrashPage() {
   return (
     <div>
       <SectionHeader title="Trash">
-        Every image you rejected, from every dataset and folder. They are kept out of the Images page, the review queue and new dataset versions. Restore puts them back as
-        &ldquo;not reviewed&rdquo;; Delete forever removes the files.
+        Every image you rejected, from every dataset and folder. They are kept out of the Images page, the review queue and new dataset versions. Restore puts them back in their class;
+        Delete forever removes the files.
       </SectionHeader>
       <TrashPanel projectId={projectId} classes={project.classes} refreshKey={refreshKey} onChanged={imagesChanged} />
     </div>

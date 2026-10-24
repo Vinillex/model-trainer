@@ -158,10 +158,13 @@ rules still apply, an empty list is refused, never "everything"). There is **no 
 turn unchecked boxes into training data. The selection is cleared whenever a filter changes and pruned to the images on screen after every reload.
 There is no "move to folder": moving existing images between folders is not built.
 **Trash.** Rejected images live in the **Trash** section (`TrashPanel.tsx`, drawer item with a count, a row in the Overview places table). They are
-kept out of the Images page and the review queue: `imageQuery()` sends `exclude_rejected` unless a review status is chosen on purpose (an explicit
-`review_status=rejected` still finds them), and dataset versions already exclude them. Places on the Overview count images without the trash.
-Select cards, then **Restore** (`POST /projects/{id}/images/restore`: back to "not reviewed", boxes as they were, and the AI's doubts return because
-the decision recorded at the reject is forgotten) or **Delete forever** (`POST .../images/delete`, inline confirm; rows first, files after, cascades
+kept out of the Images page and the review queue: the Images page has no "Rejected" filter and `imageQuery()` always sends `exclude_rejected`
+(the API's explicit `review_status=rejected` is what the Trash page uses), and dataset versions already exclude them. Places on the Overview
+count images without the trash. The Trash page keeps its own filters (`trash-filters:<project>` in sessionStorage, `trashQuery()`), so opening a
+trashed image in the review window (`?from=trash`: queue = the trash, "← Trash" goes back) never changes what the Images page shows. Cards have a
+big always-visible checkbox; once something is selected a click on a picture selects it too. Select cards, then **Restore**
+(`POST /projects/{id}/images/restore`: the image stays in its class, boxes as they were, "not reviewed" again, except a hard-negative picture
+(no boxes) which comes back reviewed; any AI doubt it had is set aside, so a restored image never lands on "AI: needs a look") or **Delete forever** (`POST .../images/delete`, inline confirm; rows first, files after, cascades
 included). Both take only rejected images of the project, all or nothing, up to 500. A frozen dataset version reads its image files whenever it is
 downloaded, so images that a version contains (matched on id and SHA-256: SQLite reuses ids) are refused with a 409 naming the version; the panel then
 offers "Delete anyway" (`allow_breaking_versions`). The single Delete on a gallery card is unchanged and unprotected, as before (a version then reports
@@ -295,7 +298,21 @@ thousands of files and belong to someone else (see `DATA_LICENSES.md`). Dataset 
 machine that has them. **The committed `handover-data/` was exported with `--include-imported`**, so a fresh clone gets Anti-UAV
 too; when you re-export for a push, decide again whether to pass the flag.
 
+**Negative mode (added 2026-10-24, not yet used on real data).** `--negative bird=birds` (repeatable) imports a dataset's frames as
+**hard-negative images**: the frame is kept only if *every* box is of a source class mapped with `--negative`, it is filed under that project
+negative class (`birds`, `balloons`, ...; anything else is refused before anything is written), reviewed, and gets **no boxes** (its boxes are only
+used to judge the frame; the sample sheet draws them in red). Dropped: frames that also have a `--map` or unmapped class (a drone next to the
+bird), frames with no boxes (unknown content), and frames where any boxed object is smaller than `--negative-min-size` (default **0.10** of the
+image's short side) because a tiny bird against the sky looks like a drone and teaching "not a drone" from it would blur the target (68% of our
+drone boxes are below 10%). Scenes, the per-scene cap, dedupe, `ImportRecord` and `rollback` work as for positives, and a dataset version
+picks the negatives up by imported-dataset name with "include negatives" on. Review the imported negatives in the review window (that is the manual
+check) and reject any that show a drone. Still a command-line tool: there is no import button yet.
+
 ### 4.7 The data bundle (`scripts/bundle.py`, `handover-data/`)
+**Policy from 2026-10-24: datasets are not committed any more.** `handover-data/` and `*.zip` are in `.gitignore`, and
+downloaded dataset exports live under `backend/data/imports/` (already ignored). What was committed before that date stays in
+git (tracked files are not affected by `.gitignore`, so `bundle export` still shows changes to the tracked `db.json` and
+`files.json`); step 1 below describes the old way of sharing data and needs a different channel (a drive, `rsync`) now.
 `export` dumps **every table** to `db.json` (primary-key order, no timestamps, so diffs are stable and re-export is
 repeatable), copies every stored file under `storage/`, and writes `files.json` with SHA-256s. `import` verifies every
 checksum *before* touching anything (catches CRLF conversion or a lost file), refuses a non-empty database, restores
@@ -417,6 +434,33 @@ editor (unsaved) like drawing would; Save / Accept & next persists them and `put
   "Interrupted by a server restart"; start it again (`POST /projects/1/jobs/ai-check {"limit": 20000}` or the AI panel): finished
   images are skipped, so it resumes. Restart by port: `lsof -ti tcp:8000 | xargs kill`, then `cd backend && source .venv/bin/activate &&
   uvicorn app.main:app --host 0.0.0.0 --port 8000`.
+- **YOLOE, the text-prompt detector (added 2026-10-24, uncommitted).** Detector id `yoloe:26s` in the AI panel; code in `app/ai/yoloe.py`
+  (class), `app/ai/prompts.py` (default words), `service.check_negative`, `job.build_prompts`. Files: `backend/data/ai/models/yoloe/`
+  `yoloe-26s-seg.pt` (31 MB) + `mobileclip2_b.ts` (254 MB text encoder), Ultralytics release assets, fetched on first use if absent (the
+  panel says so; they are built from that folder, never from the working directory, where Ultralytics would drop them; `backend/*.pt|*.ts`
+  is git-ignored as a net). It needs the `clip` fork pinned in `requirements-ai.txt`. Every call takes `GPU_LOCK`. Ultralytics code is
+  AGPL-3.0 and the YOLOE page states no licence for the weights: check before shipping anything built on them.
+  *Measured on 886 human-boxed drone images (scratch scripts, not kept):* one generic phrase **"drone aircraft"** finds 90% of drones of 32+ px
+  at score 0.10 and 82% at 0.25, but only 25% / 15% of the smaller ones (median drone here is 26 px), with 0.06 extra boxes per image at
+  0.25 (some are real unlabelled drones). **It cannot tell our classes apart by name**: "quadcopter drone" found 8% of the multirotors and
+  called most of them fixed-wing / interceptor / shahed. So a box is filed under the class its picture is filed in, and the person corrects
+  it in review. Scores run low (median 0.35 even for 64+ px drones), hence the 25% default (the trained detector's default is 50%).
+  Two things use it: **AI labelling with words** (mode "Draw boxes", pick the detector; boxes are `auto`, images stay pending; on 5 real
+  images the SAM-refined boxes had IoU 0.88-0.97 with the human labels) and **"Look inside the negatives"** (mode `negatives`): for each
+  picture in a hard-negative class it flags (a) a drone-like hit (default 25% sure; on the 340 kept birds 3% were hit, all real birds, mostly
+  flat-winged gulls and owls: useful hard examples, and a real drone hiding in a bird folder would show up), (b) a thing of the class's own
+  words ("bird") smaller than the floor (default 10% of the picture's short side, the importer's floor), (c) no such thing at all. Results are
+  ordinary `ai_checks` rows (drone hit = `missing`, the others `suspect`, plus a `negatives` block) so "AI: needs a look" lists them.
+  **Each negative class gets its own detector holding only the drone phrase and its own words**: with "airplane" and "bird" loaded together a
+  gull was called an airplane and never found as a bird. Not offered with the box check (its thresholds were tuned on the trained detector).
+  A negative picture has no boxes, so the review window shows **Keep as is & next** (Enter) and **Reject image** (X) instead of Accept/Save,
+  (Keep there is an Accept with no boxes, so a restored picture, which comes back "not reviewed", is reviewed again and used for training).
+  The gallery has the same two as bulk actions: Keep as is = `POST /projects/{id}/images/ai-dismiss` (only sets the AI's doubt aside, it does not
+  change the review status), Reject = `POST .../images/reject`. The window never offers the AI's drone-like hit as a box to add (the picture stays a negative). Tested end to end through the UI on a throwaway backend with
+  the real model files; nothing was run on the real database.
+  The first real negatives run on `birds` (2026-10-25) also checked the 232 images already in the trash, and 60 of them were flagged: the
+  Images page hides the trash but the drawer count did not, so the number stayed at 60 after everything visible was dismissed. Now the
+  negatives mode skips rejected images unless `review_status` is given, and `/folders` `ai_flagged` leaves out rejected ones (same as the list).
 - **Not exercised:** the S3 storage path with AI checks, a non-Mac machine (CUDA/CPU only through the same code), the `_t/_b/_l`
   SAM sizes, and tiny-drone behaviour of the detector on images it was trained on (run 5 saw anti-uav, so its agreement there is
   optimistic).
@@ -448,6 +492,10 @@ reviewed, boxes started for `fixed-wing`, `shahed`, `vtol`, `interceptor`) and t
 The committed `handover-data/` was re-exported with `--include-imported` after that import, so it holds the *later* state too: a
 fresh clone plus `python -m scripts.bundle import` restores Anti-UAV with no re-download (the raw Roboflow export, 826 MB with
 augmented copies, is deliberately not in git). If you re-download it anyway (YOLOv11, version 1), the importer reproduces the same selection.
+On 2026-10-24 a second import followed: **uav-annotated** (GKh, CC BY 4.0), 2,180 reviewed images (1,700 `multirotor`, 480 `fixed-wing`), from a fork
+of the live Roboflow dataset because its published versions have one class only. It is **not** in `handover-data/` or git (datasets are
+gitignored from that date); the raw export is in `backend/data/imports/uav-annotated-v1/`, and a backup of the database from just
+before the import is `backend/data/backups/pre-import-uav-annotated-20261024-172828.db`. `python -m scripts.import_yolo rollback --dataset uav-annotated` undoes it.
 
 ## 6. What has and hasn't been verified
 

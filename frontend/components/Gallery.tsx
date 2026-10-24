@@ -12,10 +12,9 @@ const PAGE = 48;
 const scopeLabel = (s: string) => (s.startsWith("folder:") ? `folder ${s.slice(7)}` : s.startsWith("dataset:") ? s.slice(8) : s.slice(7));
 const STATUS_STYLE = { pending: "text-amber-500", reviewed: "text-green-500", rejected: "text-red-500" } as const;
 // "pending" is shown as "not reviewed": it means nobody has looked at the image yet.
-const REVIEW_FILTERS: { value: ReviewStatus; label: string }[] = [
+const REVIEW_FILTERS: { value: Exclude<ReviewStatus, "rejected">; label: string }[] = [
   { value: "reviewed", label: "Reviewed" },
   { value: "pending", label: "Not reviewed" },
-  { value: "rejected", label: "Rejected" },
 ];
 
 // How the AI check shows on a card: [text, colour]. Mirrors the manual-check tag.
@@ -47,12 +46,16 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
   const router = useRouter();
   const [rejecting, setRejecting] = useState(false); // the inline "are you sure" for a bulk reject
   const [bulkBusy, setBulkBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const className = (id: number) => classes.find((c) => c.id === id)?.name ?? id;
 
   useEffect(() => {
     saveGalleryFilters(projectId, filters);
   }, [projectId, filters]);
-  useEffect(() => setRejecting(false), [filters]);
+  useEffect(() => {
+    setRejecting(false);
+    setNotice(null);
+  }, [filters]);
 
   const load = useCallback(
     async (offset: number, limit = PAGE) => {
@@ -102,6 +105,23 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
       setError((e as Error).message);
     } finally {
       setRejecting(false);
+      setBulkBusy(false);
+    }
+  }
+
+  /** Keep the picked images although the AI flagged them: they leave "AI: needs a look" (the review screen only shows hard-negative pictures). */
+  async function keepSelected() {
+    setBulkBusy(true);
+    try {
+      const { dismissed } = await api.dismissAi(projectId, [...selected]);
+      const none = selected.size - dismissed;
+      setNotice(`Kept ${dismissed} image(s) as they are${none > 0 ? `; ${none} had nothing flagged` : ""}. Filter "AI: dismissed" to see them again.`);
+      clearSelection();
+      setError(null);
+      onChanged();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
       setBulkBusy(false);
     }
   }
@@ -192,7 +212,7 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
         <select
           className="input"
           value={reviewStatus ?? ""}
-          onChange={(e) => update({ reviewStatus: (e.target.value || undefined) as ReviewStatus | undefined })}
+          onChange={(e) => update({ reviewStatus: (e.target.value || undefined) as GalleryFilters["reviewStatus"] })}
           aria-label="Review status"
         >
           <option value="">All images</option>
@@ -248,6 +268,9 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
               <button className="btn" onClick={runAiOnSelected} data-testid="bulk-ai">
                 Run AI on these
               </button>
+              <button className="btn" onClick={keepSelected} disabled={bulkBusy} data-testid="bulk-keep" title="Set the AI's doubts about these images aside: they leave “AI: needs a look”. Nothing else changes.">
+                Keep as is
+              </button>
             </>
           )}
           <button className="ml-auto text-neutral-500 hover:text-current" onClick={clearSelection}>
@@ -256,6 +279,11 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
         </div>
       )}
       {error && <p className="text-sm text-red-600">{error}</p>}
+      {notice && (
+        <p className="text-sm text-green-600" data-testid="gallery-notice">
+          {notice}
+        </p>
+      )}
       {images.length === 0 && !error && <p className="text-sm text-neutral-500">No images match.</p>}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
         {images.map((img) => (

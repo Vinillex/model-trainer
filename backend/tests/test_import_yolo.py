@@ -320,3 +320,143 @@ def test_an_imported_image_boxed_as_another_class_stays_inside_its_dataset_folde
     with client.session_factory() as db:
         key = db.get(Image, victim["id"]).storage_key
     assert "/raw/fixed-wing/imported/demo-v1/" in key and (storage._storage.root / key).exists()
+
+
+# ---------- negative mode ----------
+
+NEG = {"bird": "birds"}
+
+
+def build_bird_dataset(root: Path) -> None:
+    """Frames for negative mode (96 px images): clean big birds in two scenes, and every kind of frame that must be dropped."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "data.yaml").write_text("nc: 2\nnames: ['UAV', 'bird']\n\nroboflow:\n  license: CC BY 4.0\n  url: https://example.test/ds/2\n")
+    n = collections.Counter()
+
+    def add(scene, boxes, split="valid"):
+        n[split] += 1
+        im = _scene_pattern(200 + scene).copy()
+        ImageDraw.Draw(im).rectangle([n[split] % 40, 5, n[split] % 40 + 3, 8], fill=(10, 10, 10))  # frames of a scene differ a little
+        _write(root, split, f"{n[split]:05d}_jpg.rf.b{scene}{n[split]:03d}", im, boxes)
+
+    big = "1 0.5 0.5 0.4 0.4"          # 38 px of 96: far above the 10% floor
+    for scene in (0, 1):
+        for _ in range(3):
+            add(scene, [big])
+    add(0, [big, "1 0.1 0.1 0.04 0.04"])                  # a flock with one tiny bird: dropped
+    add(2, ["1 0.5 0.5 0.05 0.05"])                       # a single tiny bird: dropped
+    add(0, [big, "0 0.2 0.2 0.3 0.3"])                    # a bird and a drone together: never a clean negative
+    add(2, [])                                            # nothing boxed: unknown content, dropped
+    add(3, ["0 0.5 0.5 0.3 0.3"])                         # a plain drone frame, for the positives
+
+
+@pytest.fixture()
+def birds(tmp_path):
+    root = tmp_path / "birds"
+    build_bird_dataset(root)
+    return root
+
+
+def test_negative_mode_keeps_only_clean_birds_that_are_big_enough(birds):
+    chosen, stats = plan(birds, CLASS_MAP, cap=100, negative_map=NEG)
+    negatives = [f for f in chosen if f.negative]
+    assert len(negatives) == 6 and stats["selected_negatives"] == 6
+    assert all(f.boxes[0][0] == "birds" for f in negatives)                # filed under our class, whatever the dataset called it
+    assert stats["dropped_negative_too_small"] == 2                        # the flock with a tiny bird, and the lone tiny bird
+    assert stats["dropped_negative_with_drone_class"] == 1 and stats["dropped_no_boxes"] == 1
+    positives = [f for f in chosen if not f.negative]
+    assert len(positives) == 1 and positives[0].boxes[0][0] == "multirotor"
+    assert summarize_classes(chosen) == {"birds": 6, "multirotor": 1}
+
+
+def summarize_classes(chosen):
+    return import_yolo.summarize(chosen, collections.Counter())["selected_by_class"]
+
+
+def test_a_bird_next_to_an_unmapped_drone_class_is_dropped_too(birds):
+    chosen, stats = plan(birds, {}, cap=100, negative_map=NEG)               # UAV not mapped at all
+    assert stats["selected_negatives"] == 6 and stats["dropped_unmapped_or_malformed"] == 2   # the bird+drone frame, the plain drone frame
+
+
+def test_the_size_floor_is_a_fraction_of_the_images_short_side(birds):
+    assert plan(birds, {}, negative_map=NEG, negative_min_size=0.5)[1]["selected_negatives"] == 0        # birds are 40% of the image
+    assert plan(birds, {}, negative_map=NEG, negative_min_size=0.0)[1]["selected_negatives"] == 8        # no floor: the tiny birds come back
+    assert plan(birds, {}, negative_map=NEG, negative_min_size=0.03)[1]["selected_negatives"] == 8       # 0.04 and 0.05 both pass 3%
+    assert plan(birds, {}, negative_map=NEG, negative_min_size=0.045)[1]["selected_negatives"] == 7      # only the 0.04 bird fails
+
+
+def test_a_class_cannot_be_both_a_drone_and_a_negative(birds):
+    with pytest.raises(ImportProblem, match="both --map and --negative"):
+        plan(birds, {"bird": "multirotor"}, negative_map=NEG)
+
+
+def import_with_negatives(client, root, tag="birds-v1"):
+    pid = client.post("/projects", json={"name": "p"}).json()["id"]
+    chosen, _ = plan(root, CLASS_MAP, cap=100, negative_map=NEG)
+    with client.session_factory() as db:
+        result = run_import(db, pid, chosen, tag, {**META, "url": "https://example.test/ds/2"})
+    return pid, chosen, result
+
+
+def test_negative_images_are_filed_under_the_negative_class_reviewed_and_without_boxes(client, birds):
+    pid, chosen, result = import_with_negatives(client, birds)
+    assert result == {"added": 7, "already_imported": 0, "rejected": 0}
+    with client.session_factory() as db:
+        negatives = db.scalars(select(Image).where(Image.storage_key.contains("/raw/birds/"))).all()
+        assert len(negatives) == 6
+        for img in negatives:
+            assert img.source == Source.imported and img.review_status == ReviewStatus.reviewed and not img.annotations
+            assert "/raw/birds/imported/birds-v1/" in img.storage_key and (storage._storage.root / img.storage_key).exists()
+            assert img.group_key.startswith("birds-v1:scene-")
+            assert img.import_record.dataset == "birds-v1" and img.import_record.dataset_url == "https://example.test/ds/2"
+        assert db.scalar(select(func.count()).select_from(Annotation)) == 1            # only the drone frame has a box
+    rows = {r["class_name"]: r for r in client.get(f"/projects/{pid}/stats").json()}
+    assert rows["birds"]["imported"] == 6 and rows["birds"]["boxes"] == 0 and rows["multirotor"]["boxes"] == 1
+    with client.session_factory() as db:
+        again = run_import(db, pid, chosen, "birds-v1", META)
+    assert again == {"added": 0, "already_imported": 7, "rejected": 0}               # a re-run is harmless here too
+
+
+def test_negative_images_become_empty_background_images_in_a_dataset_version(client, birds):
+    pid, _, _ = import_with_negatives(client, birds)
+    v = client.post(f"/projects/{pid}/datasets", json={"imported_datasets": ["birds-v1"]}).json()
+    with client.session_factory() as db:
+        items = datasets.load_manifest(db.get(DatasetVersion, v["id"]))["images"]
+    background = [it for it in items if it["folder_class"] == "birds"]
+    assert len(background) == 6 and all(it["boxes"] == [] for it in background) and len(items) == 7
+    without = client.post(f"/projects/{pid}/datasets", json={"imported_datasets": ["birds-v1"], "include_negatives": False}).json()
+    with client.session_factory() as db:
+        assert len(datasets.load_manifest(db.get(DatasetVersion, without["id"]))["images"]) == 1
+
+
+def test_rollback_removes_the_negatives_and_their_files(client, birds):
+    pid, _, _ = import_with_negatives(client, birds)
+    with client.session_factory() as db:
+        keys = list(db.scalars(select(Image.storage_key)))
+        assert rollback(db, "birds-v1")["images_removed"] == 7
+        assert db.scalar(select(func.count()).select_from(Image)) == 0
+    assert not any((storage._storage.root / k).exists() for k in keys)
+
+
+def test_a_negative_target_must_be_a_negative_class_and_nothing_is_written_otherwise(client, birds):
+    pid = client.post("/projects", json={"name": "p"}).json()["id"]
+    for target in ("multirotor", "no-such-class", "mixed"):
+        chosen, _ = plan(birds, CLASS_MAP, negative_map={"bird": target})
+        with client.session_factory() as db, pytest.raises(ImportProblem, match="hard-negative"):
+            run_import(db, pid, chosen, "birds-v1", META)
+    chosen, _ = plan(birds, {"UAV": "birds"})                                          # and a drone class may not point at a negative
+    with client.session_factory() as db, pytest.raises(ImportProblem, match="trainable"):
+        run_import(db, pid, chosen, "birds-v1", META)
+    with client.session_factory() as db:
+        assert db.scalar(select(func.count()).select_from(Image)) == 0
+
+
+def test_negative_dry_run_reports_the_negatives_and_a_sample_sheet(birds, tmp_path, capsys):
+    sheet = tmp_path / "birds.jpg"
+    code = import_yolo.main(["import", str(birds), "--dataset", "birds-v1", "--negative", "bird=birds", "--author", "x",
+                             "--dry-run", "--sample-sheet", str(sheet)])
+    out = capsys.readouterr().out
+    assert code == 0 and "selected_negatives: 6" in out and "'birds': 6" in out and sheet.exists()
+    assert import_yolo.main(["import", str(birds), "--dataset", "birds-v1", "--negative", "bird=birds", "--author", "x",
+                             "--negative-min-size", "2", "--dry-run"]) == 1
+    assert "between 0 and 1" in capsys.readouterr().err

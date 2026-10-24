@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import BoxEditor, { type Box } from "@/components/BoxEditor";
 import { api, imageUrl, type AiBox, type AiCheck, type AiStatusValue, type BoxIn, type ImageDetail, type ImageRow, type Project, type ReviewStatus } from "@/lib/api";
 import { KIND_COLOR, applySuggestion, buildSuggestions, ghostFor, type Suggestion } from "@/lib/aiSuggestions";
-import { NO_FILTERS, describeFilters, imageQuery, loadGalleryFilters, saveGalleryFilters, type GalleryFilters } from "@/lib/galleryFilters";
+import { NO_FILTERS, describeFilters, imageQuery, loadGalleryFilters, loadTrashFilters, saveGalleryFilters, saveTrashFilters, trashQuery, type GalleryFilters } from "@/lib/galleryFilters";
 
 const PALETTE = ["#ef4444", "#22c55e", "#3b82f6", "#eab308", "#a855f7", "#f97316", "#14b8a6", "#ec4899"];
 const QUEUE_LIMIT = 500;
@@ -34,11 +34,11 @@ export default function ReviewScreen() {
   const projectId = Number(useParams<{ id: string }>().id);
   const params = useSearchParams();
   const jumpTo = params.get("image") ? Number(params.get("image")) : null;
+  const fromTrash = params.get("from") === "trash"; // opened from the Trash page: the queue is the trash, and leaving goes back there
 
   const [project, setProject] = useState<Project | null>(null);
   // No filters of its own: the queue is whatever the main page's gallery filters select (read once the page is in the browser).
   const [filters, setFilters] = useState<GalleryFilters | null>(null);
-  const status = filters?.reviewStatus;
   const [queue, setQueue] = useState<ImageRow[] | null>(null);
   const [index, setIndex] = useState(0);
   const [detail, setDetail] = useState<ImageDetail | null>(null);
@@ -70,15 +70,15 @@ export default function ReviewScreen() {
 
   useEffect(() => {
     api.getProject(projectId).then(setProject).catch((e) => setError(e.message));
-    setFilters(loadGalleryFilters(projectId));
-  }, [projectId]);
+    setFilters(fromTrash ? loadTrashFilters(projectId) : loadGalleryFilters(projectId));
+  }, [projectId, fromTrash]);
 
   // Load the queue the main page's filters describe.
   useEffect(() => {
     if (!filters) return;
     let cancelled = false;
     api
-      .listImages(projectId, { ...imageQuery(filters), limit: QUEUE_LIMIT, offset: 0 })
+      .listImages(projectId, { ...(fromTrash ? trashQuery(filters) : imageQuery(filters)), limit: QUEUE_LIMIT, offset: 0 })
       .then(async (rows) => {
         if (cancelled) return;
         let start = 0;
@@ -99,7 +99,7 @@ export default function ReviewScreen() {
     return () => {
       cancelled = true;
     };
-  }, [projectId, filters, jumpTo]);
+  }, [projectId, filters, jumpTo, fromTrash]);
 
   // Load the boxes for the current image.
   const currentId = current?.id;
@@ -198,26 +198,50 @@ export default function ReviewScreen() {
       const next = index + delta;
       if (next < 0 || next >= queue.length) return;
       if (dirty && !(await save())) return;
+      setNotice(null); // it was about the image just left
       setIndex(next);
     },
     [queue, index, dirty, save],
   );
 
-  /** Save with a status, then continue. Accepting or rejecting is also the person's decision on the AI's doubts (a flagged image is then
-   *  dismissed for these boxes). In the pending or "AI: needs a look" queue the image leaves it, elsewhere we step forward. */
-  const finish = useCallback(
-    async (newStatus: ReviewStatus) => {
-      if (!(await save(newStatus, true)) || !queue || !current) return;
-      // a decided image is no longer in these lists (and an accepted one is no longer in the trash)
-      if (status === "pending" || filters?.ai === "flagged" || filters?.ai === "autolabelled" || (status === "rejected" && newStatus !== "rejected")) {
-        const rest = queue.filter((r) => r.id !== current.id);
-        setQueue(rest);
-        setIndex((i) => Math.min(i, Math.max(0, rest.length - 1)));
-      } else {
-        setIndex((i) => Math.min(i + 1, queue.length - 1));
+  /** The same two decisions for a hard-negative picture, which never has boxes: "reviewed" = Keep as is (the same save as Accept with no boxes:
+   *  the picture counts as reviewed, so a restored one is used for training again, and the AI's doubts are set aside), "rejected" = into the
+   *  trash (the gallery's bulk Reject, which leaves the picture's folder alone). */
+  const decideNegative = useCallback(
+    async (newStatus: ReviewStatus): Promise<boolean> => {
+      if (!detail) return true;
+      setSaving(true);
+      try {
+        if (newStatus === "rejected") await api.rejectImages(projectId, [detail.id]);
+        else await api.putAnnotations(detail.id, [], "reviewed", true);
+        const out = await api.getImage(detail.id);
+        setDetail(out);
+        setQueue((q) => q && q.map((r) => (r.id === out.id ? { ...r, review_status: out.review_status, ai_status: out.ai_status } : r)));
+        refreshAi(out.id);
+        setError(null);
+        setNotice(null);
+        return true;
+      } catch (e) {
+        setError((e as Error).message);
+        return false;
+      } finally {
+        setSaving(false);
       }
     },
-    [save, queue, current, status, filters?.ai],
+    [detail, projectId, refreshAi],
+  );
+
+  /** Save with a status, then step forward. Accepting or rejecting is also the person's decision on the AI's doubts (a flagged image is then
+   *  dismissed for these boxes). The decided image stays in this list so Prev can come back to it; it is gone from the list the next time
+   *  the review window is opened. */
+  const finish = useCallback(
+    async (newStatus: ReviewStatus) => {
+      const done = readOnly ? await decideNegative(newStatus) : await save(newStatus, true);
+      if (!done || !queue || !current) return;
+      if (index >= queue.length - 1) setNotice((n) => n ?? "That was the last image in this list. Open the review again to see what is left.");
+      setIndex((i) => Math.min(i + 1, queue.length - 1));
+    },
+    [readOnly, decideNegative, save, queue, current, index],
   );
 
   const removeSelected = useCallback(() => {
@@ -357,10 +381,10 @@ export default function ReviewScreen() {
       } else if (e.key === "Escape") setSelected(null);
       else if (e.key === "ArrowRight") go(1);
       else if (e.key === "ArrowLeft") go(-1);
-      else if (e.key === "Enter" && !readOnly) {
+      else if (e.key === "Enter") {
         e.preventDefault();
         finish("reviewed");
-      } else if (e.key === "x" && !readOnly) finish("rejected");
+      } else if (e.key === "x") finish("rejected");
       else if (e.key.toLowerCase() === "a" && !readOnly) runAi();
       else if (e.key.toLowerCase() === "s" && !readOnly) snap();
       else if (/^[1-9]$/.test(e.key) && targets[Number(e.key) - 1]) setBoxClass(targets[Number(e.key) - 1].id);
@@ -385,13 +409,13 @@ export default function ReviewScreen() {
   return (
     <div className="fixed inset-0 z-30 flex flex-col gap-2 overflow-hidden bg-[var(--background)] p-3" data-testid="review-root">
       <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1">
-        <Link href={`/projects/${projectId}/images`} className="text-sm text-neutral-500 hover:underline">
-          ← {project?.name ?? "Project"}
+        <Link href={`/projects/${projectId}/${fromTrash ? "trash" : "images"}`} className="text-sm text-neutral-500 hover:underline" data-testid="review-back">
+          ← {fromTrash ? "Trash" : project?.name ?? "Project"}
         </Link>
         <h1 className="text-xl font-semibold">Review</h1>
-        {/* Read-only: the filters are set on the Images page. */}
+        {/* Read-only: the filters are set on the Images page (or the Trash page). */}
         <span className="text-sm text-neutral-500" data-testid="filter-summary">
-          Showing {filters ? describeFilters(filters, nameFor) : "…"}
+          Showing {filters ? (fromTrash ? `the trash${describeFilters(filters, nameFor) === "all images" ? "" : ` · ${describeFilters(filters, nameFor)}`}` : describeFilters(filters, nameFor)) : "…"}
         </span>
         {queue && queue.length > 0 && (
           <span className="text-sm text-neutral-500" data-testid="position">
@@ -410,15 +434,15 @@ export default function ReviewScreen() {
       {queue === null && !error && <p className="shrink-0 text-sm text-neutral-500">Loading…</p>}
       {queue?.length === 0 && (
         <p className="shrink-0 text-neutral-500">
-          Nothing matches the Images page&apos;s filters.{" "}
+          {fromTrash ? "Nothing in the trash matches the Trash page's filters." : "Nothing matches the Images page's filters."}{" "}
           <button
             className="underline"
             onClick={() => {
-              saveGalleryFilters(projectId, NO_FILTERS);
+              (fromTrash ? saveTrashFilters : saveGalleryFilters)(projectId, NO_FILTERS);
               setFilters(NO_FILTERS);
             }}
           >
-            Show all images
+            {fromTrash ? "Show the whole trash" : "Show all images"}
           </button>
         </p>
       )}
@@ -473,7 +497,16 @@ export default function ReviewScreen() {
             </div>
 
             <div className="grid shrink-0 grid-cols-2 gap-2">
-              {!readOnly && (
+              {readOnly ? (
+                <>
+                  <button className="btn col-span-2 bg-green-700/30 py-2 font-medium short:py-1" onClick={() => finish("reviewed")} disabled={saving} data-testid="keep-as-is" title="Keep this picture as it is and set the AI's doubts about it aside (Enter)">
+                    Keep as is &amp; next
+                  </button>
+                  <button className="btn col-span-2" onClick={() => finish("rejected")} disabled={saving} data-testid="reject-negative" title="Send this picture to the trash (X)">
+                    Reject image
+                  </button>
+                </>
+              ) : (
                 <>
                   <button className="btn col-span-2 bg-green-700/30 py-2 font-medium short:py-1" onClick={() => finish("reviewed")} disabled={saving}>
                     Accept ({boxes.length} {boxes.length === 1 ? "box" : "boxes"}) &amp; next
@@ -495,7 +528,7 @@ export default function ReviewScreen() {
             </div>
 
             {readOnly ? (
-              <p className="text-sm text-neutral-500">This is a hard-negative image: it never has boxes.</p>
+              <p className="text-sm text-neutral-500">This is a hard-negative image: it never has boxes, so there is nothing to draw. Keep it or reject it.</p>
             ) : (
               <div className="shrink-0 space-y-1.5">
                 <p className="text-sm text-neutral-500">Draw as:</p>
@@ -555,7 +588,7 @@ export default function ReviewScreen() {
                 <div className="flex shrink-0 flex-wrap items-center gap-2 text-sm">
                   <b>AI suggestions</b>
                   <span className="text-xs text-neutral-500">dashed boxes on the image</span>
-                  {suggestions.some((x) => x.box) && (
+                  {!readOnly && suggestions.some((x) => x.box) && (
                     <button className="btn ml-auto" onClick={() => accept(suggestions)} data-testid="ai-accept-all">
                       Accept all
                     </button>
@@ -574,7 +607,7 @@ export default function ReviewScreen() {
                             Select box
                           </button>
                         )}
-                        {x.box && (
+                        {x.box && !readOnly && (
                           <button className="btn bg-green-700/30" onClick={() => accept([x])}>
                             {x.kind === "missing" ? "Add box" : "Use this box"}
                           </button>
@@ -587,7 +620,9 @@ export default function ReviewScreen() {
                   ))}
                 </ul>
                 <p className="shrink-0 text-xs text-neutral-500" title={ai?.model}>
-                  Nothing is saved until you Save or Accept. The AI is a second opinion, not the answer.
+                  {readOnly
+                    ? "Keep as is sets these doubts aside; Reject sends the picture to the trash. The AI is a second opinion, not the answer."
+                    : "Nothing is saved until you Save or Accept. The AI is a second opinion, not the answer."}
                 </p>
               </div>
             )}

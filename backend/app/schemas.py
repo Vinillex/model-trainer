@@ -81,6 +81,10 @@ class RejectResult(BaseModel):
     rejected: int
 
 
+class DismissResult(BaseModel):
+    dismissed: int  # images whose AI doubts were set aside (the others had none to set aside)
+
+
 class RestoreResult(BaseModel):
     restored: int
 
@@ -197,8 +201,9 @@ class AiStatus(BaseModel):
 class AiDetectorOut(BaseModel):
     id: str
     label: str
-    kind: Literal["run", "file"]
+    kind: Literal["run", "file", "prompt"]  # a training run, an uploaded .pt, or the text-prompt detector
     map50: float | None = None  # a training run's validation mAP50
+    downloaded: bool | None = None  # the text-prompt detector only: false = its files (about 285 MB) are fetched the first time it is used
 
 
 class AiSamOut(BaseModel):
@@ -213,6 +218,19 @@ class AiModelsOut(BaseModel):
     default_detector: str | None  # what "default" means right now (a label), None = no detector yet
     sams: list[AiSamOut]
     default_sam: str
+
+
+class AiObjectPrompt(BaseModel):
+    class_id: int
+    name: str
+    prompt: str  # empty = nothing to look for in this class (no size check)
+
+
+class AiPromptsOut(BaseModel):
+    """What the text-prompt detector is told by default, for the panel to prefill (the person can change every word)."""
+
+    drone_prompt: str
+    negative_classes: list[AiObjectPrompt]
 
 
 class AiPreviewOut(BaseModel):
@@ -235,12 +253,25 @@ class AiBoxOut(BaseModel):
 
 class AiJobCreate(BaseModel):
     """A batch AI run over the images the filters select: `check` stores the AI's opinion of existing boxes, `autolabel` draws boxes on
-    unlabelled pending images (as unconfirmed `auto` boxes)."""
+    unlabelled pending images (as unconfirmed `auto` boxes), `negatives` looks inside the hard-negative classes (text-prompt detector only)."""
 
-    mode: Literal["check", "autolabel"] = "check"
-    detector: str | None = Field(None, pattern=DETECTOR_PATTERN)  # "run:5" or "file:name.pt"; None = the default detector
+    mode: Literal["check", "autolabel", "negatives"] = "check"
+    detector: str | None = Field(None, pattern=DETECTOR_PATTERN)  # "run:5", "file:name.pt" or "yoloe:26s"; None = the default detector
     sam: Literal["t", "s", "b", "l"] | None = None  # SAM 2.1 size; None = the MT_AI_SAM_WEIGHTS setting
-    min_score: float = Field(0.5, ge=0.25, le=0.95)  # autolabel: the least sure detection that becomes a box
+    # autolabel: the least sure detection that becomes a box. negatives: the least sure drone hit that is reported. A trained detector is
+    # only refused below 0.25 by the API (its own floor, the threshold baked into the IMX500 export); the text-prompt detector scores lower.
+    min_score: float | None = Field(None, ge=0.10, le=0.95)  # None = the mode's own default: 0.5 (trained detector), 0.25 (text prompts, which score lower)
+    prompt: str | None = Field(None, min_length=1, max_length=80)  # text-prompt detector: the words that find a drone (None = the default)
+    object_prompts: dict[str, str] | None = None  # negatives: class id -> words for what that class holds ("bird"); blank = no size check; None = defaults
+    min_size: float = Field(0.10, ge=0.02, le=0.5)  # negatives: the smallest the class's thing may be, as a share of the image's short side
+
+    @field_validator("object_prompts")
+    @classmethod
+    def _object_prompts_are_short_and_keyed_by_class_id(cls, v):
+        if v is not None:
+            if len(v) > 50 or any(not k.isdigit() or len(w) > 80 for k, w in v.items()):
+                raise ValueError("object_prompts: class ids (digits) to words of at most 80 characters")
+        return v
 
     class_id: int | None = None
     source: Source | None = None

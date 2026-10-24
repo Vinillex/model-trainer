@@ -320,8 +320,9 @@ def test_the_model_list_has_finished_runs_uploaded_files_and_the_sam_sizes(clien
     client.post("/ai/models/upload", files={"file": ("mine.pt", ZIP)}, headers={"X-MT-Upload": "1"})
     (tmp_path / "ai" / "models" / "sam2.1_b.pt").write_bytes(b"x")
     out = client.get("/ai/models").json()
-    assert [d["id"] for d in out["detectors"]] == [f"run:{new}", f"run:{old}", "file:mine.pt"]            # newest run first; unfinished or empty runs left out
+    assert [d["id"] for d in out["detectors"]] == [f"run:{new}", f"run:{old}", "file:mine.pt", "yoloe:26s"]  # newest run first; unfinished or empty runs left out
     assert out["detectors"][0]["map50"] == 0.65 and out["detectors"][2]["kind"] == "file"
+    assert out["detectors"][3]["kind"] == "prompt" and out["detectors"][3]["downloaded"] is False         # the text-prompt detector is always offered
     assert out["default_detector"] == f"yolo run {new} (new)"
     assert {s["size"]: s["downloaded"] for s in out["sams"]} == {"t": False, "s": False, "b": True, "l": False} and out["default_sam"] == settings.ai_sam_weights
 
@@ -423,9 +424,9 @@ def test_an_upload_is_stored_and_listed_but_never_opened(client, project, tmp_pa
     monkeypatch.setattr(service, "RealModels", Booby)
     monkeypatch.setattr("app.ai.detector.Detector", Booby)
     r = upload(client)
-    assert r.status_code == 201 and r.json() == {"id": "file:mine.pt", "label": "mine.pt (uploaded)", "kind": "file", "map50": None}
+    assert r.status_code == 201 and r.json() == {"id": "file:mine.pt", "label": "mine.pt (uploaded)", "kind": "file", "map50": None, "downloaded": None}
     assert stored(tmp_path) == ["mine.pt"]
-    assert [d["id"] for d in client.get("/ai/models").json()["detectors"]] == ["file:mine.pt"]
+    assert [d["id"] for d in client.get("/ai/models").json()["detectors"]] == ["file:mine.pt", "yoloe:26s"]
     pid, _ = project
     assert client.post(f"/projects/{pid}/jobs/ai-check", json={"detector": "file:mine.pt"}).status_code == 201   # picking it queues a run; the load waits for the job
 
@@ -480,9 +481,9 @@ def test_the_model_endpoints_are_closed_to_the_network(client):
     assert lan.post("/ai/models/upload", files={"file": ("a.pt", ZIP)}, headers={"X-MT-Upload": "1"}).status_code == 403
 
 
-def test_the_ai_counts_as_available_when_the_only_detector_is_an_uploaded_one(client, project):
-    assert client.get("/ai/status").json()["available"] is False                      # no run, no upload: nothing can find drones yet
-    assert "No detector yet" in client.get("/ai/status").json()["reason"]
+def test_the_ai_is_available_without_a_trained_detector_because_the_text_prompt_one_needs_none(client, project):
+    status = client.get("/ai/status").json()
+    assert status["available"] is True and status["reason"] is None and status["detector"] is None    # no run, no upload: no default detector, but YOLOE can run
     upload(client)
     status = client.get("/ai/status").json()
     assert status["available"] is True and status["reason"] is None and status["detector"] is None   # no default, but a run can pick the upload

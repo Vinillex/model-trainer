@@ -4,8 +4,10 @@ from sqlalchemy.orm import Session
 from ..ai import job as ai_job, registry, service
 from ..config import settings
 from ..db import get_db
-from ..models import Image, Job
-from ..schemas import AiBoxIn, AiBoxOut, AiCheckOut, AiDetectorOut, AiJobCreate, AiModelsOut, AiPreviewOut, AiSamOut, AiStatus, JobOut
+from ..ai.prompts import DRONE_PROMPT, default_object_prompt
+from ..models import DetClass, Image, Job
+from ..schemas import (AiBoxIn, AiBoxOut, AiCheckOut, AiDetectorOut, AiJobCreate, AiModelsOut, AiObjectPrompt, AiPreviewOut, AiPromptsOut, AiSamOut,
+                       AiStatus, JobOut)
 from .projects import get_project
 
 # Loopback-only like the rest of the UI API (the LAN guard only opens /workers/*): nobody else on the network can run a check.
@@ -23,9 +25,7 @@ def _image(db: Session, image_id: int) -> Image:
 def ai_status(db: Session = Depends(get_db)):
     """Whether the AI check can run here, and what it uses. Cheap: loads no model."""
     reason = service.missing_extras()
-    found = service.detector_weights(db)
-    if reason is None and found is None and not registry.list_detectors(db):  # an uploaded model is a detector too
-        reason = "No detector yet: finish a training run first (its best.pt is the detector), or set MT_AI_DETECTOR_WEIGHTS."
+    found = service.detector_weights(db)  # None until a training run has finished: the text-prompt detector needs none, so the AI is available anyway
     live = service.device_summary() or {}
     return AiStatus(available=reason is None, reason=reason, sam_weights=settings.ai_sam_weights, detector=found[1] if found else None,
                     device=live.get("device") or settings.ai_device, fallbacks=live.get("fallbacks", 0), last_fallback=live.get("last_error"))
@@ -108,15 +108,40 @@ def create_ai_job(project_id: int, body: AiJobCreate, db: Session = Depends(get_
     get_project(db, project_id)
     if (reason := service.missing_extras()) is not None:
         raise HTTPException(503, reason)  # fail now rather than queue a job that is certain to fail
+    prompted = body.detector == registry.YOLOE_ID
+    if body.mode == "negatives":
+        if body.detector not in (None, registry.YOLOE_ID):
+            raise HTTPException(422, "looking inside the negative classes needs the text-prompt detector")
+        prompted = True
+    elif prompted and body.mode == "check":
+        raise HTTPException(422, "the box check was tuned on the trained detector and is not offered with the text-prompt detector")
+    if not prompted and body.min_score is not None and body.min_score < 0.25:
+        raise HTTPException(422, "a trained detector is only used from 25% sure (its own threshold); lower values are for the text-prompt detector")
     if body.detector is not None:  # a choice that can't work is refused now, not after the job was queued
         try:
             registry.resolve_detector(db, body.detector, service.detector_weights)
         except service.AiUnavailable as e:
             raise HTTPException(422, str(e))
-    job = Job(project_id=project_id, type="ai_check", params=body.model_dump(mode="json"))
+    params = body.model_dump(mode="json")
+    if prompted:
+        params["detector"] = registry.YOLOE_ID
+        try:
+            ai_job.build_prompts(db, project_id, params)  # the words are checked now: same phrase twice, a class that is not a negative one
+        except service.AiUnavailable as e:
+            raise HTTPException(422, str(e))
+    job = Job(project_id=project_id, type="ai_check", params=params)
     db.add(job)
     db.commit()
     return job
+
+
+@router.get("/projects/{project_id}/ai/prompts", response_model=AiPromptsOut)
+def ai_prompts(project_id: int, db: Session = Depends(get_db)):
+    """The words the text-prompt detector gets by default: one phrase that finds drones, and for each hard-negative class the words for its own thing."""
+    get_project(db, project_id)
+    negatives = db.query(DetClass).filter(DetClass.project_id == project_id, DetClass.is_negative.is_(True)).order_by(DetClass.id).all()
+    return AiPromptsOut(drone_prompt=DRONE_PROMPT,
+                        negative_classes=[AiObjectPrompt(class_id=c.id, name=c.name, prompt=default_object_prompt(c.name)) for c in negatives])
 
 
 @router.post("/projects/{project_id}/jobs/ai-check/preview", response_model=AiPreviewOut)

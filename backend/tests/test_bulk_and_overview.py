@@ -188,6 +188,24 @@ def test_the_counts_per_place_are_the_gallery_filters_counted(client, project):
     assert [i["id"] for i in client.get(f"/projects/{pid}/images", params={"ai": "flagged", "folder": "f1"}).json()] == [flagged]
 
 
+def test_a_rejected_image_the_ai_flagged_is_not_counted_as_needing_a_look(client, project):
+    pid, ids = project
+    m = ids["multirotor"]
+    kept, trashed = in_folder(client, pid, m, "f1"), in_folder(client, pid, m, "f1")
+    service.set_models(FakeModels([]))
+    for i in (kept, trashed):
+        client.post(f"/images/{i}/ai-check")                                               # no boxes, nothing found: neither is flagged yet
+    assert client.post(f"/projects/{pid}/images/reject", json={"image_ids": [trashed]}).status_code == 200
+    # a check that lands on an image already in the trash (as a job over a whole class used to do) leaves a flag nobody can see in the gallery
+    with client.session_factory() as db:
+        db.get(Image, trashed).ai_check.verdict = "suspect"
+        db.commit()
+    row = folder_rows(client, pid)[("uploaded", "f1", m)]
+    assert row["rejected"] == 1 and row["ai_flagged"] == 0
+    shown = client.get(f"/projects/{pid}/images", params={"ai": "flagged", "folder": "f1", "exclude_rejected": True, "limit": 500}).json()
+    assert len(shown) == row["ai_flagged"]                                                 # the badge and the list say the same thing
+
+
 def test_the_counts_do_not_multiply_with_the_number_of_boxes(client, project):
     pid, ids = project
     m = ids["multirotor"]

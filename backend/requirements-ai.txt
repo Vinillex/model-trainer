@@ -2,3 +2,9 @@
 # Ultralytics provides SAM 2.1 (box refinement) and the YOLO detector, and pulls in torch (the Mac's GPU is used through "mps").
 # Same pin as agents/requirements-gpu.txt so the detector loads the weights the training pods made.
 ultralytics==8.4.183
+# YOLOE (text-prompt detection, see HANDOVER) loads its text encoder through Ultralytics' CLIP fork; Ultralytics installs these on first use, pinned here.
+clip @ git+https://github.com/ultralytics/CLIP.git@7ffa84b3bfa40c42ecc1c77147a855e69cb2dd40
+ftfy==6.3.1
+regex==2026.9.29
+tqdm==4.70.1
+wcwidth==0.9.3

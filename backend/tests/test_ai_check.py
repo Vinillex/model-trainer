@@ -2,7 +2,10 @@
 
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -10,9 +13,10 @@ import pytest
 from app import jobs
 from app.ai import service
 from app.ai.check import POLICY_VERSION, Detection, LabelBox, Policy, run_check
+from app.ai.detector import Detector
 from app.ai.device import Device
 from app.ai.geometry import crop_window, iou, mask_to_box, side_on_input
-from app.ai.sam import Refined
+from app.ai.sam import Refined, SamRefiner
 from app.ai.verdict import fingerprint, worst
 from app.models import AiCheck, AiDismissal, Annotation, Image, Job, JobStatus
 
@@ -662,6 +666,31 @@ def test_a_cpu_device_never_counts_a_failure_as_a_fallback():
     with pytest.raises(RuntimeError):
         d.call(lambda dev: (_ for _ in ()).throw(RuntimeError("real bug")))
     assert d.fallbacks == 0
+
+
+def test_the_detector_and_sam_never_use_the_gpu_at_the_same_time():
+    # Metal aborts the whole backend when two threads encode at once (a batch job plus a preview did it), so one lock covers both models
+    guard, active, most = threading.Lock(), [0], [0]
+
+    def fake_model(*args, **kwargs):
+        with guard:
+            active[0] += 1
+            most[0] = max(most[0], active[0])
+        time.sleep(0.01)
+        with guard:
+            active[0] -= 1
+        return [SimpleNamespace(masks=None, boxes=SimpleNamespace(xyxyn=[], conf=[], cls=[]), names={})]
+
+    detector, sam = Detector(Path("x.pt"), "cpu"), SamRefiner(Path("x.pt"), "cpu")
+    detector._model = sam._model = fake_model
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    workers = [threading.Thread(target=lambda f=f: [f() for _ in range(5)])
+               for f in (lambda: detector.detect(image), lambda: sam.refine(image, prompt=(10, 10, 30, 30))) * 2]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    assert most[0] == 1
 
 
 def test_status_and_job_progress_report_the_device(client, project, monkeypatch):

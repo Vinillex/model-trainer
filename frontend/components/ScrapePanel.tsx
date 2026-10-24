@@ -47,25 +47,29 @@ export default function ScrapePanel({ projectId, classes, onImagesChanged }: { p
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
-  const [history, setHistory] = useState<SearchHistory | null>(null);
+  const [fetched, setFetched] = useState<(SearchHistory & { asked: string }) | null>(null); // the last lookup, and the text it was for
   const [account, setAccount] = useState<SerpApiAccount | null>(null);
   const [accountError, setAccountError] = useState<string | null>(null);
   const lastAdded = useRef(new Map<number, number>());
   const lastStatus = useRef(new Map<number, string>());
   const queryRef = useRef(query); // read by refresh(), so typing doesn't re-create it and refetch the job list
   queryRef.current = query;
+  const lookups = useRef(0); // only the newest history lookup may update the screen
+  const history = fetched && fetched.asked === query.trim() ? fetched : null; // never show another query's pages while the new text is still being looked up
 
   const loadAccount = useCallback(() => {
     api.serpapiAccount().then((a) => { setAccount(a); setAccountError(null); }).catch((e) => { setAccount(null); setAccountError(e.message); });
   }, []);
 
   const loadHistory = useCallback(async (q: string) => {
+    const mine = ++lookups.current;
     try {
       const h = await api.searchHistory(projectId, q);
-      setHistory(h);
+      if (mine !== lookups.current) return null;
+      setFetched({ ...h, asked: q });
       return h;
     } catch {
-      setHistory(null);
+      if (mine === lookups.current) setFetched(null);
       return null;
     }
   }, [projectId]);
@@ -107,12 +111,13 @@ export default function ScrapePanel({ projectId, classes, onImagesChanged }: { p
   // Look up which pages of this query were already searched, and suggest the next one.
   useEffect(() => {
     const q = query.trim();
-    if (!q) { setHistory(null); return; }
+    if (!q) { setFetched(null); return; }
+    let stale = false; // the text changed again while this lookup was in flight
     const t = setTimeout(async () => {
       const h = await loadHistory(q);
-      if (h && !startTouched) setStartPage(h.next_page + 1);
+      if (h && !stale && !startTouched) setStartPage(h.next_page + 1);
     }, 400);
-    return () => clearTimeout(t);
+    return () => { stale = true; clearTimeout(t); };
   }, [query, startTouched, loadHistory]);
 
   async function start(e: React.FormEvent) {

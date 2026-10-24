@@ -68,10 +68,15 @@ export interface AiBoxResult {
 }
 export type AiSamSize = "t" | "s" | "b" | "l";
 export interface AiDetector {
-  id: string; // "run:5" or "file:name.pt"
+  id: string; // "run:5", "file:name.pt" or "yoloe:26s" (the text-prompt detector)
   label: string;
-  kind: "run" | "file";
+  kind: "run" | "file" | "prompt";
   map50: number | null; // a training run's validation mAP50
+  downloaded?: boolean | null; // the text-prompt detector only: false = its files (about 285 MB) are fetched the first time it is used
+}
+export interface AiPrompts {
+  drone_prompt: string; // the words that find a drone by default
+  negative_classes: { class_id: number; name: string; prompt: string }[]; // words for what each hard-negative class holds ("" = nothing to look for)
 }
 export interface AiSam {
   size: AiSamSize;
@@ -86,10 +91,13 @@ export interface AiModels {
   default_sam: string;
 }
 export interface AiJobParams {
-  mode?: "check" | "autolabel"; // check = the AI's opinion of existing boxes; autolabel = draw boxes on unlabelled pending images
+  mode?: "check" | "autolabel" | "negatives"; // check = the AI's opinion of existing boxes; autolabel = draw boxes on unlabelled pending images; negatives = look inside the hard-negative classes
   detector?: string;
   sam?: AiSamSize;
-  min_score?: number;
+  min_score?: number; // autolabel: least sure detection that becomes a box; negatives: least sure drone-like hit that is reported
+  prompt?: string; // text-prompt detector: the words that find a drone
+  object_prompts?: Record<string, string>; // negatives: class id -> words for what the class holds ("bird"); blank = no size check
+  min_size?: number; // negatives: the smallest the class's thing may be, as a share of the picture's short side
   class_id?: number;
   source?: Source;
   dataset?: string;
@@ -485,6 +493,9 @@ export const api = {
   /** Click-to-box: SAM's tight box around a click and/or a rough box (all normalized). */
   aiBox: (id: number, p: { x?: number; y?: number; box?: AiBox }) => req<AiBoxResult>(`/images/${id}/ai-box`, json("POST", p)),
   aiModels: () => req<AiModels>("/ai/models"),
+  aiPrompts: (projectId: number) => req<AiPrompts>(`/projects/${projectId}/ai/prompts`),
+  /** Keep images as they are although the AI flagged them (what a review Save does with the AI's doubts, without saving). */
+  dismissAi: (projectId: number, imageIds: number[]) => req<{ dismissed: number }>(`/projects/${projectId}/images/ai-dismiss`, json("POST", { image_ids: imageIds })),
   /** The weights are only stored, never opened, when they arrive. The header is what the server checks to know the upload came from this app. */
   aiUploadModel: (file: File) => {
     const form = new FormData();

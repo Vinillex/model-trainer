@@ -4,8 +4,8 @@ const GROUPS: { title: string; rows: [string, string][] }[] = [
   {
     title: "Deciding",
     rows: [
-      ["Enter", "Accept the image and go to the next one"],
-      ["X", "Reject the image and go to the next one"],
+      ["Enter", "Accept the image and go to the next one (a hard-negative picture: keep it as is)"],
+      ["X", "Reject the image (into the trash) and go to the next one"],
       ["← / →", "Previous / next image (unsaved edits are saved first)"],
     ],
   },

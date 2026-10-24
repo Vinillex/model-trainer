@@ -3,8 +3,10 @@
 A check only ever writes its own row in `ai_checks`. The auto-label job is the one thing here that writes boxes, and only as `auto` boxes on a
 pending image that has none (never `reviewed`, so nothing it writes can reach a training set before a person accepts it)."""
 
+import hashlib
 import io
 import importlib.util
+import json
 import threading
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -21,13 +23,15 @@ from ..config import settings
 from ..models import AiCheck, Annotation, AnnotationStatus, DetClass, Image, ReviewStatus, RunStage, TrainingRun
 from . import registry
 from .check import POLICY_VERSION, LabelBox, Models, Policy, run_check, suggest
-from .geometry import iou, to_normalized, to_pixels
-from .registry import SAM_FILES, AiUnavailable, models_dir, resolve_detector, run_weights  # noqa: F401 - AiUnavailable is part of this module's API
+from .geometry import iou, side_on_input, to_normalized, to_pixels
+from .prompts import DRONE_LABEL, OBJECT_SCORE
+from .registry import SAM_FILES, YOLOE_ID, AiUnavailable, models_dir, resolve_detector, run_weights  # noqa: F401 - AiUnavailable is part of this module's API
+from .verdict import fingerprint, worst
 
 KEEP_LOADED = 2  # model sets kept in memory at once (the Mac has 16 GB); the least recently used one is dropped
 
 _override: Models | None = None  # tests put fakes here; they win over any choice
-_real: "OrderedDict[tuple[str, str], RealModels]" = OrderedDict()
+_real: "OrderedDict[tuple[str, str, str], RealModels]" = OrderedDict()
 _build_lock = threading.Lock()
 
 
@@ -60,13 +64,19 @@ def missing_extras() -> str | None:
 
 
 class RealModels:
-    """The trained YOLO as detector and one SAM size as refiner. Nothing heavy loads until the first image."""
+    """The trained YOLO (or, with `prompts`, the text-prompt detector, whose path is its folder) as detector and one SAM size as refiner.
+    Nothing heavy loads until the first image."""
 
-    def __init__(self, detector_path: Path, detector_label: str, sam_path: Path):
+    def __init__(self, detector_path: Path, detector_label: str, sam_path: Path, prompts: list[tuple[str, str]] | None = None):
         from .detector import Detector  # the heavy imports
         from .sam import SamRefiner
 
-        self.detector = Detector(detector_path, settings.ai_device)
+        if prompts:
+            from .yoloe import YoloeDetector
+
+            self.detector = YoloeDetector(detector_path, prompts, settings.ai_device)
+        else:
+            self.detector = Detector(detector_path, settings.ai_device)
         self.sam = SamRefiner(sam_path, settings.ai_device)
         self.label = f"{sam_path.name} + {detector_label}"
 
@@ -85,21 +95,24 @@ class RealModels:
                 "last_error": next((p["last_error"] for p in parts if p["last_error"]), None)}
 
 
-def get_models(db: Session, detector: str | None = None, sam: str | None = None) -> Models:
-    """The models for a detector choice ("run:5", "file:name.pt", None = the default) and a SAM size ("t" "s" "b" "l", None = the setting).
+def get_models(db: Session, detector: str | None = None, sam: str | None = None, prompts: list[tuple[str, str]] | None = None) -> Models:
+    """The models for a detector choice ("run:5", "file:name.pt", "yoloe:26s", None = the default) and a SAM size ("t" "s" "b" "l", None = the setting).
+    The text-prompt detector also needs `prompts`, (label, words) pairs: one loaded set serves one prompt set, so the set is part of the cache key.
     Built on first use and kept (the last KEEP_LOADED sets), so switching back is free. Weights load on the first image, so a first check is slow.
     A caller keeps the object it got: being dropped from the cache never unloads it from under a running job."""
     if _override is not None:
         return _override
     if (reason := missing_extras()) is not None:
         raise AiUnavailable(reason)
+    if (detector == YOLOE_ID) != bool(prompts):
+        raise AiUnavailable("the text-prompt detector needs prompts, and only it takes them")
     with _build_lock:
         det_key, det_path, det_label = resolve_detector(db, detector, detector_weights)
         sam_file = SAM_FILES[sam] if sam else settings.ai_sam_weights
-        key = (det_key, sam_file)
+        key = (det_key, sam_file, hashlib.sha1(json.dumps(sorted(prompts or [])).encode()).hexdigest()[:12])
         models = _real.get(key)
         if models is None:
-            models = _real[key] = RealModels(det_path, det_label, models_dir() / sam_file)
+            models = _real[key] = RealModels(det_path, det_label, models_dir() / sam_file, *([prompts] if prompts else []))
             while len(_real) > KEEP_LOADED:
                 _real.popitem(last=False)
         else:
@@ -127,13 +140,10 @@ def label_boxes(image: Image) -> list[LabelBox]:
     return [LabelBox(a.id, (a.cx - a.w / 2, a.cy - a.h / 2, a.cx + a.w / 2, a.cy + a.h / 2)) for a in image.annotations]
 
 
-def check_image(db: Session, image: Image, models: Models | None = None, policy: Policy = Policy()) -> AiCheck:
-    """Run the AI check on one image and store (replace) its row. Never touches the image's boxes or review status."""
-    models = models or get_models(db)
-    result = run_check(load_rgb(image), label_boxes(image), models, policy)
+def _store_check(db: Session, image: Image, model: str, result: dict) -> AiCheck:
     row = image.ai_check or AiCheck(image_id=image.id)
     row.checked_at = datetime.now(timezone.utc)
-    row.model = model_label(models)
+    row.model = model
     row.fingerprint = result.pop("fingerprint")
     row.verdict = result.pop("verdict")
     row.stale = False
@@ -143,6 +153,71 @@ def check_image(db: Session, image: Image, models: Models | None = None, policy:
     db.commit()
     db.refresh(row)
     return row
+
+
+def check_image(db: Session, image: Image, models: Models | None = None, policy: Policy = Policy()) -> AiCheck:
+    """Run the AI check on one image and store (replace) its row. Never touches the image's boxes or review status."""
+    models = models or get_models(db)
+    return _store_check(db, image, model_label(models), run_check(load_rgb(image), label_boxes(image), models, policy))
+
+
+# ---------- checking negative images ----------
+
+MAX_DRONE_HITS = 8  # a flock of tiny birds gives dozens of hits: the surest few are enough to look at
+
+
+class NegativeRules(NamedTuple):
+    drone_score: float  # a drone-phrase hit this sure is reported
+    min_size: float  # the smallest the class's own thing may be, as a share of the image's short side (the importer's floor)
+    drone_words: str
+    object_label: str | None  # the detector's label for what the class holds ("class:4"); None = no object check
+    object_words: str  # "bird"
+
+
+def negatives_label(models: Models, rules: NegativeRules) -> str:
+    """Like model_label, plus a digest of the prompts and thresholds: another floor or other words make older results out of date."""
+    digest = hashlib.sha1(json.dumps(list(rules)).encode()).hexdigest()[:8]
+    return f"{model_label(models)} · negatives {digest}"
+
+
+def _item(box, side_px: float, reason: str) -> dict:
+    return {"annotation_id": None, "box": list(box), "side_px": round(side_px, 1), "verdict": "suspect", "reason": reason,
+            "suggested": None, "detector_iou": None, "detector_score": None, "sam_object": None}
+
+
+def check_negative(db: Session, image: Image, models: Models, rules: NegativeRules) -> AiCheck:
+    """What a hard-negative picture must hold: nothing that reads as a drone, and (when the class has words for its thing) that thing at a
+    useful size. Same row and verdicts as the box check, so the gallery's "AI: needs a look" lists the pictures to look at; boxes and review
+    status are never touched. A drone hit is "missing" (a drone with no label), a too-small or absent object is "suspect"."""
+    rgb = load_rgb(image)
+    height, width = rgb.shape[:2]
+    dets = models.detect(rgb)
+    missing = [{"box": list(d.box), "detector_box": list(d.box), "score": round(d.score, 3), "class_name": DRONE_LABEL,
+                "side_px": round(side_on_input(d.box, width, height), 1),
+                "reason": f"the model reads this as a drone ({d.score:.0%} sure): a real drone, or something that looks like one"}
+               for d in sorted(dets, key=lambda d: -d.score) if d.class_name == DRONE_LABEL and d.score >= rules.drone_score][:MAX_DRONE_HITS]
+    items, found, smallest = [], 0, None
+    if rules.object_label:
+        things = [d for d in dets if d.class_name == rules.object_label and d.score >= OBJECT_SCORE]
+        found = len(things)
+        short = min(width, height)
+        sizes = [min((d.box[2] - d.box[0]) * width, (d.box[3] - d.box[1]) * height) / short for d in things]
+        if things:
+            smallest = min(sizes)
+            for d, size in zip(things, sizes):
+                if size < rules.min_size:
+                    items.append(_item(d.box, side_on_input(d.box, width, height),
+                                       f"this {rules.object_words} is {size:.0%} of the picture's short side: smaller than the {rules.min_size:.0%} floor, "
+                                       "so against the sky it could pass for a drone"))
+        else:
+            items.append(_item((0.0, 0.0, 1.0, 1.0), side_on_input((0.0, 0.0, 1.0, 1.0), width, height),
+                               f"the model finds no {rules.object_words} in this picture (not what its folder says?)"))
+    verdicts = [it["verdict"] for it in items] + ["missing"] * len(missing)
+    result = {"labels": items, "missing": missing, "fingerprint": fingerprint([]), "verdict": worst(verdicts) if verdicts else "ok",
+              "summary": {"ok": 0, "adjust": 0, "suspect": len(items), "too_small": 0, "missing": len(missing), "labels": len(items)},
+              "negatives": {"object": rules.object_words or None, "found": found, "smallest": None if smallest is None else round(smallest, 4),
+                            "min_size": rules.min_size, "drone_score": rules.drone_score}}
+    return _store_check(db, image, negatives_label(models, rules), result)
 
 
 def suggest_box(db: Session, image: Image, x: float | None, y: float | None, box: list[float] | None) -> dict:

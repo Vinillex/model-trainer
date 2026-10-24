@@ -1,19 +1,17 @@
 """The detector half of the AI check: the trained YOLO (best.pt of a finished run) finds drones anywhere in an image. Imported lazily."""
 
-import threading
 from pathlib import Path
 
 import numpy as np
 
 from .check import Detection
-from .device import Device
+from .device import GPU_LOCK, Device
 
 
 class Detector:
     def __init__(self, weights: Path, device: str | None = None, imgsz: int = 640, conf: float = 0.15):
         self.weights, self.device, self.imgsz, self.conf = Path(weights), Device(device), imgsz, conf
         self._model = None
-        self._lock = threading.Lock()
 
     def _load(self):
         if self._model is None:
@@ -29,7 +27,7 @@ class Detector:
     def detect(self, image_rgb: np.ndarray) -> list[Detection]:
         model = self._load()
         bgr = np.ascontiguousarray(image_rgb[:, :, ::-1])  # Ultralytics wants BGR arrays, as cv2 gives them
-        with self._lock:
+        with GPU_LOCK:  # reading the boxes back is GPU work too
             result = self.device.call(lambda dev: model(bgr, imgsz=self.imgsz, conf=self.conf, device=dev, verbose=False)[0])
-        return [Detection(tuple(float(v) for v in box), float(score), result.names.get(int(cls)))
-                for box, score, cls in zip(result.boxes.xyxyn, result.boxes.conf, result.boxes.cls)]
+            return [Detection(tuple(float(v) for v in box), float(score), result.names.get(int(cls)))
+                    for box, score, cls in zip(result.boxes.xyxyn, result.boxes.conf, result.boxes.cls)]
