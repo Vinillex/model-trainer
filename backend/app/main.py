@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import ai as ai_api, annotations, datasets as datasets_api, images, jobs as jobs_api, projects, training as training_api, workers
+from .api import ai as ai_api, annotations, datasets as datasets_api, images, jobs as jobs_api, pi_display as pi_display_api, projects, runpod as runpod_api, training as training_api, workers
 from . import jobs
 from .config import settings
 from .db import Base, engine
@@ -34,6 +34,8 @@ app.include_router(ai_api.router)
 app.include_router(jobs_api.router)
 app.include_router(datasets_api.router)
 app.include_router(training_api.router)
+app.include_router(runpod_api.router)
+app.include_router(pi_display_api.router)
 app.include_router(workers.router)
 
 

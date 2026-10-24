@@ -14,6 +14,7 @@ const ITEMS: { href: string; label: string; hint: string; icon: string }[] = [
   { href: "/ai", label: "AI labelling", hint: "Check or auto-label", icon: "M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2z" },
   { href: "/datasets", label: "Datasets", hint: "Versions to train on", icon: "M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7" },
   { href: "/training", label: "Training & export", hint: "Runs and the camera model", icon: "M13 3L4 14h7l-1 7 9-11h-7z" },
+  { href: "/trash", label: "Trash", hint: "Rejected images", icon: "M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13" },
 ];
 
 const COLLAPSE_KEY = "drawer-collapsed";
@@ -22,10 +23,11 @@ const POLL_MS = 10_000;
 /** What the drawer shows beside a section: how many images need a look, whether an AI run or a training run is going. Decoration: failures are ignored. */
 interface Badges {
   needsLook: number;
+  trash: number; // rejected images
   aiRunning: boolean;
   training: boolean;
 }
-const NO_BADGES: Badges = { needsLook: 0, aiRunning: false, training: false };
+const NO_BADGES: Badges = { needsLook: 0, trash: 0, aiRunning: false, training: false };
 
 function useBadges(projectId: number, refreshKey: number): Badges {
   const [badges, setBadges] = useState<Badges>(NO_BADGES);
@@ -38,6 +40,7 @@ function useBadges(projectId: number, refreshKey: number): Badges {
         if (alive) {
           setBadges({
             needsLook: places.reduce((n, p) => n + p.ai_flagged, 0),
+            trash: places.reduce((n, p) => n + p.rejected, 0),
             aiRunning: jobs.some((j) => j.status === "queued" || j.status === "running"),
             training: runs.some((r) => !["done", "failed", "cancelled"].includes(r.stage)),
           });
@@ -58,6 +61,16 @@ function useBadges(projectId: number, refreshKey: number): Badges {
 
 /** The little marker beside a section: a count, or a pulsing dot for something running. */
 function Badge({ href, badges, collapsed }: { href: string; badges: Badges; collapsed: boolean }) {
+  if (href === "/trash") {
+    if (!badges.trash) return null;
+    return collapsed ? (
+      <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-neutral-400" title={`${badges.trash} rejected images`} />
+    ) : (
+      <span className="ml-auto rounded-full bg-neutral-500/20 px-2 text-xs text-neutral-400" title={`${badges.trash} rejected images`} data-testid="badge-trash">
+        {badges.trash.toLocaleString()}
+      </span>
+    );
+  }
   const count = href === "/images" ? badges.needsLook : 0;
   const running = (href === "/ai" && badges.aiRunning) || (href === "/training" && badges.training);
   if (!count && !running) return null;

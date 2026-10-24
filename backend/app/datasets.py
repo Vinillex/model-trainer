@@ -216,6 +216,22 @@ def resolve_manifest(db: Session, manifest: dict) -> dict:
     return manifest
 
 
+def versions_using(db: Session, project_id: int, image_ids: set[int]) -> dict[str, list[int]]:
+    """{version name: the given image ids it contains}. A frozen version reads its image files whenever it is downloaded, so deleting one of
+    these images for good would make that version impossible to download. Matched on SHA-256 too: SQLite reuses the ids of deleted images."""
+    shas = dict(db.execute(select(Image.id, Image.sha256).where(Image.id.in_(image_ids))).all())
+    found: dict[str, list[int]] = {}
+    for version in db.scalars(select(DatasetVersion).where(DatasetVersion.project_id == project_id).order_by(DatasetVersion.id)):
+        try:
+            items = load_manifest(version)["images"]
+        except Exception:  # noqa: BLE001 - a version whose manifest is gone cannot be broken any further
+            continue
+        hit = sorted(it["image_id"] for it in items if shas.get(it["image_id"]) == it["sha256"])
+        if hit:
+            found[version.name] = hit
+    return found
+
+
 def load_manifest(version: DatasetVersion) -> dict:
     return json.loads(get_storage().get(version.manifest_key))
 

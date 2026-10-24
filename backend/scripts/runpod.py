@@ -14,11 +14,12 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -167,6 +168,7 @@ class Plan:
     export_imx: bool = True  # whether the queued run exports for the IMX500 (the pod then installs the export tools)
     dataset_id: int | None = None
     bucket: bool = False  # the pod downloads the dataset from the dataset bucket (MT_DATASET_BUCKET) instead of through the tunnel
+    gpu_prices: dict = field(default_factory=dict)  # per hour, for each of `gpus` in this cloud
 
 
 def image_exists(image: str, http: httpx.Client) -> bool | None:
@@ -217,7 +219,13 @@ def make_plan(args, d: Deps) -> Plan:
         # A run whose pod died stays "training" until a worker next asks for work, and then only if its lease has run out.
         # This launcher is that worker's only caller, so it does the release itself, or a stranded run could never be retried.
         training.reap_expired(db)
-        run = db.scalars(select(TrainingRun).where(TrainingRun.stage == RunStage.queued).order_by(TrainingRun.id).limit(1)).first()
+        wanted_run = getattr(args, "run", None)
+        if wanted_run is not None:  # the UI names the run the person confirmed; never "whichever is first" then
+            run = db.get(TrainingRun, wanted_run, populate_existing=True)
+            if run is None or run.stage != RunStage.queued:
+                raise Refusal(f"Run {wanted_run} is not waiting for a GPU (it must be queued). Nothing was started.")
+        else:
+            run = db.scalars(select(TrainingRun).where(TrainingRun.stage == RunStage.queued).order_by(TrainingRun.id).limit(1)).first()
         if run is None:
             raise Refusal("No training run is waiting. Create one in the UI (Train & export), then run this again. "
                           "A pod with nothing to do would only cost money.")
@@ -237,6 +245,10 @@ def make_plan(args, d: Deps) -> Plan:
         raise Refusal(f"None of {', '.join(wanted)} is offered in the {cloud.title()} cloud. See: python -m scripts.runpod gpus")
     worst_price = max(offered[g][price_key] for g in chosen)
     worst_case = round(worst_price * args.max_hours, 2)
+    agreed = getattr(args, "max_cost", None)
+    if agreed is not None and worst_case > agreed + 0.005:  # the person confirmed a price; a dearer one needs a new confirmation
+        raise Refusal(f"The price changed: this could now cost up to ${worst_case:.2f}, more than the ${agreed:.2f} that was agreed. "
+                      "Nothing was started; check the price again.")
 
     balance = d.api.account().get("balance") or 0
     if balance < worst_case:
@@ -250,7 +262,7 @@ def make_plan(args, d: Deps) -> Plan:
         raise Refusal("A download the pod needs is not available right now, so it would only sit and bill: " + "; ".join(problems)
                       + ". Try again in a little while.")
     return Plan(run_id, run_name, images, chosen, cloud, args.max_hours, worst_price, worst_case, balance, args.image, export_imx,
-                dataset_id, dataset_bucket.enabled())
+                dataset_id, dataset_bucket.enabled(), {g: offered[g][price_key] for g in chosen})
 
 
 def describe(p: Plan) -> str:
@@ -636,6 +648,19 @@ def cmd_stop(args, d: Deps) -> int:
     return 1 if failed else 0
 
 
+def install_stop_handlers() -> None:
+    """Make SIGINT and SIGTERM end the launch the careful way (KeyboardInterrupt runs the `finally` that deletes the pod and closes
+    the tunnel). A launcher started by the backend may have inherited SIGINT as "ignored", which Python would then leave alone."""
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, stop)
+        signal.signal(signal.SIGTERM, stop)
+    except ValueError:  # not the main thread
+        pass
+
+
 def main(argv=None, deps: Deps | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -646,6 +671,8 @@ def main(argv=None, deps: Deps | None = None) -> int:
     ln.add_argument("--yes", action="store_true", help="really start (spends money). Without it this is a dry run.")
     ln.add_argument("--gpu", action="append", help="a GPU id, repeat for several in order of preference (see `gpus`)")
     ln.add_argument("--cloud", choices=("secure", "community"), default="secure", help="community is cheaper, secure is steadier")
+    ln.add_argument("--run", type=int, help="train this queued run (default: the oldest one waiting)")
+    ln.add_argument("--max-cost", type=float, help="refuse if the worst case now costs more than this many dollars (what you agreed to)")
     ln.add_argument("--max-hours", type=float, default=3.0, help=f"hard limit on the pod's life, at most {MAX_HOURS_LIMIT} (default 3)")
     ln.add_argument("--image", default=IMAGE)
     ln.add_argument("--backend-url", default="http://127.0.0.1:8000", help="where the backend listens on this Mac")
@@ -662,6 +689,7 @@ def main(argv=None, deps: Deps | None = None) -> int:
             print("MT_RUNPOD_API_KEY isn't set in backend/.env.")
             return 1
         deps = real_deps(settings.runpod_api_key or "")
+        install_stop_handlers()
     try:
         return {"status": cmd_status, "gpus": cmd_gpus, "launch": cmd_launch, "stop": cmd_stop,
                 "upload-dataset": cmd_upload_dataset}[args.cmd](args, deps)

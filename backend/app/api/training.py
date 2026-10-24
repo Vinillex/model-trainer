@@ -1,8 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, Response
+import shlex
+import socket
+import subprocess
+import sys
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import training
+from ..config import settings
 from ..db import get_db
 from ..models import TrainingRun
 from ..schemas import TrainingRunCreate, TrainingRunOut, WorkerOut
@@ -77,3 +83,29 @@ def download_artifact(run_id: int, name: str, db: Session = Depends(get_db)):
 def training_workers():
     """Workers that have called in recently (in memory, so it resets when the backend restarts)."""
     return training.list_workers()
+
+
+def lan_hostname() -> str:
+    """The name other machines on the network use for this one (<name>.local). Unlike an IP address it survives a new DHCP lease."""
+    if sys.platform == "darwin":
+        try:
+            name = subprocess.run(["scutil", "--get", "LocalHostName"], capture_output=True, text=True, timeout=3).stdout.strip()
+            if name:
+                return f"{name}.local"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    host = socket.gethostname()
+    return host if "." in host else f"{host}.local"
+
+
+@router.get("/pi-setup")
+def pi_setup(request: Request):
+    """The one-time command that turns a Raspberry Pi into an always-on worker. It contains the worker token, so it is only
+    served to this machine (the normal API is loopback-only) and the page copies it to the clipboard without showing it."""
+    if not settings.worker_token:
+        raise HTTPException(503, "The worker API is disabled: set MT_WORKER_TOKEN in backend/.env and restart the backend")
+    server = f"http://{lan_hostname()}:{request.url.port or 8000}"
+    command = (f"T={shlex.quote(settings.worker_token)} && mkdir -p ~/agent && cd ~/agent"
+               f" && curl -fsS -H \"X-Worker-Token: $T\" {shlex.quote(server + '/workers/pi-agent')} | tar xz"
+               f" && MT_SERVER={shlex.quote(server)} MT_WORKER_TOKEN=\"$T\" bash pi_install.sh")
+    return {"server": server, "command": command}

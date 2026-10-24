@@ -11,10 +11,10 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
-from .. import dataset_bucket, training
+from .. import dataset_bucket, pi_display, training
 from ..db import get_db
-from ..models import DatasetVersion
-from ..schemas import ClaimIn, CompleteIn, FailIn, HeartbeatIn, TrainingRunOut
+from ..models import DatasetVersion, TrainingRun
+from ..schemas import ClaimIn, CompleteIn, DisplayStatusIn, FailIn, HeartbeatIn, TrainingRunOut
 from ..security import require_token, worker_name
 from ..storage import get_storage
 from .datasets import zip_response
@@ -46,17 +46,54 @@ def ping():
 
 AGENTS_DIR = Path(__file__).resolve().parents[3] / "agents"
 AGENT_FILES = ("common.py", "gpu_agent.py", "requirements-gpu.txt")
+PI_AGENT_FILES = ("common.py", "pi_agent.py", "pi_display.py", "pi_viewer.py", "pi_install.sh")
+
+
+def agent_files_response(names: tuple[str, ...]) -> Response:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name in names:
+            tar.add(AGENTS_DIR / name, arcname=name)
+    return Response(buf.getvalue(), media_type="application/gzip")
 
 
 @router.get("/agent")
 def agent_bundle():
     """The GPU agent's code as a tar.gz. A fresh machine (a RunPod pod) fetches it here, so it runs exactly the version on
     this Mac, including changes that were never committed."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for name in AGENT_FILES:
-            tar.add(AGENTS_DIR / name, arcname=name)
-    return Response(buf.getvalue(), media_type="application/gzip")
+    return agent_files_response(AGENT_FILES)
+
+
+@router.get("/pi-agent")
+def pi_agent_bundle():
+    """The Pi agent and its installer as a tar.gz: the Training page's "Copy Pi setup command" downloads this on the Pi."""
+    return agent_files_response(PI_AGENT_FILES)
+
+
+# ---------- what the Pi's screen should show ----------
+
+@router.get("/display")
+def display_request():
+    """`active` = the request that should be showing; `request` = that request, handed out once (see app/pi_display.py)."""
+    return pi_display.for_worker()
+
+
+@router.post("/display/status", status_code=204)
+def display_status(body: DisplayStatusIn):
+    pi_display.report(body.model_dump())
+
+
+@router.get("/display/files/{name}")
+def display_file(name: str, db: Session = Depends(get_db)):
+    """The .rpk and labels of the run the page asked to show: only that run, so a token holder can't read other runs' files from here."""
+    if name not in ("rpk", "labels"):
+        raise HTTPException(404, "no such file")
+    run_id = pi_display.wanted_run()
+    run = db.get(TrainingRun, run_id) if run_id is not None else None
+    art = (run.artifacts or {}).get(name) if run else None
+    if art is None:
+        raise HTTPException(404, "nothing is wanted on the Pi's screen, or this run has no such file")
+    return Response(get_storage().get(art["key"]), media_type="application/octet-stream")
 
 
 WORKER_LOG_MAX_BYTES = 256 * 1024

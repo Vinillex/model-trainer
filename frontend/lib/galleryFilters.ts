@@ -2,7 +2,10 @@ import type { ReviewStatus, Source } from "@/lib/api";
 
 /** The main page's gallery filters. The review screen has no filters of its own: it shows the queue these describe. */
 export interface GalleryFilters {
+  /** The folder an image is filed under. */
   classId?: number;
+  /** Images that have at least one box of this class, wherever they are filed (how to find what still uses a class). */
+  boxClassId?: number;
   /** One choice, so a source, an imported dataset and an upload folder can't be combined: "", "source:scraped", "dataset:anti-uav" or "folder:flight-1". */
   scope: string;
   reviewStatus?: ReviewStatus;
@@ -44,7 +47,8 @@ export function scopeFilter(scope: string): { source?: Source; dataset?: string;
 
 /** What the gallery and the review screen both send to list images: one place, so the review queue is exactly the gallery's list. */
 export function imageQuery(f: GalleryFilters) {
-  return { classId: f.classId, ...scopeFilter(f.scope), manuallyChecked: f.manualCheck, ai: f.ai, reviewStatus: f.reviewStatus };
+  // Rejected images live in the Trash: they stay out of the Images page and the review queue unless a review status is chosen on purpose.
+  return { classId: f.classId, boxClassId: f.boxClassId, excludeRejected: f.reviewStatus === undefined, ...scopeFilter(f.scope), manuallyChecked: f.manualCheck, ai: f.ai, reviewStatus: f.reviewStatus };
 }
 
 export const AI_FILTERS: { value: string; label: string }[] = [
@@ -64,6 +68,7 @@ export function describeFilters(f: GalleryFilters, className: (id: number) => st
   const { source, dataset, folder } = scopeFilter(f.scope);
   const parts = [
     f.classId !== undefined ? className(f.classId) : null,
+    f.boxClassId !== undefined ? `${className(f.boxClassId)} boxes` : null,
     dataset ?? (folder ? `folder ${folder}` : source) ?? null,
     f.manualCheck === undefined ? null : f.manualCheck ? "manually checked" : "not manually checked",
     f.ai ? AI_FILTERS.find((a) => a.value === f.ai)?.label ?? f.ai : null,

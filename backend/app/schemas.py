@@ -73,8 +73,20 @@ class ImageIdsIn(BaseModel):
     image_ids: list[int] = Field(min_length=1, max_length=500)
 
 
+class TrashDeleteIn(ImageIdsIn):
+    allow_breaking_versions: bool = False  # delete even images that an existing dataset version contains (that version can then no longer be downloaded)
+
+
 class RejectResult(BaseModel):
     rejected: int
+
+
+class RestoreResult(BaseModel):
+    restored: int
+
+
+class PurgeResult(BaseModel):
+    deleted: int
 
 
 class UploadResult(BaseModel):
@@ -374,6 +386,16 @@ class WorkerOut(BaseModel):
     online: bool
     last_seen: datetime
     run_id: int | None
+
+
+class DisplayStatusIn(BaseModel):
+    """What the Pi agent reports about the live view on the Pi's screen."""
+    request_id: str = Field(max_length=64)
+    state: Literal["starting", "running", "stopped", "failed"]
+    message: str = Field("", max_length=500)
+    camera_fps: float | None = None
+    results_per_s: float | None = None
+    detections: int | None = None
 
 
 class ClaimIn(BaseModel):

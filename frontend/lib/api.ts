@@ -327,6 +327,69 @@ export interface WorkerInfo {
   run_id: number | null;
 }
 
+export interface RunPodPod {
+  id: string;
+  name: string | null;
+  status: string | null;
+  cost_per_hr: number;
+}
+
+export interface RunPodStatus {
+  key_set: boolean;
+  token_set: boolean;
+  cloudflared: boolean;
+  bucket: boolean;
+  balance: number | null;
+  spend_per_hr: number | null;
+  pods: RunPodPod[];
+  other_pods: number;
+  error: string | null;
+}
+
+export type RunPodCloud = "secure" | "community";
+
+/** What starting a run on RunPod would do and cost: every check the launcher makes before it spends anything. */
+export interface RunPodPlan {
+  run_id: number;
+  run_name: string;
+  images: number;
+  cloud: RunPodCloud;
+  max_hours: number;
+  gpus: { id: string; price: number | null }[];
+  worst_price: number;
+  worst_case: number;
+  balance: number;
+  bucket: boolean;
+  export_imx: boolean;
+}
+
+/** The latest RunPod launch (a separate process on the Mac): running, or finished with the end of its log. */
+export interface RunPodLaunch {
+  state: "none" | "running" | "finished";
+  run_id?: number;
+  started_at?: string;
+  max_cost?: number;
+  exit_code?: number | null;
+  stopping?: boolean;
+  lost_track?: boolean; // the backend restarted while it ran, so how it ended is only in the log
+  lines: string[];
+}
+
+/** The live view of a finished run on the Raspberry Pi's own screen (the Pi agent shows it; this is what it last reported). */
+export interface PiDisplay {
+  state: "none" | "waiting" | "starting" | "running" | "stopped" | "failed" | "ended";
+  pi_online: boolean;
+  request_id: string | null;
+  run_id: number | null;
+  run_name: string | null;
+  message: string;
+  camera_fps: number | null;
+  results_per_s: number | null;
+  detections: number | null;
+  threshold: number | null;
+  fps: number | null;
+}
+
 /** The backend stores UTC but its timestamps carry no zone suffix, which `new Date` would read as local time. */
 export const parseUtc = (s: string) => new Date(/(Z|[+-]\d\d:?\d\d)$/.test(s) ? s : s + "Z");
 
@@ -335,7 +398,9 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     const body = await res.json().catch(() => null);
     const detail = body?.detail;
-    throw new Error(typeof detail === "string" ? detail : detail ? JSON.stringify(detail) : res.statusText);
+    const err = new Error(typeof detail === "string" ? detail : detail ? JSON.stringify(detail) : res.statusText) as Error & { status?: number };
+    err.status = res.status; // callers that need to tell "refused, ask the person" (409) from a failure can
+    throw err;
   }
   return res.status === 204 ? (undefined as T) : res.json();
 }
@@ -362,16 +427,18 @@ export const api = {
   stats: (projectId: number) => req<StatRow[]>(`/projects/${projectId}/stats`),
   listImages: (
     projectId: number,
-    p: { classId?: number; source?: Source; dataset?: string; folder?: string; manuallyChecked?: boolean; ai?: string; reviewStatus?: ReviewStatus; limit: number; offset: number },
+    p: { classId?: number; boxClassId?: number; excludeRejected?: boolean; source?: Source; dataset?: string; folder?: string; manuallyChecked?: boolean; ai?: string; reviewStatus?: ReviewStatus; limit: number; offset: number },
   ) => {
     const q = new URLSearchParams({ limit: String(p.limit), offset: String(p.offset) });
     if (p.classId != null) q.set("class_id", String(p.classId));
+    if (p.boxClassId != null) q.set("box_class_id", String(p.boxClassId));
     if (p.source) q.set("source", p.source);
     if (p.dataset) q.set("dataset", p.dataset);
     if (p.folder) q.set("folder", p.folder);
     if (p.manuallyChecked !== undefined) q.set("manually_checked", String(p.manuallyChecked));
     if (p.ai) q.set("ai", p.ai);
     if (p.reviewStatus) q.set("review_status", p.reviewStatus);
+    if (p.excludeRejected) q.set("exclude_rejected", "true");
     return req<ImageRow[]>(`/projects/${projectId}/images?${q}`);
   },
   /** The review window calls this for an imported image it shows: opening it there is what counts as a manual check. */
@@ -386,6 +453,11 @@ export const api = {
     return req<UploadResult>(`/projects/${projectId}/classes/${classId}/images${q}`, { method: "POST", body: form });
   },
   folders: (projectId: number) => req<FolderRow[]>(`/projects/${projectId}/folders`),
+  /** Take rejected images out of the trash: they become "not reviewed" again, boxes as they were. */
+  restoreImages: (projectId: number, imageIds: number[]) => req<{ restored: number }>(`/projects/${projectId}/images/restore`, json("POST", { image_ids: imageIds })),
+  /** Delete rejected images for good. A 409 means a dataset version contains some of them: ask the person, then repeat with allowBreakingVersions. */
+  purgeImages: (projectId: number, imageIds: number[], allowBreakingVersions = false) =>
+    req<{ deleted: number }>(`/projects/${projectId}/images/delete`, json("POST", { image_ids: imageIds, allow_breaking_versions: allowBreakingVersions })),
   /** Reject several images exactly as the review screen's Reject does for one. There is no bulk accept: accepting means a person looked. */
   rejectImages: (projectId: number, imageIds: number[]) => req<{ rejected: number }>(`/projects/${projectId}/images/reject`, json("POST", { image_ids: imageIds })),
   getImage: (id: number) => req<ImageDetail>(`/images/${id}`),
@@ -440,4 +512,19 @@ export const api = {
   cancelTrainingRun: (id: number) => req<TrainingRun>(`/training-runs/${id}/cancel`, { method: "POST" }),
   deleteTrainingRun: (id: number) => req<void>(`/training-runs/${id}`, { method: "DELETE" }),
   trainingWorkers: () => req<WorkerInfo[]>("/training-workers"),
+  piDisplay: () => req<PiDisplay>("/pi-display"),
+  // These switch the Pi's camera and screen on: the header makes the browser ask the backend's CORS allow-list first.
+  showOnPi: (runId: number) =>
+    req<PiDisplay>(`/training-runs/${runId}/pi-display`, { ...json("POST", {}), headers: { "content-type": "application/json", "X-MT-Pi": "1" } }),
+  stopOnPi: () => req<PiDisplay>("/pi-display", { method: "DELETE", headers: { "X-MT-Pi": "1" } }),
+  runpodStatus: () => req<RunPodStatus>("/runpod/status"),
+  runpodPlan: (runId: number, maxHours: number, cloud: RunPodCloud) => req<RunPodPlan>(`/runpod/plan?run_id=${runId}&max_hours=${maxHours}&cloud=${cloud}`),
+  runpodLaunch: () => req<RunPodLaunch>("/runpod/launch"),
+  // These spend money or end pods: the header makes the browser ask the backend's CORS allow-list first, so a page that is not this app cannot send them.
+  startRunpodLaunch: (body: { run_id: number; max_hours: number; cloud: RunPodCloud; max_cost: number }) =>
+    req<RunPodLaunch>("/runpod/launch", { ...json("POST", body), headers: { "content-type": "application/json", "X-MT-Spend": "1" } }),
+  stopRunpodLaunch: () => req<RunPodLaunch>("/runpod/launch/stop", { method: "POST", headers: { "X-MT-Spend": "1" } }),
+  deleteRunpodPod: (podId: string) => req<{ deleted: boolean }>(`/runpod/pods/${encodeURIComponent(podId)}/delete`, { method: "POST", headers: { "X-MT-Spend": "1" } }),
+  /** The one-time command that sets up a Raspberry Pi as an always-on worker (it contains the worker token: copy it, don't show it). */
+  piSetup: () => req<{ server: string; command: string }>("/pi-setup"),
 };

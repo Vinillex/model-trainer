@@ -15,11 +15,8 @@ export default function OverviewPage() {
         <h2 className="font-medium">Where the images are</h2>
         <PlacesTable projectId={projectId} refreshKey={refreshKey} />
       </section>
-      <section className="space-y-2">
-        <h2 className="font-medium">Classes</h2>
-        <StatsTable projectId={projectId} rows={stats} onChanged={classesChanged} />
-        <ClassForm projectId={projectId} onAdded={classesChanged} />
-      </section>
+      <StatsTable projectId={projectId} rows={stats} onChanged={classesChanged} />
+      <ClassForm projectId={projectId} onAdded={classesChanged} />
     </div>
   );
 }

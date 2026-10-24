@@ -115,6 +115,17 @@ class Api:
     def download(self, path: str, dest: Path) -> None:
         self.call("GET", path, out=dest)
 
+    # ---- the live view on the Pi's screen ----
+    def display_request(self) -> dict:
+        """{"active": the request id that should be showing or None, "request": that request the first time it is asked for}"""
+        return self.json("GET", "/workers/display", retry=False, timeout=15)
+
+    def display_status(self, body: dict) -> None:
+        self.call("POST", "/workers/display/status", body=body, retry=False, timeout=15)
+
+    def display_file(self, name: str, dest: Path) -> None:
+        self.call("GET", f"/workers/display/files/{name}", out=dest, retry=False, timeout=120)
+
     def upload(self, run_id: int, name: str, file: Path) -> None:
         self.call("PUT", f"/workers/runs/{run_id}/artifacts/{name}", file=file)
         log.info("uploaded %s (%.1f MB)", name, file.stat().st_size / 2**20)

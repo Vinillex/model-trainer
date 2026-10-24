@@ -30,6 +30,7 @@ export default function PlacesTable({ projectId, refreshKey }: { projectId: numb
     api.folders(projectId).then(setRows).catch((e) => setError(e.message));
   }, [projectId, refreshKey]);
 
+  const inTrash = (rows ?? []).reduce((n, r) => n + r.rejected, 0);
   const places = useMemo(() => {
     const byKey = new Map<string, Place>();
     for (const r of rows ?? []) {
@@ -42,7 +43,7 @@ export default function PlacesTable({ projectId, refreshKey }: { projectId: numb
         scope: key,
         total: 0, reviewed: 0, rejected: 0, ai_ok: 0, ai_flagged: 0, ai_unchecked: 0,
       };
-      p.total += r.total;
+      p.total += r.total - r.rejected; // rejected images are in the Trash, not in their dataset
       p.reviewed += r.reviewed;
       p.rejected += r.rejected;
       p.ai_ok += r.ai_ok;
@@ -60,7 +61,7 @@ export default function PlacesTable({ projectId, refreshKey }: { projectId: numb
   }
 
   if (error) return <p className="text-sm text-red-600">{error}</p>;
-  if (rows && places.length === 0) return <p className="text-sm text-neutral-500">No images yet. Add some in Add data.</p>;
+  if (rows && places.length === 0 && inTrash === 0) return <p className="text-sm text-neutral-500">No images yet. Add some in Add data.</p>;
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-sm" data-testid="places-table">
@@ -98,6 +99,22 @@ export default function PlacesTable({ projectId, refreshKey }: { projectId: numb
               </td>
             </tr>
           ))}
+          {inTrash > 0 && (
+            <tr className="border-b border-neutral-200 dark:border-neutral-800" data-testid="place-trash">
+              <td className="py-1.5 pr-4">
+                <span className="font-medium">Trash</span> <span className="text-xs text-neutral-500">rejected images</span>
+              </td>
+              <td className="px-2 text-right tabular-nums">{inTrash.toLocaleString()}</td>
+              <td colSpan={4} className="px-2 text-right text-neutral-500">
+                kept out of the datasets
+              </td>
+              <td className="pl-2 text-right whitespace-nowrap">
+                <button className="btn" onClick={() => router.push(`/projects/${projectId}/trash`)}>
+                  Open
+                </button>
+              </td>
+            </tr>
+          )}
         </tbody>
       </table>
     </div>

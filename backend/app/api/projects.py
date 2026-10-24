@@ -108,6 +108,10 @@ def create_classes_bulk(project_id: int, body: BulkClassCreate, db: Session = De
     return result
 
 
+def _count(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
 @router.delete("/{project_id}/classes/{class_id}", status_code=204)
 def delete_class(project_id: int, class_id: int, db: Session = Depends(get_db)):
     """Remove a class nothing uses. Refused while it has images, boxes, or a queued/running scrape job aimed at it."""
@@ -118,8 +122,10 @@ def delete_class(project_id: int, class_id: int, db: Session = Depends(get_db)):
     images = db.scalar(select(func.count()).select_from(Image).where(Image.class_id == class_id))
     boxes = db.scalar(select(func.count()).select_from(Annotation).where(Annotation.class_id == class_id))
     if images or boxes:
-        raise HTTPException(409, f"Class '{cls.name}' is still in use ({images} images, {boxes} boxes). "
-                                 "A class can only be removed once nothing uses it.")
+        box_images = db.scalar(select(func.count(func.distinct(Annotation.image_id))).where(Annotation.class_id == class_id))
+        raise HTTPException(409, f"Class '{cls.name}' is still in use ({_count(images, 'image', 'images')} filed under it, "
+                                 f"{_count(boxes, 'box', 'boxes')} on {_count(box_images, 'image', 'images')}). "
+                                 "A class can only be removed once nothing uses it: relabel or delete those boxes and move or delete those images.")
     active = db.scalars(select(Job).where(Job.project_id == project_id, Job.status.in_((JobStatus.queued, JobStatus.running)))).all()
     if any(j.params.get("class_id") == class_id for j in active):
         raise HTTPException(409, f"A scrape job for '{cls.name}' is queued or running. Cancel it first.")

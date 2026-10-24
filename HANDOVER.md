@@ -19,7 +19,7 @@ Decisions already made (don't re-litigate without a reason):
 
 | Decision | Detail |
 |---|---|
-| Compute | **Rented RunPod GPUs** (decided 2026-10-22: the user has no GPU access). `python -m scripts.runpod launch --yes` rents one for the length of a run and deletes the pod afterwards; see `agents/RUNPOD.md`. The launch path has run on four real pods (1-epoch tests, $0.45 in all, see the status below); the IMX export has still never finished. Earlier plan, still supported by `agents/README.md`: local GPUs (RTX 4060 Ti 8 GB and RTX 3060 12 GB in Windows PCs). |
+| Compute | **Rented RunPod GPUs** (decided 2026-10-22: the user has no GPU access). The Training page's **Train on RunPod…** button (price dialog, live log, Stop; `app/api/runpod.py`) or `python -m scripts.runpod launch --yes` rents one for the length of a run and deletes the pod afterwards; see `agents/RUNPOD.md`. The launch path has run on four real pods (1-epoch tests, $0.45 in all, see the status below); the IMX export has still never finished. Earlier plan, still supported by `agents/README.md`: local GPUs (RTX 4060 Ti 8 GB and RTX 3060 12 GB in Windows PCs). |
 | Model | **YOLO11n / YOLOv8n only.** Ultralytics' IMX export supports nothing else, and the sensor has about 8 MB of model memory. Input up to 640x640. |
 | Labeling | Built-in review UI (box editor), not CVAT or Label Studio. |
 | Auth | **None.** Single user, trusted network. The only protection is a loopback guard plus a worker token (section 4.6). |
@@ -44,6 +44,8 @@ backend/            FastAPI + SQLAlchemy 2 (SQLite by default). Python.
     yolo_export.py  frozen manifest -> YOLO zip (no DB access, reusable)
     training.py     training-run state machine: stages, leases, claim/heartbeat/complete (section 4.5)
     security.py     LoopbackOnly middleware + worker-token check
+    pi_display.py      what the Pi's screen should show (request + the agent's reports, one JSON file); api/pi_display.py is its page-facing side
+    api/runpod.py      the UI's RunPod buttons: price check, confirmed launch as a detached process, log, stop, delete a stray pod
     runpod_client.py   RunPod: balance and GPU prices (GraphQL), start/list/delete pods (REST, https://rest.runpod.io/v1)
     runpod_pod.py   what a training pod is: pinned image, GPU preference list, the POST /pods body
     ai/             the AI check (section 4.8): geometry.py, verdict.py, check.py (the rules), service.py (glue, model cache, auto-label), job.py (batch),
@@ -54,7 +56,7 @@ backend/            FastAPI + SQLAlchemy 2 (SQLite by default). Python.
     bundle.py       export/import the whole database + files as a portable bundle
     ai_spike.py     calibration for the AI check: SAM on jittered/loose/wrong boxes, by drone size (re-run it before changing thresholds)
     seed_synthetic.py  make a synthetic project so the pipeline can be tested with no real data
-  tests/            421 tests (pytest)
+  tests/            518 tests (pytest)
 agents/             what runs on the GPU and the Pi: gpu_agent.py, pi_agent.py, common.py, README.md, runpod_start.sh (the pod's
                     start command), RUNPOD.md
 frontend/           Next.js 15 (app router, TypeScript, Tailwind 3). Talks to the API at NEXT_PUBLIC_API_URL (default http://localhost:8000)
@@ -119,8 +121,9 @@ export is Linux-only. If this machine is already native Linux, ignore the WSL no
    ```
    Watch the run in the UI ("Train & export"). Success = stage `awaiting_package` with `best.pt`, `packerOut.zip` and
    `labels.txt` downloadable. That is the real export working.
-10. **The Raspberry Pi** (`agents/README.md` section 2): `sudo apt install imx500-tools`, copy `common.py` and
-    `pi_agent.py`, point it at this machine's LAN address. Success = the run reaches `done` and `network.rpk` downloads.
+10. **The Raspberry Pi** (`agents/README.md` section 2): the Training page's **Copy Pi setup command** button copies a one-time
+    command; pasted on the Pi it installs `pi_agent.py` as a systemd service (`mt-pi-agent`, starts at boot). After that a finished
+    run is packaged by itself whenever the Pi is on. Success = the run reaches `done` and `network.rpk` downloads.
     Then load it on the Pi with Ultralytics' Sony IMX500 guide.
 
 Then tell Vinit what worked. Steps 8-10 are the first time those parts ever run.
@@ -154,6 +157,21 @@ does; boxes stay as they are) and **Run AI on these** (hands the ids to the AI p
 rules still apply, an empty list is refused, never "everything"). There is **no bulk accept**: accepting means a person looked, and it would
 turn unchecked boxes into training data. The selection is cleared whenever a filter changes and pruned to the images on screen after every reload.
 There is no "move to folder": moving existing images between folders is not built.
+**Trash.** Rejected images live in the **Trash** section (`TrashPanel.tsx`, drawer item with a count, a row in the Overview places table). They are
+kept out of the Images page and the review queue: `imageQuery()` sends `exclude_rejected` unless a review status is chosen on purpose (an explicit
+`review_status=rejected` still finds them), and dataset versions already exclude them. Places on the Overview count images without the trash.
+Select cards, then **Restore** (`POST /projects/{id}/images/restore`: back to "not reviewed", boxes as they were, and the AI's doubts return because
+the decision recorded at the reject is forgotten) or **Delete forever** (`POST .../images/delete`, inline confirm; rows first, files after, cascades
+included). Both take only rejected images of the project, all or nothing, up to 500. A frozen dataset version reads its image files whenever it is
+downloaded, so images that a version contains (matched on id and SHA-256: SQLite reuses ids) are refused with a 409 naming the version; the panel then
+offers "Delete anyway" (`allow_breaking_versions`). The single Delete on a gallery card is unchanged and unprotected, as before (a version then reports
+its missing files). Opening a card reviews the trash; accepting an image there takes it out of the rejected queue.
+
+**Classes and what uses them.** The Overview lists the drone classes and the hard negatives as two tables (negative images arrive already reviewed,
+so that table has no "To review" column). Remove is always visible and greyed out while the class is in use (an image filed under it, or any
+box of that class); beside it "show N boxes" opens the review queue on exactly the images that have such a box (`GET /images?box_class_id=`,
+wherever they are filed: an image in `mixed` has boxes of several classes) and "show images" opens the gallery on the class. The 409 message says
+how many images are filed under the class and how many boxes on how many images.
 **Overview.** `PlacesTable.tsx` (from `GET /projects/{id}/folders`, which now also returns `ai_ok`, `ai_flagged`, `ai_unchecked` per place): images,
 reviewed %, AI ok %, needs a look, not checked, with "Review N" and "Open". The AI counts use `ai_condition()` in `app/ai/filters.py`, the one
 SQL rule behind every AI filter (the gallery list, these counts and the drawer's "needs a look" badge); `Image.ai_status` is the same rule in
@@ -248,7 +266,8 @@ UI "Train & export" -> POST /projects/{id}/training-runs   (refused if the versi
 ### 4.6 Security model (`security.py`)
 `LoopbackOnly` middleware: only requests from the machine itself may use the normal API; any other client gets 403 on
 everything except `/workers/*`, where it must present `MT_WORKER_TOKEN` (unset = worker API disabled, 503). The backend
-binds `127.0.0.1` by default. **If you bind `0.0.0.0` so the Pi can connect, tell Vinit.** Still no user auth: anyone who
+binds `127.0.0.1` by default. **If you bind `0.0.0.0` so the Pi can connect, tell Vinit.** (Since 2026-10-24 Vinit runs it on `0.0.0.0`
+so the always-on Pi worker can reach it: `uvicorn app.main:app --host 0.0.0.0 --port 8000`; other machines still get 403 outside `/workers/*`.) Still no user auth: anyone who
 can run a browser *on the machine* can do anything.
 
 A request that carries a proxy or tunnel header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP`, `CF-Ray`, ...)

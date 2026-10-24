@@ -5,10 +5,10 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { SELECTABLE_SOURCES, api, imageUrl, type DetClass, type FolderRow, type ImageRow, type ImportedDataset, type ReviewStatus } from "@/lib/api";
 import { setAiSelection } from "@/lib/aiSelection";
+import { useSelection } from "@/lib/useSelection";
 import { AI_FILTERS, NO_FILTERS, imageQuery, loadGalleryFilters, saveGalleryFilters, scopeFilter, type GalleryFilters } from "@/lib/galleryFilters";
 
 const PAGE = 48;
-const MAX_SELECTED = 500; // what the server takes in one bulk request or AI run
 const scopeLabel = (s: string) => (s.startsWith("folder:") ? `folder ${s.slice(7)}` : s.startsWith("dataset:") ? s.slice(8) : s.slice(7));
 const STATUS_STYLE = { pending: "text-amber-500", reviewed: "text-green-500", rejected: "text-red-500" } as const;
 // "pending" is shown as "not reviewed": it means nobody has looked at the image yet.
@@ -34,17 +34,17 @@ const AI_TAG: Record<string, [string, string]> = {
 export default function Gallery({ projectId, classes, refreshKey, onChanged }: { projectId: number; classes: DetClass[]; refreshKey: number; onChanged: () => void }) {
   // These filters are also the review screen's: it opens the queue they describe, so they are kept for the tab.
   const [filters, setFilters] = useState<GalleryFilters>(() => loadGalleryFilters(projectId));
-  const { classId, scope, reviewStatus, manualCheck, ai } = filters;
+  const { classId, boxClassId, scope, reviewStatus, manualCheck, ai } = filters;
   const { dataset } = scopeFilter(scope);
   const update = (patch: Partial<GalleryFilters>) => setFilters((f) => ({ ...f, ...patch }));
   const [datasets, setDatasets] = useState<ImportedDataset[]>([]);
   const [folders, setFolders] = useState<FolderRow[]>([]);
   const [images, setImages] = useState<ImageRow[]>([]);
+  const { selected, toggle, selectAll, clear: clearSelection, max: MAX_SELECTED } = useSelection(images, filters);
   const [more, setMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<number | null>(null);
   const router = useRouter();
-  const [selected, setSelected] = useState<Set<number>>(new Set());
   const [rejecting, setRejecting] = useState(false); // the inline "are you sure" for a bulk reject
   const [bulkBusy, setBulkBusy] = useState(false);
   const className = (id: number) => classes.find((c) => c.id === id)?.name ?? id;
@@ -52,11 +52,7 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
   useEffect(() => {
     saveGalleryFilters(projectId, filters);
   }, [projectId, filters]);
-  // A selection belongs to the list it was made on: another filter starts a new one.
-  useEffect(() => {
-    setSelected(new Set());
-    setRejecting(false);
-  }, [filters]);
+  useEffect(() => setRejecting(false), [filters]);
 
   const load = useCallback(
     async (offset: number, limit = PAGE) => {
@@ -76,14 +72,6 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
   }, [load, refreshKey]);
   // Coming back to this tab (the review screen may have been opened in another one) shows the list as it is now, with as many rows as are loaded.
   const loaded = images.length;
-  // ...and it only ever covers images that are on screen: a reload can drop images from the list (reviewed since, rejected), and a bulk action must not reach them.
-  useEffect(() => {
-    setSelected((prev) => {
-      const onScreen = new Set(images.map((i) => i.id));
-      const kept = [...prev].filter((id) => onScreen.has(id));
-      return kept.length === prev.size ? prev : new Set(kept);
-    });
-  }, [images]);
   useEffect(() => {
     const onBack = () => {
       if (document.visibilityState === "visible") load(0, Math.min(500, Math.max(1, Math.ceil(loaded / PAGE)) * PAGE));
@@ -102,20 +90,12 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
   // One entry per upload folder, however many classes it was filed under.
   const uploadFolders = [...folders.filter((f) => f.source === "uploaded" && f.folder).reduce((m, f) => m.set(f.folder!, (m.get(f.folder!) ?? 0) + f.total), new Map<string, number>())];
 
-  const toggle = (id: number) =>
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else if (next.size < MAX_SELECTED) next.add(id);
-      return next;
-    });
-  const selectable = images.slice(0, MAX_SELECTED);
 
   async function rejectSelected() {
     setBulkBusy(true);
     try {
       await api.rejectImages(projectId, [...selected]);
-      setSelected(new Set());
+      clearSelection();
       setError(null);
       onChanged(); // reloads the list and the counts
     } catch (e) {
@@ -134,6 +114,7 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
   // The active filters as removable chips (the selects above stay the way to change them).
   const chips: { key: string; label: string; clear: () => void }[] = [];
   if (classId !== undefined) chips.push({ key: "class", label: String(className(classId)), clear: () => update({ classId: undefined }) });
+  if (boxClassId !== undefined) chips.push({ key: "box", label: `${className(boxClassId)} boxes`, clear: () => update({ boxClassId: undefined }) });
   if (scope) chips.push({ key: "scope", label: scopeLabel(scope), clear: () => update({ scope: "", manualCheck: undefined }) }); // the manual-check filter only exists inside one dataset
   if (manualCheck !== undefined) chips.push({ key: "manual", label: manualCheck ? "manual check ✓" : "not checked yet", clear: () => update({ manualCheck: undefined }) });
   if (ai) chips.push({ key: "ai", label: AI_FILTERS.find((f) => f.value === ai)?.label ?? ai, clear: () => update({ ai: undefined }) });
@@ -246,8 +227,8 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
       {selected.size > 0 && (
         <div className="sticky top-2 z-10 flex flex-wrap items-center gap-2 rounded-lg border border-blue-500/50 bg-white/95 px-3 py-2 text-sm shadow dark:bg-neutral-900/95" data-testid="bulk-bar">
           <span className="font-medium">{selected.size} selected</span>
-          <button className="btn" onClick={() => setSelected(new Set(selectable.map((i) => i.id)))}>
-            Select {images.length > MAX_SELECTED ? `first ${MAX_SELECTED}` : `all ${selectable.length}`} shown
+          <button className="btn" onClick={selectAll}>
+            Select {images.length > MAX_SELECTED ? `first ${MAX_SELECTED}` : `all ${images.length}`} shown
           </button>
           {rejecting ? (
             <>
@@ -269,7 +250,7 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
               </button>
             </>
           )}
-          <button className="ml-auto text-neutral-500 hover:text-current" onClick={() => setSelected(new Set())}>
+          <button className="ml-auto text-neutral-500 hover:text-current" onClick={clearSelection}>
             Clear selection
           </button>
         </div>

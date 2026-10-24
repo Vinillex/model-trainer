@@ -208,7 +208,8 @@ export default function ReviewScreen() {
   const finish = useCallback(
     async (newStatus: ReviewStatus) => {
       if (!(await save(newStatus, true)) || !queue || !current) return;
-      if (status === "pending" || filters?.ai === "flagged" || filters?.ai === "autolabelled") {  // a decided image is no longer in these lists
+      // a decided image is no longer in these lists (and an accepted one is no longer in the trash)
+      if (status === "pending" || filters?.ai === "flagged" || filters?.ai === "autolabelled" || (status === "rejected" && newStatus !== "rejected")) {
         const rest = queue.filter((r) => r.id !== current.id);
         setQueue(rest);
         setIndex((i) => Math.min(i, Math.max(0, rest.length - 1)));

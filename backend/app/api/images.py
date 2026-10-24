@@ -1,5 +1,6 @@
 import hashlib
 import io
+import logging
 import re
 from collections.abc import Callable
 
@@ -7,21 +8,22 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import Response
 from PIL import Image as PILImage
 from PIL import UnidentifiedImageError
-from sqlalchemy import case, func, select
+from sqlalchemy import case, exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from ..ai.filters import AI_FILTER_VALUES, ai_condition
 from ..config import settings
 from ..db import get_db
-from .. import imagehash, refile as refile_mod
-from ..models import DetClass, Image, ImageHash, ImportRecord, ManualCheck, ReviewStatus, Source, UploadRecord
+from .. import datasets, imagehash, refile as refile_mod
+from ..models import AiDismissal, Annotation, DetClass, Image, ImageHash, ImportRecord, ManualCheck, ReviewStatus, Source, UploadRecord
 from ..refile import storage_key_for
-from ..schemas import FOLDER_PATTERN, FolderOut, ImageDetail, ImageOut, ImportedDatasetOut, UploadResult
+from ..schemas import FOLDER_PATTERN, FolderOut, ImageDetail, ImageIdsIn, ImageOut, ImportedDatasetOut, PurgeResult, RestoreResult, TrashDeleteIn, UploadResult
 from ..storage import get_storage
 from .projects import get_project
 
 router = APIRouter(tags=["images"])
+log = logging.getLogger(__name__)
 
 EXT_BY_FORMAT = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp"}
 
@@ -124,13 +126,16 @@ def refile_images(project_id: int, dry_run: bool = True, db: Session = Depends(g
 
 
 @router.get("/projects/{project_id}/images", response_model=list[ImageOut])
-def list_images(project_id: int, class_id: int | None = None, source: Source | None = None,
+def list_images(project_id: int, class_id: int | None = None, box_class_id: int | None = None, source: Source | None = None,
                 dataset: str | None = Query(None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$"), folder: str | None = Query(None, pattern=FOLDER_PATTERN),
-                manually_checked: bool | None = None,
+                manually_checked: bool | None = None, exclude_rejected: bool = False,
                 ai: str | None = Query(None, pattern="^(" + "|".join(AI_FILTER_VALUES) + ")$"),
                 review_status: ReviewStatus | None = None, limit: int = Query(50, le=500), offset: int = 0, db: Session = Depends(get_db)):
     """`dataset` keeps only the images imported from that public dataset, so each one can be reviewed on its own.
+    `class_id` is the folder an image is filed under; `box_class_id` keeps the images that have at least one box of that class, wherever they are
+    filed (an image in the `mixed` folder has boxes of several classes), which is how to find what still uses a class.
     `folder` keeps only the images uploaded in that folder.
+    `exclude_rejected` leaves out the trash (rejected images): the Images page and the review queue ask for it unless a review status is chosen.
     `manually_checked` is a tag only imported images have: true = opened in the review window, false = imported but not yet.
     `ai` filters on the AI check: unchecked, stale (boxes edited since), ok, flagged (suspect/missing/adjust that nobody has dismissed),
     dismissed (flagged, but a person reviewed those boxes anyway), too_small or autolabelled (boxes drawn by the auto-label job, not yet confirmed)."""
@@ -140,6 +145,8 @@ def list_images(project_id: int, class_id: int | None = None, source: Source | N
         selectinload(Image.annotations))
     if class_id is not None:
         q = q.where(Image.class_id == class_id)
+    if box_class_id is not None:
+        q = q.where(exists().where(Annotation.image_id == Image.id, Annotation.class_id == box_class_id))
     if source is not None:
         q = q.where(Image.source == source)
     if dataset is not None:
@@ -154,6 +161,8 @@ def list_images(project_id: int, class_id: int | None = None, source: Source | N
         q = q.where(ai_condition(ai))
     if review_status is not None:
         q = q.where(Image.review_status == review_status)
+    elif exclude_rejected:
+        q = q.where(Image.review_status != ReviewStatus.rejected)
     return db.scalars(q.order_by(Image.id.desc()).limit(limit).offset(offset)).all()
 
 
@@ -235,11 +244,64 @@ def image_file(image_id: int, db: Session = Depends(get_db)):
     return Response(get_storage().get(image.storage_key), media_type=media)
 
 
+def purge_images(db: Session, project_id: int, images: list[Image], *, protect_versions: bool = False) -> None:
+    """Delete images for good: the rows (with their boxes, checks and records), then the files. The rows go first: a file left behind is harmless,
+    a row whose file is gone is not. With `protect_versions`, images that an existing dataset version contains refuse the whole request (409):
+    deleting them stays possible (a version then reports its missing files), but only when asked for explicitly."""
+    using = datasets.versions_using(db, project_id, {i.id for i in images}) if protect_versions else {}
+    if using:
+        names = ", ".join(sorted(using))
+        count = len({i for ids in using.values() for i in ids})
+        raise HTTPException(409, f"{count} of these images {'is' if count == 1 else 'are'} part of dataset version {names}. Deleting "
+                                 f"{'it' if count == 1 else 'them'} means that version can no longer be downloaded. Delete anyway only if you do not need it.")
+    keys = [i.storage_key for i in images]
+    for image in images:
+        db.delete(image)
+    db.commit()
+    for key in keys:
+        try:
+            get_storage().delete(key)
+        except Exception:  # noqa: BLE001 - the rows are gone; a leftover file is harmless
+            log.warning("could not delete the file %s", key)
+
+
 @router.delete("/images/{image_id}", status_code=204)
 def delete_image(image_id: int, db: Session = Depends(get_db)):
     image = db.get(Image, image_id)
     if image is None:
         raise HTTPException(404, "image not found")
-    get_storage().delete(image.storage_key)
-    db.delete(image)
+    purge_images(db, image.project_id, [image])
+
+
+def _in_trash(db: Session, project_id: int, image_ids: list[int]) -> list[Image]:
+    """The rejected images with these ids. All or nothing: an id that is not a rejected image of this project refuses the whole request."""
+    ids = sorted(set(image_ids))
+    found = db.scalars(select(Image).where(Image.project_id == project_id, Image.id.in_(ids), Image.review_status == ReviewStatus.rejected)
+                       .options(selectinload(Image.ai_dismissal))).all()
+    other = set(ids) - {i.id for i in found}
+    if other:
+        raise HTTPException(422, f"not rejected images of this project: {sorted(other)[:10]}")
+    return list(found)
+
+
+@router.post("/projects/{project_id}/images/restore", response_model=RestoreResult)
+def restore_images(project_id: int, body: ImageIdsIn, db: Session = Depends(get_db)):
+    """Take rejected images out of the trash: they become "not reviewed" again, boxes as they were. The AI's doubts about them come back too
+    (the decision recorded when they were rejected is forgotten), so they are looked at again."""
+    get_project(db, project_id)
+    images = _in_trash(db, project_id, body.image_ids)
+    for image in images:
+        image.review_status = ReviewStatus.pending
+        image.ai_dismissal = None
     db.commit()
+    return RestoreResult(restored=len(images))
+
+
+@router.post("/projects/{project_id}/images/delete", response_model=PurgeResult)
+def delete_trashed_images(project_id: int, body: TrashDeleteIn, db: Session = Depends(get_db)):
+    """Delete rejected images for good (files included). Only the trash can be deleted in bulk. Images that an existing dataset version contains
+    are refused (409, naming the versions) unless `allow_breaking_versions` says the person knows."""
+    get_project(db, project_id)
+    images = _in_trash(db, project_id, body.image_ids)
+    purge_images(db, project_id, images, protect_versions=not body.allow_breaking_versions)
+    return PurgeResult(deleted=len(images))

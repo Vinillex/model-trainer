@@ -20,6 +20,7 @@ import traceback
 from pathlib import Path
 
 from common import Api, ApiError, Heartbeat, LeaseLost, setup_logging
+from pi_display import DisplayManager
 
 log = logging.getLogger("agent")
 
@@ -62,6 +63,22 @@ def run_task(api: Api, task: dict, workdir: Path, packager: str, heartbeat_inter
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
+def wait_for_backend(api: Api, retry_every: float = 30.0) -> None:
+    """Service mode: sit here until the backend answers (the Mac may be off or asleep). Says so once per outage, not every try."""
+    warned = False
+    while True:
+        try:
+            api.ping()
+            if warned:
+                log.info("the backend is reachable again")
+            return
+        except ApiError as e:
+            if not warned:
+                log.warning("can't reach the backend yet (%s); waiting for it", e)
+                warned = True
+            time.sleep(retry_every)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--server", default=os.environ.get("MT_SERVER"), help="backend URL (or MT_SERVER)")
@@ -71,6 +88,10 @@ def main(argv=None) -> int:
     ap.add_argument("--poll", type=float, default=5.0)
     ap.add_argument("--heartbeat", type=float, default=20.0)
     ap.add_argument("--once", action="store_true", help="do at most one run, then exit (also exits if none is waiting)")
+    ap.add_argument("--display", action="store_true",
+                    help="also show a finished run's model live on the Pi's screen when the Training page's Run on Pi button asks for it")
+    ap.add_argument("--keep-trying", action="store_true",
+                    help="for a service that starts at boot: wait quietly while the backend is unreachable instead of exiting or logging every poll")
     args = ap.parse_args(argv)
     token = os.environ.get("MT_WORKER_TOKEN")
     if not args.server or not token:
@@ -81,6 +102,8 @@ def main(argv=None) -> int:
         log.error("'%s' not found. Install it with: sudo apt install imx500-tools", args.packager)
         return 2
     api = Api(args.server, token, args.name)
+    if args.keep_trying:
+        wait_for_backend(api)
     try:
         api.ping()
     except ApiError as e:
@@ -88,12 +111,32 @@ def main(argv=None) -> int:
         return 2
     log.info("worker '%s' connected to %s", args.name, args.server)
 
+    display = DisplayManager(api, Path(args.workdir), Path(__file__).with_name("pi_viewer.py")) if args.display else None
+    try:
+        return loop(api, args, display)
+    finally:
+        if display:
+            display.shutdown()
+
+
+def loop(api: Api, args, display: DisplayManager | None) -> int:
+    down = False
     while True:
         try:
             task = api.claim("pi")
+            if down:
+                log.info("the backend is reachable again")
+                down = False
         except ApiError as e:
-            log.warning("claim failed: %s", e)
+            if not (args.keep_trying and down):  # one line per outage when running as a service
+                log.warning("claim failed: %s", e)
+            down = True
             task = None
+        if display:
+            try:
+                display.sync()
+            except Exception:  # noqa: BLE001 - the live view must never take the packaging worker down with it
+                log.exception("the live view failed")
         if task:
             run_task(api, task, Path(args.workdir), args.packager, args.heartbeat)
             if args.once:
@@ -101,7 +144,7 @@ def main(argv=None) -> int:
         elif args.once:
             return 0
         else:
-            time.sleep(args.poll)
+            time.sleep(30.0 if args.keep_trying and down else args.poll)
 
 
 if __name__ == "__main__":

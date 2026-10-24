@@ -11,6 +11,8 @@ import {
   type TrainingRun,
   type WorkerInfo,
 } from "@/lib/api";
+import { PiDisplayBar, usePiDisplay } from "@/components/PiDisplayBar";
+import { RunPodDialog, RunPodPanel } from "@/components/RunPodPanel";
 
 const ACTIVE: RunStage[] = ["queued", "training", "exporting", "awaiting_package", "packaging"];
 const STAGE_LABEL: Record<RunStage, string> = {
@@ -81,7 +83,76 @@ function Trail({ run }: { run: TrainingRun }) {
   );
 }
 
-function RunCard({ run, datasetName, workers, onChanged }: { run: TrainingRun; datasetName: string; workers: WorkerInfo[]; onChanged: () => void }) {
+/** Which workers have called in, and for the Pi a button that copies the one-time command that makes it an always-on worker. */
+function WorkersBar({ workers }: { workers: WorkerInfo[] }) {
+  const [copy, setCopy] = useState<{ ok: boolean; text: string } | null>(null);
+  const piOnline = workers.some((w) => w.kind === "pi" && w.online);
+
+  async function copySetup() {
+    setCopy(null);
+    try {
+      const { command } = await api.piSetup();
+      await navigator.clipboard.writeText(command); // never shown on screen: it holds the worker token
+      setCopy({ ok: true, text: "Copied. Paste it once into a terminal on the Raspberry Pi and press Enter." });
+    } catch (e) {
+      setCopy({ ok: false, text: (e as Error).message || "Could not copy the command." });
+    }
+  }
+
+  return (
+    <div className="space-y-2 text-sm text-neutral-500" data-testid="workers">
+      <p>
+        Workers:{" "}
+        {workers.length === 0 ? (
+          "none have connected since the backend started."
+        ) : (
+          workers.map((w, i) => (
+            <span key={w.name}>
+              {i > 0 && ", "}
+              <span className={w.online ? "text-green-500" : "text-neutral-500"}>●</span> {w.name} ({w.kind === "gpu" ? "GPU" : "Pi"}, {w.online ? "online" : "offline"})
+            </span>
+          ))
+        )}
+      </p>
+      {piOnline ? (
+        <p>The Raspberry Pi packages finished runs into a camera file by itself.</p>
+      ) : (
+        <div className="flex flex-wrap items-center gap-3">
+          <span>No Raspberry Pi is online. Switch it on; a finished run is packaged as soon as it connects. Never set up?</span>
+          <button className="btn" onClick={copySetup} data-testid="copy-pi-setup">
+            Copy Pi setup command
+          </button>
+          {copy && <span className={copy.ok ? "text-green-500" : "text-red-600"}>{copy.text}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** On every finished run: show its model live on the Pi's own screen (and stop it again). */
+function RunOnPiButton({ run, pi }: { run: TrainingRun; pi: ReturnType<typeof usePiDisplay> }) {
+  const d = pi.display;
+  const showingThis = pi.live && d.run_id === run.id;
+  if (!run.artifacts.rpk)
+    return (
+      <button className="btn" disabled title="This run has no camera file (.rpk): Export for IMX500 was off for it." data-testid={`run-${run.id}-pi`}>
+        Run on Pi
+      </button>
+    );
+  if (showingThis)
+    return (
+      <button className="btn" onClick={pi.stop} data-testid={`run-${run.id}-pi`}>
+        Stop on Pi
+      </button>
+    );
+  return (
+    <button className="btn" onClick={() => pi.show(run.id)} disabled={!d.pi_online} title={d.pi_online ? "Show this model live on the Raspberry Pi's screen" : "No Raspberry Pi is online"} data-testid={`run-${run.id}-pi`}>
+      Run on Pi
+    </button>
+  );
+}
+
+function RunCard({ run, datasetName, workers, onChanged, onRunPod, pi }: { run: TrainingRun; datasetName: string; workers: WorkerInfo[]; onChanged: () => void; onRunPod: (run: TrainingRun) => void; pi: ReturnType<typeof usePiDisplay> }) {
   const [confirm, setConfirm] = useState<"cancel" | "delete" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const active = ACTIVE.includes(run.stage);
@@ -92,8 +163,8 @@ function RunCard({ run, datasetName, workers, onChanged }: { run: TrainingRun; d
 
   let note: string | null = null;
   if (run.cancel_requested && active) note = "Cancelling… the worker stops at its next check-in.";
-  else if (run.stage === "queued") note = online("gpu") ? "Waiting for the GPU worker to pick it up." : "No GPU worker is online. Start gpu_agent.py (see agents/README.md).";
-  else if (run.stage === "awaiting_package") note = online("pi") ? "Waiting for the Raspberry Pi to pick it up." : "Training is done. No Raspberry Pi worker is online; start pi_agent.py to build the .rpk.";
+  else if (run.stage === "queued") note = online("gpu") ? "Waiting for the GPU worker to pick it up." : "No GPU worker is online. Press Train on RunPod to rent one for this run.";
+  else if (run.stage === "awaiting_package") note = online("pi") ? "Waiting for the Raspberry Pi to pick it up." : "Training is done. Switch the Raspberry Pi on: it builds the .rpk by itself as soon as it connects.";
   else if (active && message && message !== "training") note = message; // the stage badge already says "Training"
   if (run.attempts > 0 && active) note = `${note ?? ""} (a worker was lost ${run.attempts}×; this run was re-queued)`.trim();
 
@@ -135,14 +206,24 @@ function RunCard({ run, datasetName, workers, onChanged }: { run: TrainingRun; d
             </>
           ) : active ? (
             !run.cancel_requested && (
-              <button className="btn" onClick={() => setConfirm("cancel")}>
-                Cancel
-              </button>
+              <>
+                {run.stage === "queued" && !online("gpu") && (
+                  <button className="btn" onClick={() => onRunPod(run)} data-testid={`run-${run.id}-runpod`}>
+                    Train on RunPod…
+                  </button>
+                )}
+                <button className="btn" onClick={() => setConfirm("cancel")}>
+                  Cancel
+                </button>
+              </>
             )
           ) : (
-            <button className="btn" onClick={() => setConfirm("delete")}>
-              Delete
-            </button>
+            <>
+              {run.stage === "done" && <RunOnPiButton run={run} pi={pi} />}
+              <button className="btn" onClick={() => setConfirm("delete")}>
+                Delete
+              </button>
+            </>
           )}
         </span>
       </div>
@@ -216,6 +297,9 @@ export default function TrainingPanel({ projectId, refreshKey }: { projectId: nu
   const [exportImx, setExportImx] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [runpodRun, setRunpodRun] = useState<TrainingRun | null>(null); // the run the RunPod dialog is open for
+  const pi = usePiDisplay();
+  const [runpodTick, setRunpodTick] = useState(0); // bumped after a launch starts so the panel looks right away
   const datasetIdRef = useRef(datasetId); // lets the loader pick a default without depending on the selection
   datasetIdRef.current = datasetId;
 
@@ -270,19 +354,9 @@ export default function TrainingPanel({ projectId, refreshKey }: { projectId: nu
   const num = "input w-24";
   return (
     <div className="space-y-4">
-      <p className="text-sm text-neutral-500" data-testid="workers">
-        Workers:{" "}
-        {workers.length === 0 ? (
-          <>none have connected yet. See <code>agents/README.md</code> to set up the GPU PC and the Raspberry Pi.</>
-        ) : (
-          workers.map((w, i) => (
-            <span key={w.name}>
-              {i > 0 && ", "}
-              <span className={w.online ? "text-green-500" : "text-neutral-500"}>●</span> {w.name} ({w.kind === "gpu" ? "GPU" : "Pi"}, {w.online ? "online" : "offline"})
-            </span>
-          ))
-        )}
-      </p>
+      <WorkersBar workers={workers} />
+      <PiDisplayBar pi={pi} />
+      <RunPodPanel tick={runpodTick} onChanged={refresh} />
 
       {versions.length === 0 ? (
         <p className="text-sm text-neutral-500">Create a dataset version above first; a training run uses one frozen version.</p>
@@ -336,9 +410,21 @@ export default function TrainingPanel({ projectId, refreshKey }: { projectId: nu
       )}
       {error && <p className="text-sm text-red-600">{error}</p>}
 
+      {runpodRun && (
+        <RunPodDialog
+          run={runpodRun}
+          onClose={() => setRunpodRun(null)}
+          onStarted={() => {
+            setRunpodRun(null);
+            setRunpodTick((t) => t + 1);
+            refresh();
+          }}
+        />
+      )}
+
       <ul className="space-y-3">
         {runs.map((r) => (
-          <RunCard key={r.id} run={r} datasetName={names.get(r.dataset_id) ?? `#${r.dataset_id}`} workers={workers} onChanged={() => { refresh(); loadVersions(); }} />
+          <RunCard key={r.id} run={r} datasetName={names.get(r.dataset_id) ?? `#${r.dataset_id}`} workers={workers} onRunPod={setRunpodRun} pi={pi} onChanged={() => { refresh(); loadVersions(); }} />
         ))}
       </ul>
     </div>

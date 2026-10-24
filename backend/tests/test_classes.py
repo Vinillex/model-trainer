@@ -49,7 +49,7 @@ def test_a_class_with_images_is_refused(client, project):
     pid, ids = project
     add(client, pid, ids["multirotor"], [box(ids["multirotor"])])
     r = client.delete(f"/projects/{pid}/classes/{ids['multirotor']}")
-    assert r.status_code == 409 and "1 images" in r.json()["detail"]
+    assert r.status_code == 409 and "1 image filed under it" in r.json()["detail"]
     assert "multirotor" in class_names(client, pid)
 
 
@@ -60,7 +60,7 @@ def test_a_class_used_only_by_boxes_on_other_images_is_refused(client, project):
     stats = {r["class_name"]: r for r in client.get(f"/projects/{pid}/stats").json()}
     assert stats["fixed-wing"]["boxes"] == 1 and stats["fixed-wing"]["uploaded"] == 0 and stats["mixed"]["uploaded"] == 1
     r = client.delete(f"/projects/{pid}/classes/{ids['fixed-wing']}")
-    assert r.status_code == 409 and "1 boxes" in r.json()["detail"]
+    assert r.status_code == 409 and "1 box on 1 image" in r.json()["detail"]
 
 
 def test_a_class_with_a_queued_or_running_scrape_job_is_refused_until_it_ends(client, project):

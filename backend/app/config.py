@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     # a pod that stalls while installing says where; its own logs are gone once the pod is deleted.
     worker_log_dir: str = "./data/worker_logs"
 
+    # Where the UI's RunPod launches keep their state file and logs (app/api/runpod.py). The launcher runs as its own process, so this is
+    # how the page finds it again after the backend restarts.
+    runpod_launch_dir: str = "./data/runpod"
+
+    # What the Pi's screen should show (app/pi_display.py): one small file, so it survives a backend restart.
+    pi_display_file: str = "./data/pi_display.json"
+
     # AI check (app/ai/): SAM 2.1 refines boxes, the trained YOLO is the detector. Needs `pip install -r requirements-ai.txt`; the weights live
     # under ai_dir (git-ignored with the rest of data/). Official weights names are downloaded there on first use: sam2.1_t.pt, _s.pt, _b.pt, _l.pt.
     ai_dir: str = "./data/ai"

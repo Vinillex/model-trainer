@@ -6,6 +6,23 @@ run of one to two hours costs well under a dollar (how long a run takes is not m
 Raspberry Pi still does the final `.rpk` packaging (`agents/README.md` section 2),
 unless you turn **Export for IMX500** off and only want `best.pt`.
 
+## From the UI (no terminal)
+
+On **Training & export**, a run waiting for a GPU has a **Train on RunPod…** button. It opens a dialog that checks everything and
+shows the price before anything is rented: the GPUs in the order they are tried with their hourly prices, the most the run can cost
+(the time limit at the dearest GPU), your balance, and what leaves the Mac. Only **Start on RunPod (up to $X)** rents a pod, and the
+launcher refuses to go on if the worst case has become dearer than the $X you saw.
+
+While it runs, the **RunPod** card on the same page shows the balance, the live log and **Stop and delete the pod** (the same path as
+Ctrl-C: the pod is deleted and the tunnel closed before it exits). If a pod is ever left running with nothing watching it, the card
+says so in red with a **Delete pod** button. Only pods whose name starts with `mt-` are ever touched.
+
+The page starts the launcher below as its own detached process (`python -m scripts.runpod launch --yes --run <id> --max-cost <$>`), so
+it keeps going through a backend restart; its log and state live in `backend/data/runpod/`. The buttons that spend money or end pods
+need the `X-MT-Spend: 1` header and only work from this Mac, never through the tunnel.
+
+The command line below still works and does the same things.
+
 ```
 your Mac                                                RunPod
  backend (127.0.0.1:8000)  <-- cloudflared tunnel <--   pod: gpu_agent.py --once

@@ -91,16 +91,31 @@ GPU through the normal Windows driver.
 
 ## 2. Raspberry Pi
 
-1. `sudo apt update && sudo apt full-upgrade && sudo apt install imx500-tools`
-2. Copy two files from this folder to the Pi, from the Mac:
-   `scp agents/common.py agents/pi_agent.py <user>@<pi-address>:~/agent/`
-3. On the Pi (standard library only, nothing to pip install):
-   ```
-   cd ~/agent
-   export MT_SERVER=http://192.168.1.20:8000
-   export MT_WORKER_TOKEN=<token>
-   python3 pi_agent.py --name pi-camera
-   ```
+The Pi is an **always-on worker**: set up once, it packages every finished run by itself whenever it is switched on.
+
+1. On the Pi: `sudo apt update && sudo apt full-upgrade && sudo apt install imx500-tools`
+2. Start the backend so the Pi can reach it (`--host 0.0.0.0`, section 0 step 2).
+3. In the UI, **Training & export**, press **Copy Pi setup command** (shown while no Pi is online). Paste it once into a terminal on the
+   Pi. It downloads `common.py`, `pi_agent.py` and `pi_install.sh` from the backend into `~/agent`, writes the address and token to
+   `~/agent/pi_agent.env` (readable only by you) and installs a `mt-pi-agent` systemd service that starts at boot.
+   The command uses the Mac's `<name>.local` address, so a new DHCP address doesn't break it, and it contains the worker token:
+   it is copied to the clipboard and never shown on screen.
+4. The Training page now lists the Pi as online. Run it again to change the address or token; `journalctl -u mt-pi-agent -n 30` shows its log
+   on the Pi. While the Mac is off the service waits quietly (`--keep-trying`) and carries on when the Mac is back.
+
+**Run on Pi (live view on the Pi's own screen).** Every finished run that has a camera file (.rpk) has a **Run on Pi** button on the
+Training page. It shows that model on the Pi's screen with the detections drawn on the camera picture, and a **Pi screen** line on the
+page shows camera fps, network results per second and detections now. The first start takes a minute or two (the model is loaded onto
+the camera chip; the page shows the percentage). **Stop** (on the line or on the run) ends it and frees the camera; closing the window
+on the Pi does not. The picture needs someone logged in on the Pi's desktop. If your own `main_ai.py` is running, it holds the camera:
+the page says so and nothing is touched; stop that program on the Pi yourself first. The viewer is `pi_viewer.py`, started and
+stopped by the agent (`pi_display.py`); a request is used up when the Pi picks it up, so a Pi or agent restart never relaunches it.
+
+Without the service you can still run it by hand (standard library only):
+```
+export MT_SERVER=http://<mac>.local:8000 MT_WORKER_TOKEN=<token>
+python3 ~/agent/pi_agent.py --name pi-camera
+```
 
 ## 3. Training
 
