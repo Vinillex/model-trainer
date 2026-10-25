@@ -13,10 +13,14 @@ from sqlalchemy.orm import Session, sessionmaker
 from .ai.job import handle_ai_check
 from .db import SessionLocal
 from .models import Job, JobStatus
+from .collect import handle_collect
 from .scrape import handle_scrape
+from .video import handle_video
 
 HANDLERS: dict[str, Callable[[Session, Job], None]] = {
     "scrape": handle_scrape,
+    "collect_pages": handle_collect,
+    "video_frames": handle_video,
     "ai_check": handle_ai_check,
 }
 

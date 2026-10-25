@@ -37,7 +37,7 @@ export default function Home() {
       </form>
       {error && <p className="text-sm text-red-600">{error}</p>}
       {projects === null && !error && <p className="text-sm text-neutral-500">Loading…</p>}
-      {projects?.length === 0 && <p className="text-sm text-neutral-500">No projects yet. New projects start with multirotor, fixed-wing and shahed classes plus hard-negative categories.</p>}
+      {projects?.length === 0 && <p className="text-sm text-neutral-500">No projects yet. New projects start with multirotor, fixed-wing and delta-wing classes plus hard-negative categories.</p>}
       <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {projects?.map((p) => (
           <li key={p.id}>

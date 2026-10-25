@@ -53,7 +53,7 @@ def create_dataset(project_id: int, body: DatasetCreate, db: Session = Depends(g
         selection = datasets.Selection(frozenset(body.sources) if body.sources is not None else None,
                                        frozenset(body.imported_datasets) if body.imported_datasets is not None else None)
         version = datasets.create_version(db, project, body.name, body.val_ratio, body.test_ratio, body.seed, body.include_negatives,
-                                          selection)
+                                          selection, [(m.class_ids, m.name) for m in body.merge_classes])
         db.commit()
     except ValueError as e:
         db.rollback()

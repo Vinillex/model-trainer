@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import CloudCopies from "@/components/CloudCopies";
-import { SELECTABLE_SOURCES, api, datasetDownloadUrl, parseUtc, type DataSelection, type DatasetPreview, type DatasetVersion } from "@/lib/api";
+import { SELECTABLE_SOURCES, api, datasetDownloadUrl, parseUtc, type DataSelection, type DatasetPreview, type DatasetVersion, type DetClass } from "@/lib/api";
 
 const SPLITS = ["train", "val", "test"] as const;
 
@@ -83,6 +83,11 @@ function VersionCard({ v, onDeleted }: { v: DatasetVersion; onDeleted: () => voi
           </tr>
         </tbody>
       </table>
+      {v.config.merged && v.config.merged.length > 0 && (
+        <p className="text-xs text-neutral-500" data-testid={`dataset-${v.id}-merged`}>
+          Treated as one class: {v.config.merged.map((m) => `${m.classes.join(" + ")} → ${m.name}`).join("; ")}. The labels in your project are unchanged.
+        </p>
+      )}
       {st.by_source && Object.keys(st.by_source).length > 0 && (
         <p className="text-xs text-neutral-500" data-testid={`dataset-${v.id}-data`}>
           Data used:{" "}
@@ -108,7 +113,7 @@ function VersionCard({ v, onDeleted }: { v: DatasetVersion; onDeleted: () => voi
   );
 }
 
-export default function DatasetsPanel({ projectId, refreshKey }: { projectId: number; refreshKey: number }) {
+export default function DatasetsPanel({ projectId, classes, refreshKey }: { projectId: number; classes: DetClass[]; refreshKey: number }) {
   const [preview, setPreview] = useState<DatasetPreview | null>(null);
   const [versions, setVersions] = useState<DatasetVersion[]>([]);
   const [name, setName] = useState("");
@@ -116,6 +121,8 @@ export default function DatasetsPanel({ projectId, refreshKey }: { projectId: nu
   const [testPct, setTestPct] = useState(10);
   const [negatives, setNegatives] = useState(true);
   const [off, setOff] = useState<Set<string>>(new Set()); // data the person unticked: "source:scraped", "imported:anti-uav"
+  const [merge, setMerge] = useState<Set<number>>(new Set()); // classes this version should treat as one
+  const [mergeName, setMergeName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -150,8 +157,22 @@ export default function DatasetsPanel({ projectId, refreshKey }: { projectId: nu
       return next;
     });
 
+  const toggleMerge = (id: number) =>
+    setMerge((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+  const drone = classes.filter((c) => !c.is_negative && !c.is_mixed);
+  const picked = drone.filter((c) => merge.has(c.id));
+  const mergeNameOk = mergeName.trim() === "" || /^[a-z0-9][a-z0-9_-]*$/.test(mergeName.trim());
+
   async function create(e: React.FormEvent) {
     e.preventDefault();
+    if (picked.length === 1 || !mergeNameOk) {
+      setError(picked.length === 1 ? "Tick at least two classes to treat as one, or none." : "The merged class name uses lowercase letters, digits, - and _.");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -162,6 +183,7 @@ export default function DatasetsPanel({ projectId, refreshKey }: { projectId: nu
         include_negatives: negatives,
         sources: selection?.sources,
         imported_datasets: selection?.imported,
+        merge_classes: picked.length >= 2 ? [{ class_ids: picked.map((c) => c.id), name: mergeName.trim() || undefined }] : undefined,
       });
       setName("");
       load();
@@ -232,6 +254,27 @@ export default function DatasetsPanel({ projectId, refreshKey }: { projectId: nu
                 ))}
               </div>
             )}
+          </fieldset>
+        )}
+        {drone.length >= 2 && (
+          <fieldset className="basis-full space-y-1" data-testid="merge-picker">
+            <legend className="mb-1 text-neutral-500">Treat classes as one (optional)</legend>
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-1">
+              {drone.map((c) => (
+                <label key={c.id} className="flex items-center gap-1">
+                  <input type="checkbox" checked={merge.has(c.id)} onChange={() => toggleMerge(c.id)} data-testid={`merge-${c.name}`} /> {c.name}
+                </label>
+              ))}
+              {picked.length >= 2 && (
+                <label className="flex items-center gap-1">
+                  <span className="text-neutral-500">called</span>
+                  <input className="input w-44" placeholder={picked.map((c) => c.name).join("+")} value={mergeName} onChange={(e) => setMergeName(e.target.value)} maxLength={64} data-testid="merge-name" />
+                </label>
+              )}
+            </div>
+            <p className="text-xs text-neutral-500">
+              This version trains one class for the ticked ones, e.g. fixed-wing and delta-wing as one. Your labels and boxes are not changed; make another version without it to compare the two.
+            </p>
           </fieldset>
         )}
         <button className="btn" disabled={busy || (preview?.reviewed_images ?? 0) === 0}>

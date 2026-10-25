@@ -44,6 +44,7 @@ export default function ScrapePanel({ projectId, classes, onImagesChanged }: { p
   const [minSide, setMinSide] = useState(200);
   const [nearDup, setNearDup] = useState(4);
   const [skipKnown, setSkipKnown] = useState(true);
+  const [byArticle, setByArticle] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -128,7 +129,7 @@ export default function ScrapePanel({ projectId, classes, onImagesChanged }: { p
     try {
       await api.createScrapeJob(projectId, {
         class_id: classId, query: query.trim(), max_images: maxImages, start_page: startPage - 1, max_pages: maxPages,
-        min_side: minSide, near_dup_distance: nearDup, skip_known_urls: skipKnown,
+        min_side: minSide, near_dup_distance: nearDup, skip_known_urls: skipKnown, group_by: byArticle ? "article" : "site",
       });
       await refresh();
     } catch (err) {
@@ -234,6 +235,9 @@ export default function ScrapePanel({ projectId, classes, onImagesChanged }: { p
             </label>
             <label className="flex items-center gap-1 pb-2">
               <input type="checkbox" checked={skipKnown} onChange={(e) => setSkipKnown(e.target.checked)} /> Skip image URLs already tried
+            </label>
+            <label className="flex items-center gap-1 pb-2" title="By default every picture from one website stays in the same train/val/test split. Tick this to keep only the pictures of one page together.">
+              <input type="checkbox" checked={byArticle} onChange={(e) => setByArticle(e.target.checked)} /> Group by page instead of by website
             </label>
           </div>
         </details>

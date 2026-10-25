@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     scrape_download_workers: int = 8
     # Dev/test only: allow fetching images from loopback/private addresses (normally blocked as SSRF).
     scrape_allow_private_hosts: bool = False
+    # Collecting pictures from web pages (app/collect.py): at most one request per host per this many seconds, pages included.
+    collect_request_delay: float = 1.0
+    collect_page_max_bytes: int = 3 * 1024 * 1024
+    video_max_bytes: int = 400 * 1024 * 1024  # a video larger than this is not downloaded (MT_VIDEO_MAX_BYTES)
+    collect_max_side: int = 2560  # collected pictures larger than this (longest side, px) are scaled down; the detector sees 640
 
     # RunPod (GPU pods for training, serverless for auto-labeling). Set MT_RUNPOD_API_KEY in backend/.env.
     runpod_api_key: str | None = None

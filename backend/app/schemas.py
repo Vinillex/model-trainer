@@ -1,6 +1,7 @@
 import re
 from datetime import datetime
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -24,6 +25,14 @@ class ClassOut(BaseModel):
     is_negative: bool
     index: int | None
     is_mixed: bool = False  # the auto-managed folder for images showing several classes; never a label
+
+
+class ClassRename(BaseModel):
+    name: str = Field(pattern=NAME_PATTERN, max_length=64)
+
+
+class ClassRenameOut(ClassOut):
+    moved: int  # images whose files were moved to the folder of the new name
 
 
 class ProjectCreate(BaseModel):
@@ -87,6 +96,10 @@ class DismissResult(BaseModel):
 
 class RestoreResult(BaseModel):
     restored: int
+
+
+class ImageCount(BaseModel):
+    count: int
 
 
 class PurgeResult(BaseModel):
@@ -293,12 +306,70 @@ class ScrapeJobCreate(BaseModel):
     min_side: int = Field(200, ge=32, le=4000)  # skip images whose shorter side is smaller, in pixels
     near_dup_distance: int = Field(4, ge=0, le=16)  # dHash bits; 0 keeps near-duplicates
     skip_known_urls: bool = True  # don't re-download URLs an earlier job already tried
+    # What keeps pictures together in one train/val/test split: the website they came from, or the page (article) they were on.
+    group_by: Literal["site", "article"] = "site"
 
     @model_validator(mode="after")
     def _within_serpapi_page_range(self):
         if self.start_page + self.max_pages > 100:
             raise ValueError("start_page + max_pages must be at most 100 (SerpAPI allows ijn 0-99)")
         return self
+
+
+def check_http_urls(urls: list[str]) -> list[str]:
+    out = []
+    for u in urls:
+        u = u.strip()
+        parts = urlsplit(u)
+        if len(u) > 2048 or parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError(f"not an http(s) address: {u[:80]!r}")
+        out.append(u)
+    return list(dict.fromkeys(out))
+
+
+class CollectJobCreate(BaseModel):
+    """Read pictures off web pages (app/collect.py). No SerpAPI search is spent."""
+
+    class_id: int
+    urls: list[str] = Field(min_length=1, max_length=50)  # article or gallery pages
+    follow_links: bool = False  # also read pages these link to: the same site only, one level deep
+    link_contains: list[str] = Field(default_factory=list, max_length=10)  # when following: only links containing one of these words
+    include_start_pages: bool = True  # False = use the start pages only to find links (an index page's own pictures are thumbnails)
+    max_pages: int = Field(30, ge=1, le=300)  # pages read in total, start pages included
+    max_images: int = Field(100, ge=1, le=1000)
+    images_per_page: int = Field(12, ge=1, le=50)
+    min_side: int = Field(300, ge=32, le=4000)
+    near_dup_distance: int = Field(4, ge=0, le=16)
+    skip_known_urls: bool = True
+    group_by: Literal["site", "article"] = "article"  # pictures of one article stay in one split
+
+    @field_validator("urls")
+    @classmethod
+    def _http_urls(cls, urls: list[str]) -> list[str]:
+        return check_http_urls(urls)
+
+    @field_validator("link_contains")
+    @classmethod
+    def _words(cls, words: list[str]) -> list[str]:
+        return [w.strip()[:100] for w in words if w.strip()]
+
+
+class VideoJobCreate(BaseModel):
+    """Cut still frames out of videos (app/video.py). No SerpAPI search is spent."""
+
+    class_id: int
+    urls: list[str] = Field(min_length=1, max_length=20)  # video files, or Wikimedia Commons File: pages of videos
+    frames_per_second: float = Field(1.0, gt=0, le=5)
+    max_frames_per_video: int = Field(120, ge=1, le=600)  # spread over the whole video
+    max_images: int = Field(500, ge=1, le=2000)
+    min_side: int = Field(240, ge=32, le=4000)
+    near_dup_distance: int = Field(5, ge=0, le=16)  # consecutive frames of a slow scene are near-duplicates and are dropped
+    skip_known_urls: bool = True
+
+    @field_validator("urls")
+    @classmethod
+    def _http_urls(cls, urls: list[str]) -> list[str]:
+        return check_http_urls(urls)
 
 
 class JobOut(BaseModel):
@@ -340,6 +411,13 @@ class RunPodAccount(BaseModel):
     pod_count: int
 
 
+class ClassMerge(BaseModel):
+    """Classes a dataset version treats as one: its labels use a single class (and index) for all of them."""
+
+    class_ids: list[int] = Field(min_length=2, max_length=10)
+    name: str | None = Field(None, pattern=NAME_PATTERN, max_length=64)  # default: the member names joined with "+"
+
+
 class DatasetCreate(BaseModel):
     name: str | None = Field(None, min_length=1, max_length=120)  # defaults to v1, v2, ...
     val_ratio: float = Field(0.1, ge=0, le=0.5)
@@ -349,6 +427,7 @@ class DatasetCreate(BaseModel):
     # Which data to use. None = all of it. Imported datasets are chosen only here, by name: [] means no imported dataset.
     sources: list[Literal["uploaded", "scraped", "generated"]] | None = None
     imported_datasets: list[str] | None = Field(None, max_length=100)
+    merge_classes: list[ClassMerge] = Field(default_factory=list, max_length=5)  # the project's own labels are not changed
 
     @field_validator("imported_datasets")
     @classmethod

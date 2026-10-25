@@ -5,8 +5,9 @@ from collections import defaultdict
 import pytest
 
 from app.datasets import assign_splits, split_quota
-from app.models import Image, Source
-from app.yolo_export import data_yaml, label_text
+from app.models import Image, ScrapeRecord, Source
+from app.storage import get_storage
+from app.yolo_export import SPLITS, data_yaml, label_text
 
 from .helpers import photo
 
@@ -53,10 +54,10 @@ def test_assign_splits_keeps_groups_together_and_is_deterministic():
 
 def test_assign_splits_stratifies_by_class_and_keeps_test_real_only():
     spec = ([(f"m{i}", "multirotor", "uploaded") for i in range(20)] + [(f"f{i}", "fixed-wing", "scraped") for i in range(10)]
-            + [(f"s{i}", "shahed", "uploaded") for i in range(4)] + [(f"g{i}", "multirotor", "generated") for i in range(30)])
+            + [(f"s{i}", "delta-wing", "uploaded") for i in range(4)] + [(f"g{i}", "multirotor", "generated") for i in range(30)])
     items = make_items(spec)
     assign_splits(items, 0.1, 0.1, seed=1)
-    for cls in ("multirotor", "fixed-wing", "shahed"):
+    for cls in ("multirotor", "fixed-wing", "delta-wing"):
         seen = {i["split"] for i in items if i["stratum"] == cls and i["source"] != "generated"}
         assert {"train", "val"} <= seen, f"{cls} missing from val"
     assert not any(i["split"] != "train" for i in items if i["source"] == "generated")  # synthetic data never measures the model
@@ -98,7 +99,7 @@ def populate(client, pid, ids):
         add(client, pid, ids["birds"])                                  # hard negatives: reviewed automatically
     add(client, pid, ids["multirotor"], status="pending")               # not reviewed: excluded
     add(client, pid, ids["multirotor"], [box(ids["multirotor"])], status="rejected")  # rejected: excluded
-    add(client, pid, ids["shahed"], [], status="reviewed")              # reviewed, nothing in it: a background image
+    add(client, pid, ids["delta-wing"], [], status="reviewed")              # reviewed, nothing in it: a background image
 
 
 def unzip(resp):
@@ -111,7 +112,7 @@ def test_preview_counts_what_would_be_included(client, project):
     p = client.get(f"/projects/{pid}/datasets/preview").json()
     assert (p["reviewed_images"], p["reviewed_with_boxes"], p["reviewed_empty"], p["negative_images"]) == (27, 22, 1, 4)
     assert (p["pending"], p["rejected"]) == (1, 1)
-    assert p["boxes_per_class"] == {"multirotor": 14, "fixed-wing": 8, "shahed": 0}
+    assert p["boxes_per_class"] == {"multirotor": 14, "fixed-wing": 8, "delta-wing": 0}
 
 
 def test_create_version_stats_and_warnings(client, project):
@@ -120,14 +121,14 @@ def test_create_version_stats_and_warnings(client, project):
     r = client.post(f"/projects/{pid}/datasets", json={})
     assert r.status_code == 201
     v = r.json()
-    assert v["name"] == "v1" and v["config"]["classes"] == [{"index": 0, "name": "multirotor"}, {"index": 1, "name": "fixed-wing"}, {"index": 2, "name": "shahed"}]
+    assert v["name"] == "v1" and v["config"]["classes"] == [{"index": 0, "name": "multirotor"}, {"index": 1, "name": "fixed-wing"}, {"index": 2, "name": "delta-wing"}]
     st = v["stats"]
     assert sum(st["images"].values()) == 27 and sum(st["boxes"].values()) == 22
     assert st["excluded"] == {"pending": 1, "rejected": 1, "not_selected": 0}
-    assert sum(st["background_images"].values()) == 5  # 4 hard negatives + the empty shahed image
+    assert sum(st["background_images"].values()) == 5  # 4 hard negatives + the empty delta-wing image
     assert st["images"]["train"] > st["images"]["val"] > 0
     warnings = " ".join(st["warnings"])
-    assert "'shahed' has no boxes at all" in warnings          # can't learn a class that has no examples
+    assert "'delta-wing' has no boxes at all" in warnings          # can't learn a class that has no examples
     assert "'fixed-wing' has only 8 boxes" in warnings
     assert client.post(f"/projects/{pid}/datasets", json={}).json()["name"] == "v2"
     assert [d["name"] for d in client.get(f"/projects/{pid}/datasets").json()] == ["v2", "v1"]
@@ -141,7 +142,7 @@ def test_download_is_a_valid_yolo_dataset(client, project):
     names = z.namelist()
 
     yaml = z.read("data.yaml").decode()
-    assert 'names:\n  0: "multirotor"\n  1: "fixed-wing"\n  2: "shahed"' in yaml
+    assert 'names:\n  0: "multirotor"\n  1: "fixed-wing"\n  2: "delta-wing"' in yaml
     assert "train: images/train" in yaml and "val: images/val" in yaml and "test: images/test" in yaml
 
     images = [n for n in names if n.startswith("images/")]
@@ -202,6 +203,37 @@ def test_groups_never_straddle_splits(client, project):
         for img in db.query(Image).filter(Image.group_key.isnot(None)):
             by_group[img.group_key].add(split_of[img.id])
     assert len(by_group) == 6 and all(len(s) == 1 for s in by_group.values()), by_group
+
+
+def test_photos_of_one_commons_series_share_a_group_but_ordinary_pages_stay_apart(client, project):
+    """Near-identical frames of one sortie live on separate File: pages; the split must not scatter them. Other pages are not merged."""
+    pid, ids = project
+    scraped = {}
+
+    def attach(img, page):
+        with client.session_factory() as db:
+            db.add(ScrapeRecord(image_id=img["id"], query="q", original_url=page + ".jpg", page_url=page))
+            db.commit()
+        scraped[img["id"]] = page
+
+    for s in range(8):  # 8 sorties of 4 photos each, one File: page per photo
+        for k in range(4):
+            attach(add(client, pid, ids["fixed-wing"], [box(ids["fixed-wing"])]),
+                   f"https://commons.wikimedia.org/wiki/File:MQ-9_Sortie_{s}_Over_Town_16101{k}-Z-QU230-00{k}.jpg")
+    for n in range(6):  # ordinary pages whose address merely ends in a number
+        attach(add(client, pid, ids["multirotor"], [box(ids["multirotor"])]), f"https://news.test/a/story-{n}")
+    v = client.post(f"/projects/{pid}/datasets", json={"val_ratio": 0.25, "test_ratio": 0.25}).json()
+    manifest = __import__("json").loads(get_storage().get(f"projects/{pid}/datasets/{v['id']}/manifest.json"))
+    groups = {it["image_id"]: it["group"] for it in manifest["images"]}
+    commons = {i for i, page in scraped.items() if "wikimedia" in page}
+    assert len({groups[i] for i in commons}) == 8  # one group per sortie, not per photo
+    assert len({groups[i] for i in scraped if i not in commons}) == 6  # a news article per group, as before
+    split_of = {it["image_id"]: it["split"] for it in manifest["images"]}
+    by_series = defaultdict(set)
+    for i in commons:
+        by_series[groups[i]].add(split_of[i])
+    assert all(len(sp) == 1 for sp in by_series.values()), by_series
+    assert len({sp for group in by_series.values() for sp in group}) > 1  # the check is not vacuous: sorties do land in different splits
 
 
 def test_negatives_can_be_left_out(client, project):
@@ -299,3 +331,84 @@ def test_an_image_is_balanced_by_its_most_common_box_class_and_background_images
     st = v["stats"]
     assert st["images"]["val"] > 0 and st["background_images"].get("val", 0) + st["background_images"].get("test", 0) >= 1
     assert st["per_class"]["fixed-wing"]["val"]["boxes"] > 0 and st["per_class"]["multirotor"]["val"]["boxes"] > 0
+
+
+# ---------- treating classes as one ----------
+
+def merged_version(client, pid, merge, **body):
+    return client.post(f"/projects/{pid}/datasets", json={"merge_classes": merge, **body})
+
+
+def test_a_version_can_treat_two_classes_as_one_without_touching_the_labels(client, project):
+    pid, ids = project
+    populate(client, pid, ids)
+    add(client, pid, ids["delta-wing"], [box(ids["delta-wing"], 0.7, 0.2)])
+    add(client, pid, ids["fixed-wing"], [box(ids["fixed-wing"], 0.2, 0.2), box(ids["delta-wing"], 0.8, 0.8)])  # both kinds in one picture
+
+    r = merged_version(client, pid, [{"class_ids": [ids["fixed-wing"], ids["delta-wing"]]}])
+
+    assert r.status_code == 201, r.text
+    v = r.json()
+    assert v["config"]["classes"] == [{"index": 0, "name": "multirotor"}, {"index": 1, "name": "fixed-wing+delta-wing"}]
+    assert v["config"]["merged"] == [{"name": "fixed-wing+delta-wing", "classes": ["fixed-wing", "delta-wing"]}]
+    per_class = v["stats"]["per_class"]
+    assert list(per_class) == ["multirotor", "fixed-wing+delta-wing"]
+    assert sum(per_class["fixed-wing+delta-wing"][s]["boxes"] for s in SPLITS) == 8 + 1 + 2  # 8 fixed-wing, 1 delta-wing, and both kinds in one picture
+    assert "no boxes at all" not in " ".join(v["stats"]["warnings"])  # delta-wing on its own would have had one
+    z = unzip(client.get(f"/datasets/{v['id']}/download"))
+    assert 'names:\n  0: "multirotor"\n  1: "fixed-wing+delta-wing"\n' in z.read("data.yaml").decode()
+    used = {line.split()[0] for n in z.namelist() if n.startswith("labels/") for line in z.read(n).decode().splitlines()}
+    assert used == {"0", "1"}  # no index beyond the two classes
+    # the project's own boxes keep their classes
+    assert client.get(f"/projects/{pid}/datasets/preview").json()["boxes_per_class"] == {"multirotor": 14, "fixed-wing": 9, "delta-wing": 2}
+    # a version made without merging is exactly as before
+    plain = client.post(f"/projects/{pid}/datasets", json={}).json()
+    assert len(plain["config"]["classes"]) == 3 and "merged" not in plain["config"]
+
+
+def test_merged_class_takes_its_first_members_place_and_indexes_stay_contiguous(client, project):
+    pid, ids = project
+    populate(client, pid, ids)
+    add(client, pid, ids["delta-wing"], [box(ids["delta-wing"])])
+    v = merged_version(client, pid, [{"class_ids": [ids["delta-wing"], ids["multirotor"]], "name": "small-things"}]).json()
+    assert v["config"]["classes"] == [{"index": 0, "name": "small-things"}, {"index": 1, "name": "fixed-wing"}]
+    z = unzip(client.get(f"/datasets/{v['id']}/download"))
+    assert 'names:\n  0: "small-things"\n  1: "fixed-wing"\n' in z.read("data.yaml").decode()
+
+
+def test_two_separate_merges_in_one_version(client, project):
+    pid, ids = project
+    other = client.post(f"/projects/{pid}/classes/bulk", json={"names": ["interceptor-test", "vtol-test"]})
+    assert other.status_code in (200, 201), other.text
+    all_ids = {c["name"]: c["id"] for c in client.get(f"/projects/{pid}").json()["classes"]}
+    populate(client, pid, ids)
+    add(client, pid, all_ids["interceptor-test"], [box(all_ids["interceptor-test"])])
+    add(client, pid, all_ids["vtol-test"], [box(all_ids["vtol-test"])])
+    v = merged_version(client, pid, [{"class_ids": [ids["multirotor"], all_ids["interceptor-test"]], "name": "rotors"},
+                                     {"class_ids": [ids["fixed-wing"], ids["delta-wing"]], "name": "wings"}]).json()
+    assert [c["name"] for c in v["config"]["classes"]] == ["rotors", "wings", "vtol-test"]
+    assert [m["name"] for m in v["config"]["merged"]] == ["rotors", "wings"]
+
+
+def test_merging_is_refused_when_it_does_not_make_sense(client, project):
+    pid, ids = project
+    populate(client, pid, ids)
+    other = client.post("/projects", json={"name": "other"}).json()
+    foreign = other["classes"][0]["id"]
+    fw, dw, mr, birds = ids["fixed-wing"], ids["delta-wing"], ids["multirotor"], ids["birds"]
+    for merge, why in [
+        ([{"class_ids": [fw]}], None),                                                     # one class is not a merge (schema)
+        ([{"class_ids": [fw, fw]}], "at least two different"),
+        ([{"class_ids": [fw, birds]}], "not a drone class"),                               # a hard negative
+        ([{"class_ids": [fw, foreign]}], "not a drone class"),                             # another project's class
+        ([{"class_ids": [fw, 99999]}], "not a drone class"),
+        ([{"class_ids": [fw, dw]}, {"class_ids": [dw, mr]}], "in two merged groups"),
+        ([{"class_ids": [fw, dw], "name": "multirotor"}], "both be called 'multirotor'"),  # clashes with a class that stays separate
+        ([{"class_ids": [fw, dw], "name": "Has Spaces"}], None),                          # schema: lowercase names only
+        ([{"class_ids": [fw, dw], "name": "x"}] * 6, None),                                # schema: at most five groups
+    ]:
+        r = merged_version(client, pid, merge)
+        assert r.status_code == 422, (merge, r.text)
+        if why:
+            assert why in r.json()["detail"], (merge, r.json())
+    assert client.get(f"/projects/{pid}/datasets").json() == []  # nothing half-made

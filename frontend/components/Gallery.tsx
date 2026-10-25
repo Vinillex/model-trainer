@@ -41,6 +41,7 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
   const [images, setImages] = useState<ImageRow[]>([]);
   const { selected, toggle, selectAll, clear: clearSelection, max: MAX_SELECTED } = useSelection(images, filters);
   const [more, setMore] = useState(false);
+  const [total, setTotal] = useState<number | null>(null); // how many images the filters match (not just the ones loaded)
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<number | null>(null);
   const router = useRouter();
@@ -73,6 +74,13 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
   useEffect(() => {
     load(0);
   }, [load, refreshKey]);
+  useEffect(() => {
+    let current = true; // a slower answer for older filters must not overwrite a newer one
+    api.countImages(projectId, imageQuery(filters)).then((r) => current && setTotal(r.count)).catch(() => current && setTotal(null));
+    return () => {
+      current = false;
+    };
+  }, [projectId, filters, refreshKey]);
   // Coming back to this tab (the review screen may have been opened in another one) shows the list as it is now, with as many rows as are loaded.
   const loaded = images.length;
   useEffect(() => {
@@ -236,6 +244,11 @@ export default function Gallery({ projectId, classes, refreshKey, onChanged }: {
           <button className="text-xs text-neutral-500 hover:underline" onClick={() => setFilters(NO_FILTERS)}>
             Clear filters
           </button>
+        )}
+        {chips.length > 0 && total !== null && (
+          <span className="text-sm font-medium" data-testid="filter-count">
+            {total.toLocaleString()} {total === 1 ? "image" : "images"}
+          </span>
         )}
         {/* The review screen opens the queue these filters describe. */}
         {images.length > 0 && (

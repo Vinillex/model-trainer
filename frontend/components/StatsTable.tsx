@@ -12,7 +12,10 @@ const plural = (n: number, one: string, many: string) => `${n.toLocaleString()} 
 export default function StatsTable({ projectId, rows, onChanged }: { projectId: number; rows: StatRow[]; onChanged: () => void }) {
   const router = useRouter();
   const [confirming, setConfirming] = useState<number | null>(null);
+  const [renaming, setRenaming] = useState<{ id: number; name: string } | null>(null);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const total = (r: StatRow) => r.uploaded + r.scraped + r.generated + r.imported;
   const inUse = (r: StatRow) => total(r) > 0 || r.boxes > 0; // the server enforces this too
 
@@ -24,6 +27,28 @@ export default function StatsTable({ projectId, rows, onChanged }: { projectId: 
       onChanged();
     } catch (e) {
       setError((e as Error).message);
+    }
+  }
+
+  async function rename(r: StatRow) {
+    if (!renaming) return;
+    const name = renaming.name.trim().toLowerCase().replace(/\s+/g, "-");
+    if (!/^[a-z0-9][a-z0-9_-]*$/.test(name)) {
+      setError("Use lowercase letters, digits, - and _, starting with a letter or digit.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const out = await api.renameClass(projectId, r.class_id, name);
+      setRenaming(null);
+      setNotice(out.moved > 0 ? `Renamed to ${out.name}. ${plural(out.moved, "image", "images")} moved to its folder.` : `Renamed to ${out.name}.`);
+      onChanged();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -66,7 +91,25 @@ export default function StatsTable({ projectId, rows, onChanged }: { projectId: 
             {list.map((r) => (
               <tr key={r.class_id} className="border-b border-neutral-200 dark:border-neutral-800" data-testid={`class-row-${r.class_name}`}>
                 <td className="py-1.5 pr-4">
-                  {r.class_name}
+                  {renaming?.id === r.class_id ? (
+                    <form
+                      className="flex items-center gap-1"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        rename(r);
+                      }}
+                    >
+                      <input className="input w-44" value={renaming.name} onChange={(e) => setRenaming({ id: r.class_id, name: e.target.value })} autoFocus aria-label={`New name for ${r.class_name}`} data-testid={`rename-input-${r.class_name}`} />
+                      <button className="btn px-2 py-0.5 text-xs" disabled={busy || !renaming.name.trim()} data-testid={`rename-save-${r.class_name}`}>
+                        {busy ? "Renaming…" : "Rename"}
+                      </button>
+                      <button type="button" className="btn px-2 py-0.5 text-xs" onClick={() => setRenaming(null)} disabled={busy}>
+                        Cancel
+                      </button>
+                    </form>
+                  ) : (
+                    r.class_name
+                  )}
                   {r.is_mixed && (
                     <span className="ml-2 rounded bg-neutral-200 px-1.5 py-0.5 text-xs dark:bg-neutral-800" title="Reviewed images whose boxes show two or more classes are moved here automatically. It is a folder, not a class the model learns.">
                       mixed folder
@@ -118,6 +161,19 @@ export default function StatsTable({ projectId, rows, onChanged }: { projectId: 
                           show images
                         </button>
                       )}
+                      {!r.is_mixed && (
+                        <button
+                          className="btn px-2 py-0.5 text-xs"
+                          onClick={() => {
+                            setError(null);
+                            setRenaming({ id: r.class_id, name: r.class_name });
+                          }}
+                          title="Give this class another name. Its images' files move to the folder of the new name."
+                          data-testid={`rename-${r.class_name}`}
+                        >
+                          Rename
+                        </button>
+                      )}
                       <button
                         className="btn px-2 py-0.5 text-xs"
                         disabled={inUse(r)}
@@ -143,6 +199,11 @@ export default function StatsTable({ projectId, rows, onChanged }: { projectId: 
       {table("Drone classes", "What the model learns to find. A class can only be removed once no image is filed under it and no box uses it.", rows.filter((r) => !r.is_negative), false)}
       {table("Hard negatives", "Things that look like drones but are not (birds, balloons, helicopters…). Their images count as background: they never have boxes.", rows.filter((r) => r.is_negative), true)}
       {error && <p className="text-sm text-red-600">{error}</p>}
+      {notice && (
+        <p className="text-sm text-green-600" data-testid="class-notice">
+          {notice}
+        </p>
+      )}
     </div>
   );
 }

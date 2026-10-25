@@ -226,6 +226,26 @@ def test_run_scrape_filters_and_stores(client, project):
         assert (p2["already_scraped"], p2["download_failed"], p2["too_small"], p2["added"]) == (7, 1, 1, 0)
 
 
+def test_group_by_article_keeps_one_page_together_where_site_lumps_a_whole_website(client, project):
+    pid, ids = project
+    pages = [[SearchResult(original="https://img.test/1.jpg", page_url="https://news.test/story/one", title="one"),
+              SearchResult(original="https://img.test/2.jpg", page_url="https://news.test/story/one#photos", title="one"),
+              SearchResult(original="https://img.test/3.jpg", page_url="https://news.test/story/two", title="two")]]
+    downloads = {f"https://img.test/{n}.jpg": photo(n) for n in (1, 2, 3)}
+
+    by_site, by_article = make_job(client, pid, ids["multirotor"]), make_job(client, pid, ids["multirotor"], group_by="article", skip_known_urls=False)
+    run(client, by_site, pages, downloads)
+    with client.session_factory() as db:
+        assert {i.group_key for i in db.scalars(select(Image))} == {"news.test"}  # every picture of the website in one group
+        db.query(Image).delete()
+        db.query(ImageHash).delete()
+        db.commit()
+    run(client, by_article, pages, downloads)
+    with client.session_factory() as db:
+        keys = {i.scrape_record.title: i.group_key for i in db.scalars(select(Image))}
+    assert keys["one"] != keys["two"] and all(k.startswith("news.test/") for k in keys.values())
+
+
 def test_a_png_with_a_bad_checksum_is_rejected_not_fatal(client, project):
     """Pillow raises SyntaxError (not OSError) for it; once that aborted a whole scrape job after it had added 52 images."""
     pid, ids = project
@@ -436,7 +456,8 @@ def test_scrape_job_api(client, project, monkeypatch):
     job = client.post(url, json=body).json()
     assert job["status"] == "queued" and job["type"] == "scrape"
     assert job["params"] == {"class_id": ids["multirotor"], "query": "fpv drone", "max_images": 50, "max_pages": 3,
-                             "min_side": 200, "near_dup_distance": 4, "start_page": 0, "skip_known_urls": True}
+                             "min_side": 200, "near_dup_distance": 4, "start_page": 0, "skip_known_urls": True, "group_by": "site"}
+    assert client.post(url, json={**body, "group_by": "planet"}).status_code == 422
     assert SECRET not in str(job)
 
     assert [j["id"] for j in client.get(f"/projects/{pid}/jobs").json()] == [job["id"]]

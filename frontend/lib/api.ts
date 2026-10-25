@@ -206,6 +206,40 @@ export interface ScrapeParams {
   near_dup_distance: number;
   start_page: number; // 0-based (SerpAPI ijn)
   skip_known_urls: boolean;
+  group_by: GroupBy;
+}
+
+/** What keeps pictures together in one train/val/test split: their website, or the page (article) they were on. */
+export type GroupBy = "site" | "article";
+
+/** A job that reads the pictures off web pages (type "collect_pages"). */
+export interface CollectParams {
+  class_id: number;
+  urls: string[];
+  follow_links: boolean;
+  link_contains: string[];
+  include_start_pages: boolean;
+  max_pages: number;
+  max_images: number;
+  images_per_page: number;
+  min_side: number;
+  near_dup_distance: number;
+  skip_known_urls: boolean;
+  group_by: GroupBy;
+  query?: string;
+}
+
+/** A job that cuts still frames out of videos (type "video_frames"). */
+export interface VideoParams {
+  class_id: number;
+  urls: string[];
+  frames_per_second: number;
+  max_frames_per_video: number;
+  max_images: number;
+  min_side: number;
+  near_dup_distance: number;
+  skip_known_urls: boolean;
+  query?: string;
 }
 
 export interface SearchHistory {
@@ -292,6 +326,7 @@ export interface DatasetVersion {
     sources?: SelectableSource[] | null; // null/absent = all
     imported_datasets?: string[] | null;
     classes: { index: number; name: string }[];
+    merged?: { name: string; classes: string[] }[]; // classes this version treats as one (absent when nothing was merged)
   };
   stats: {
     images: Record<SplitName, number>;
@@ -439,6 +474,9 @@ export const datasetDownloadUrl = (id: number) => `${API}/datasets/${id}/downloa
 export const imageUrl = (id: number) => `${API}/images/${id}/file`;
 export const artifactUrl = (runId: number, name: ArtifactName) => `${API}/training-runs/${runId}/artifacts/${name}`;
 
+/** The filters the Images page offers; `listImages` adds the paging, `countImages` takes them as they are. */
+type ImageFilterParams = { classId?: number; boxClassId?: number; excludeRejected?: boolean; source?: Source; dataset?: string; folder?: string; manuallyChecked?: boolean; ai?: string; reviewStatus?: ReviewStatus };
+
 export const api = {
   listProjects: () => req<Project[]>("/projects"),
   createProject: (name: string) => req<Project>("/projects", json("POST", { name })),
@@ -448,11 +486,11 @@ export const api = {
   createClasses: (projectId: number, names: string[], isNegative: boolean) =>
     req<BulkClassResult>(`/projects/${projectId}/classes/bulk`, json("POST", { names, is_negative: isNegative })),
   deleteClass: (projectId: number, classId: number) => req<void>(`/projects/${projectId}/classes/${classId}`, { method: "DELETE" }),
+  /** New name for a class; its images' files move to the folder of the new name (`moved` of them). */
+  renameClass: (projectId: number, classId: number, name: string) =>
+    req<DetClass & { moved: number }>(`/projects/${projectId}/classes/${classId}`, json("PATCH", { name })),
   stats: (projectId: number) => req<StatRow[]>(`/projects/${projectId}/stats`),
-  listImages: (
-    projectId: number,
-    p: { classId?: number; boxClassId?: number; excludeRejected?: boolean; source?: Source; dataset?: string; folder?: string; manuallyChecked?: boolean; ai?: string; reviewStatus?: ReviewStatus; limit: number; offset: number },
-  ) => {
+  listImages: (projectId: number, p: ImageFilterParams & { limit: number; offset: number }) => {
     const q = new URLSearchParams({ limit: String(p.limit), offset: String(p.offset) });
     if (p.classId != null) q.set("class_id", String(p.classId));
     if (p.boxClassId != null) q.set("box_class_id", String(p.boxClassId));
@@ -464,6 +502,20 @@ export const api = {
     if (p.reviewStatus) q.set("review_status", p.reviewStatus);
     if (p.excludeRejected) q.set("exclude_rejected", "true");
     return req<ImageRow[]>(`/projects/${projectId}/images?${q}`);
+  },
+  /** How many images `listImages` would list with the same filters. */
+  countImages: (projectId: number, p: ImageFilterParams) => {
+    const q = new URLSearchParams();
+    if (p.classId != null) q.set("class_id", String(p.classId));
+    if (p.boxClassId != null) q.set("box_class_id", String(p.boxClassId));
+    if (p.source) q.set("source", p.source);
+    if (p.dataset) q.set("dataset", p.dataset);
+    if (p.folder) q.set("folder", p.folder);
+    if (p.manuallyChecked !== undefined) q.set("manually_checked", String(p.manuallyChecked));
+    if (p.ai) q.set("ai", p.ai);
+    if (p.reviewStatus) q.set("review_status", p.reviewStatus);
+    if (p.excludeRejected) q.set("exclude_rejected", "true");
+    return req<{ count: number }>(`/projects/${projectId}/images/count?${q}`);
   },
   /** The review window calls this for an imported image it shows: opening it there is what counts as a manual check. */
   markManuallyChecked: (id: number) => req<ImageRow>(`/images/${id}/manual-check`, { method: "POST" }),
@@ -490,6 +542,10 @@ export const api = {
     req<ImageDetail>(`/images/${id}/annotations`, json("PUT", { boxes, review_status: reviewStatus ?? null, ai_dismiss: aiDismiss ?? false })),
   createScrapeJob: (projectId: number, p: Partial<ScrapeParams> & Pick<ScrapeParams, "class_id" | "query">) =>
     req<Job>(`/projects/${projectId}/jobs/scrape`, json("POST", p)),
+  createCollectJob: (projectId: number, p: Partial<CollectParams> & Pick<CollectParams, "class_id" | "urls">) =>
+    req<Job>(`/projects/${projectId}/jobs/collect-pages`, json("POST", p)),
+  createVideoJob: (projectId: number, p: Partial<VideoParams> & Pick<VideoParams, "class_id" | "urls">) =>
+    req<Job>(`/projects/${projectId}/jobs/video-frames`, json("POST", p)),
   searchHistory: (projectId: number, query: string) =>
     req<SearchHistory>(`/projects/${projectId}/searches?${new URLSearchParams({ query })}`),
   serpapiAccount: () => req<SerpApiAccount>("/serpapi/account"),
@@ -529,7 +585,15 @@ export const api = {
   listDatasets: (projectId: number) => req<DatasetVersion[]>(`/projects/${projectId}/datasets`),
   createDataset: (
     projectId: number,
-    body: { name?: string; val_ratio: number; test_ratio: number; include_negatives: boolean; sources?: SelectableSource[]; imported_datasets?: string[] },
+    body: {
+      name?: string;
+      val_ratio: number;
+      test_ratio: number;
+      include_negatives: boolean;
+      sources?: SelectableSource[];
+      imported_datasets?: string[];
+      merge_classes?: { class_ids: number[]; name?: string }[]; // the version treats each group as one class; the project's labels are unchanged
+    },
   ) =>
     req<DatasetVersion>(`/projects/${projectId}/datasets`, json("POST", body)),
   deleteDataset: (id: number) => req<void>(`/datasets/${id}`, { method: "DELETE" }),

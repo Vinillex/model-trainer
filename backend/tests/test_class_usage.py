@@ -17,7 +17,7 @@ def ids_of(client, pid, **params):
 
 def test_box_class_filter_finds_images_by_the_classes_of_their_boxes_wherever_they_are_filed(client, project):
     pid, ids = project
-    m, f, s = ids["multirotor"], ids["fixed-wing"], ids["shahed"]
+    m, f, s = ids["multirotor"], ids["fixed-wing"], ids["delta-wing"]
     plain = add(client, pid, m, [box(m)])["id"]
     mixed = add(client, pid, m, [box(f), box(s, cx=0.2, cy=0.2)])["id"]            # two classes: the review moves it to the `mixed` folder
     only_s = add(client, pid, m, [box(s)])["id"]                                    # one class: moves to that class's folder
@@ -27,7 +27,7 @@ def test_box_class_filter_finds_images_by_the_classes_of_their_boxes_wherever_th
     assert ids_of(client, pid, box_class_id=s) == sorted([mixed, only_s])           # found even inside `mixed`
     assert ids_of(client, pid, box_class_id=f) == [mixed]
     assert ids_of(client, pid, box_class_id=m) == [plain]
-    assert ids_of(client, pid, class_id=m, box_class_id=s) == []                    # the two filters are different things: filed under multirotor AND a shahed box
+    assert ids_of(client, pid, class_id=m, box_class_id=s) == []                    # the two filters are different things: filed under multirotor AND a delta-wing box
     assert unlabelled not in ids_of(client, pid, box_class_id=m)
     assert client.get(f"/projects/{pid}/images", params={"box_class_id": "x"}).status_code == 422
 

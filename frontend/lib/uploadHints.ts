@@ -1,6 +1,6 @@
 /** A cheap guess at whether a folder's name and the class it is uploaded to disagree. Only a hint: the person decides.
  *  It matters because images uploaded into a negative class arrive already reviewed, as background: a folder of drones put there would be trained on as "no drone". */
-const DRONE = /drone|uav|quad|multirotor|copter|shahed|vtol|fixed[-_ .]?wing|interceptor/i;
+const DRONE = /drone|uav|quad|multirotor|copter|shahed|geran|delta[-_ .]?wing|vtol|fixed[-_ .]?wing|interceptor/i;
 const NOT_DRONE = /bird|balloon|aircraft|airplane|plane|helicopter|cloud|sky|negative|background|empty|kite|insect|smoke|fog/i;
 
 export function folderHint(folder: string, className: string, negative: boolean): string | null {

@@ -4,7 +4,7 @@ dataset version contains them)."""
 import pytest
 
 from app import storage
-from app.models import AiCheck, Annotation, Image, ReviewStatus, UploadRecord
+from app.models import AiCheck, Annotation, Image, ImportRecord, ManualCheck, ReviewStatus, Source, UploadRecord
 
 from .test_ai_check import FakeModels, flagged_image, listed, save_boxes
 from .test_datasets import add, box
@@ -66,6 +66,41 @@ def test_the_trash_can_be_left_out_of_a_list_but_an_explicit_status_still_finds_
     assert ids_of(client, pid, exclude_rejected=True, review_status="rejected") == [gone]       # asking for the rejected ones by name wins
     assert ids_of(client, pid, review_status="rejected") == [gone]
     assert ids_of(client, pid, exclude_rejected=True, review_status="reviewed") == [keep]
+
+
+def test_the_count_endpoint_agrees_with_the_list_for_every_filter(client, project):
+    pid, ids = project
+    m, f = ids["multirotor"], ids["fixed-wing"]
+    reviewed, gone, pending = add(client, pid, m, [box(m)])["id"], add(client, pid, m, [box(m)])["id"], add(client, pid, m, status="pending")["id"]
+    wing = add(client, pid, f, [box(f)])["id"]
+    uploaded = up(client, pid, m, jpg(2), folder="flight-1").json()["added"]
+    trash_it(client, pid, gone)
+    with client.session_factory() as db:                      # an imported dataset, with one image checked by hand and one not
+        for n in range(2):
+            img = Image(project_id=pid, class_id=m, source=Source.imported, storage_key=f"projects/{pid}/raw/x/imported/c{n}.jpg", sha256=f"{n + 7:064x}",
+                        width=64, height=64, review_status=ReviewStatus.reviewed)
+            img.import_record = ImportRecord(dataset="anti-uav", original_name=f"{n}.jpg", original_split="train", dataset_url="u", license="CC BY 4.0", author="a")
+            if n == 0:
+                img.manual_check = ManualCheck()
+            db.add(img)
+        db.commit()
+    everything = [{}, {"exclude_rejected": True}, {"dataset": "anti-uav"}, {"dataset": "anti-uav", "manually_checked": True},
+                  {"dataset": "anti-uav", "manually_checked": False}, {"manually_checked": False}, {"manually_checked": True}, {"review_status": "rejected"}, {"review_status": "pending", "exclude_rejected": True},
+                  {"class_id": m, "exclude_rejected": True}, {"class_id": f}, {"box_class_id": f}, {"box_class_id": m, "exclude_rejected": True},
+                  {"folder": "flight-1"}, {"source": "uploaded", "class_id": m}, {"ai": "unchecked", "exclude_rejected": True}, {"ai": "flagged"},
+                  {"class_id": f, "review_status": "rejected"}]
+    for params in everything:
+        listed_ids = ids_of(client, pid, **params)
+        r = client.get(f"/projects/{pid}/images/count", params=params)
+        assert r.status_code == 200 and r.json() == {"count": len(listed_ids)}, params
+    assert client.get(f"/projects/{pid}/images/count", params={"exclude_rejected": True}).json() == {"count": 4 + len(uploaded) - 1 + 2}   # all but the one in the trash
+    assert client.get(f"/projects/{pid}/images/count", params={"class_id": f}).json() == {"count": 1}
+    assert client.get(f"/projects/{pid}/images/count", params={"dataset": "anti-uav"}).json() == {"count": 2}
+    assert client.get(f"/projects/{pid}/images/count", params={"dataset": "anti-uav", "manually_checked": True}).json() == {"count": 1}
+    assert client.get(f"/projects/{pid}/images/count", params={"folder": "flight-1"}).json() == {"count": len(uploaded)}
+    assert client.get("/projects/9999/images/count").status_code == 404
+    assert client.get(f"/projects/{pid}/images/count", params={"ai": "nonsense"}).status_code == 422
+    assert {reviewed, pending, wing} <= set(ids_of(client, pid, exclude_rejected=True))
 
 
 # ---------- restoring ----------

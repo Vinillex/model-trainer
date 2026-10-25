@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from . import imagehash
 from .api.images import NearDuplicate, ingest_image
 from .config import settings
+from .grouping import file_series
 from .models import DetClass, Image, ImageHash, Job, ScrapedUrl, ScrapeRecord, SearchLog, Source, UrlOutcome
 from .storage import get_storage
 
@@ -28,6 +29,11 @@ class SearchError(Exception):
 
 class FetchError(Exception):
     """An image URL could not be downloaded (blocked, HTTP error, too large, not an image...)."""
+
+
+class SearchDone(Exception):
+    """Raised by a `search` function that has nothing more to offer. An empty list only means "this page had nothing",
+    which ends a SerpAPI search (it ran past the last results) but not a crawl of web pages."""
 
 
 @dataclass
@@ -133,13 +139,13 @@ def _check_public(url: str) -> None:
             raise FetchError("host resolves to a non-public address")
 
 
-def fetch_image(url: str, http: httpx.Client, max_bytes: int | None = None) -> bytes:
+def fetch_image(url: str, http: httpx.Client, max_bytes: int | None = None, user_agent: str | None = None) -> bytes:
     """Download one image, following up to MAX_REDIRECTS redirects (each hop is re-checked) with a size cap."""
     max_bytes = max_bytes or settings.scrape_max_bytes
     for _ in range(MAX_REDIRECTS + 1):
         _check_public(url)
         try:
-            with http.stream("GET", url, headers={"User-Agent": USER_AGENT}) as r:
+            with http.stream("GET", url, headers={"User-Agent": user_agent or USER_AGENT}) as r:
                 if r.is_redirect:
                     location = r.headers.get("location")
                     if not location:
@@ -186,10 +192,30 @@ def _known_url_keys(db: Session, project_id: int) -> set[str]:
     return keys
 
 
+def group_key_for(page_url: str | None, group_by: str) -> str | None:
+    """What decides which train/val/test split an image lands in: its site (default) or its article.
+
+    The article key is the host plus a hash of the page URL, so it always fits the 200-character column and two different
+    articles with a long common prefix never share a key.
+    """
+    parts = urlsplit(page_url or "")
+    if group_by == "article" and parts.hostname and page_url:
+        series = file_series(parts.path)
+        basis = f"{parts.hostname}/{series}" if series else urlunsplit(parts._replace(fragment=""))
+        return f"{parts.hostname}/{hashlib.sha1(basis.encode()).hexdigest()[:16]}"
+    return parts.hostname
+
+
 def run_scrape(db: Session, job: Job, search: Callable[[str, int], list[SearchResult]],
-               fetch: Callable[[str], bytes]) -> None:
-    """Execute a scrape job. Progress counters are written to job.progress after every image, so the UI can poll."""
+               fetch: Callable[[str], bytes], *, log_searches: bool = True,
+               extra_progress: Callable[[], dict] | None = None) -> None:
+    """Execute a scrape job. Progress counters are written to job.progress after every image, so the UI can poll.
+
+    `log_searches` is for SerpAPI jobs: each page is a search that was spent. Page crawls (app/collect.py) switch it off and
+    use `SearchDone` to say they are finished; `extra_progress` adds their own numbers (pages read, failures) to the progress.
+    """
     params = job.params
+    group_by = params.get("group_by", "site")
     cls = db.get(DetClass, params["class_id"])
     query = normalize_query(params["query"])
     max_images, max_pages = params["max_images"], params["max_pages"]
@@ -202,7 +228,7 @@ def run_scrape(db: Session, job: Job, search: Callable[[str, int], list[SearchRe
     near = (lambda h: any(imagehash.distance(h, x) <= near_dist for x in hashes)) if near_dist > 0 else None
 
     def publish():
-        job.progress = {**counters, "target": max_images, "start_page": start_page}
+        job.progress = {**counters, "target": max_images, "start_page": start_page, **(extra_progress() if extra_progress else {})}
         db.commit()
 
     def cancelled() -> bool:
@@ -220,12 +246,19 @@ def run_scrape(db: Session, job: Job, search: Callable[[str, int], list[SearchRe
     publish()
     page = start_page
     while counters["added"] < max_images and page < start_page + max_pages and not cancelled():
-        results = search(params["query"], page)
-        db.add(SearchLog(project_id=job.project_id, query=query[:300], page=page, results=len(results), job_id=job.id))
+        try:
+            results = search(params["query"], page)
+        except SearchDone:
+            break
+        if log_searches:
+            db.add(SearchLog(project_id=job.project_id, query=query[:300], page=page, results=len(results), job_id=job.id))
         page += 1
         counters["pages"] += 1
         if not results:
-            break  # ran out of results
+            if log_searches:
+                break  # ran out of results
+            publish()
+            continue  # a page without usable pictures; the next one may have some
         counters["candidates"] += len(results)
 
         todo = []
@@ -258,9 +291,8 @@ def run_scrape(db: Session, job: Job, search: Callable[[str, int], list[SearchRe
                         record(r, UrlOutcome.download_failed)
                         publish()
                         continue
-                    host = urlparse(r.page_url or "").hostname
                     try:
-                        image = ingest_image(db, job.project_id, cls, Source.scraped, data, group_key=host,
+                        image = ingest_image(db, job.project_id, cls, Source.scraped, data, group_key=group_key_for(r.page_url, group_by),
                                              min_side=min_side, is_near_duplicate=near)
                     except NearDuplicate:
                         counters["near_duplicates"] += 1

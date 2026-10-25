@@ -64,7 +64,7 @@ def test_an_image_showing_two_classes_goes_to_the_mixed_folder(client, project):
     second = add(client, pid, ids["fixed-wing"], status="pending")
     assert mixed_id(client, pid) is None                                         # not created until needed
     put(client, first["id"], [box(ids["multirotor"], 0.2), box(ids["fixed-wing"], 0.7)])
-    put(client, second["id"], [box(ids["shahed"], 0.3), box(ids["multirotor"], 0.8)])
+    put(client, second["id"], [box(ids["delta-wing"], 0.3), box(ids["multirotor"], 0.8)])
     m = mixed_id(client, pid)
     assert m is not None and class_of(client, first["id"]) == m and class_of(client, second["id"]) == m
     assert "/raw/mixed/uploaded/" in key_of(client, first["id"]) and on_disk(key_of(client, second["id"]))
@@ -212,7 +212,7 @@ def test_the_refile_endpoint_applies_the_rule_to_images_reviewed_before_it_exist
     with monkeypatch.context() as m:
         m.setattr(refile_mod, "target_class", lambda db, image: None)           # reviews saved while the rule was off
         a = add(client, pid, ids["multirotor"], [box(ids["fixed-wing"])])
-        b = add(client, pid, ids["multirotor"], [box(ids["multirotor"], 0.2), box(ids["shahed"], 0.7)])
+        b = add(client, pid, ids["multirotor"], [box(ids["multirotor"], 0.2), box(ids["delta-wing"], 0.7)])
         c = add(client, pid, ids["multirotor"], [box(ids["multirotor"])])
     assert [class_of(client, i["id"]) for i in (a, b, c)] == [ids["multirotor"]] * 3
 

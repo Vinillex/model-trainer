@@ -2,13 +2,17 @@
 
 import { useState } from "react";
 import { SectionHeader } from "@/components/Drawer";
+import CollectPanel from "@/components/CollectPanel";
 import ScrapePanel from "@/components/ScrapePanel";
+import VideoPanel from "@/components/VideoPanel";
 import UploadBox from "@/components/UploadBox";
 import { useProject } from "@/lib/projectContext";
 
 const TABS = [
   { id: "upload", label: "Upload" },
   { id: "scrape", label: "Scrape" },
+  { id: "pages", label: "Web pages" },
+  { id: "video", label: "Video frames" },
 ] as const;
 
 export default function AddDataPage() {
@@ -32,8 +36,12 @@ export default function AddDataPage() {
       </div>
       {tab === "upload" ? (
         <UploadBox projectId={projectId} classes={project.classes} onDone={imagesChanged} />
-      ) : (
+      ) : tab === "scrape" ? (
         <ScrapePanel projectId={projectId} classes={project.classes} onImagesChanged={imagesChanged} />
+      ) : tab === "pages" ? (
+        <CollectPanel projectId={projectId} classes={project.classes} onImagesChanged={imagesChanged} />
+      ) : (
+        <VideoPanel projectId={projectId} classes={project.classes} onImagesChanged={imagesChanged} />
       )}
     </div>
   );

@@ -10,7 +10,7 @@ anything that costs money, exposes a port, or touches their data before you do i
 ## 1. What this is
 
 A tool to build a dataset and train an **object-detection** model that identifies **drone types** (multirotor,
-fixed-wing, shahed-class, and others), producing a **`.rpk`** file that runs on a **Sony IMX500** (the Raspberry Pi AI
+fixed-wing, delta-wing, and others; see `CLASSES.md`), producing a **`.rpk`** file that runs on a **Sony IMX500** (the Raspberry Pi AI
 Camera). Images come from three sources: **upload**, **scraping** (SerpAPI Google Images) and **AI generation**
 (not built yet). The user reviews and boxes images in a built-in web UI, freezes a *dataset version*, trains in the
 cloud/own GPU, exports for the IMX500 and packages the `.rpk` on a Raspberry Pi.
@@ -38,8 +38,10 @@ backend/            FastAPI + SQLAlchemy 2 (SQLite by default). Python.
     schemas.py      pydantic request/response models
     api/            projects, images, annotations, jobs (scrape + quota), datasets, training (UI side), workers (agent side)
     scrape.py       SerpAPI client, image download (SSRF-guarded), the scrape job, dedupe layers
+    collect.py      "Collect pictures from web pages": throttle, robots.txt, page reader, crawl; feeds scrape.run_scrape (section 4.3b)
+    video.py        "Video frames": download a video, ffmpeg frames, feed scrape.run_scrape (section 4.3c)
     imagehash.py    64-bit dHash for near-duplicate detection
-    jobs.py         tiny DB-backed queue + in-process worker thread (scrape and ai_check jobs)
+    jobs.py         tiny DB-backed queue + in-process worker thread (scrape, collect_pages, video_frames and ai_check jobs)
     datasets.py     dataset versions: grouped/stratified train-val-test split, stats, warnings
     yolo_export.py  frozen manifest -> YOLO zip (no DB access, reusable)
     training.py     training-run state machine: stages, leases, claim/heartbeat/complete (section 4.5)
@@ -64,6 +66,7 @@ frontend/           Next.js 15 (app router, TypeScript, Tailwind 3). Talks to th
                     ai, datasets, training; layout.tsx provides the project once (lib/projectContext.tsx: project, stats, refreshKey,
                     imagesChanged(), classesChanged()). app/projects/[id]/review is outside the group: full screen, no drawer.
 handover-data/      the data bundle (db.json + files + checksums). Restore with `python -m scripts.bundle import`.
+CLASSES.md          the class guide: what each class means, picture tiers A/B/C, the delta-wing list
 HANDOVER.md         this file
 ```
 
@@ -149,7 +152,9 @@ and nothing is scraped, uploaded or boxed into it by hand. The move is the last 
 first, then the file is copied, the row switched, and the old copy deleted, so a failed move leaves the image where it was.
 `POST /projects/{id}/images/refile?dry_run=false` applies the rule to images reviewed before it existed (dry run by default).
 
-**Images page extras.** Active filters show as removable chips with "Clear filters" and a "Review these" button (the queue those filters
+**Images page extras.** Active filters show as removable chips with "Clear filters", the number of images they match ("1,468 images", from
+`GET /projects/{id}/images/count`, which takes the same filters as the list and shares its code, so the two cannot disagree; nothing is shown
+without a filter) and a "Review these" button (the queue those filters
 describe). Cards have a checkbox (always visible below 768 px, on hover above it): the bar offers **Reject** (inline confirm, `POST
 /projects/{id}/images/reject`, up to 500, all or nothing, ids of another project refuse the whole request; it goes through the same
 `apply_annotations()` as the editor's save, so a rejected image leaves "AI: needs a look" and "AI drew the boxes" exactly as a single Reject
@@ -197,6 +202,12 @@ nothing uses it: no images, no boxes drawn with it on any image, and no queued/r
 versions are self-contained snapshots, so existing ones are unaffected. New positive classes get `index = max + 1`, never a
 count, because a removal leaves a gap and a count would reuse a live class's index.
 
+**Renaming a class** (`PATCH /projects/{id}/classes/{class_id}` `{name}`, the Rename button in the class table; `refile.rename_class`) moves every image of
+the class to `raw/<new name>/...` and changes the name in one commit. It copies first, switches the rows, and deletes the old files last, so a failure
+halfway leaves the old name and the old files. Refused: name taken (drone or negative class), the reserved `mixed`, a bad name (422), a queued/running
+job (409). Dataset versions re-point by image id + SHA-256 and keep the old class names in their own labels, so they stay downloadable. `shahed` became
+`delta-wing` this way on 2026-10-25 (the default class list says `delta-wing` now).
+
 There are **no migrations**. `create_all` makes missing *tables* on startup; a new *column* on an existing table needs a
 manual `ALTER TABLE`. Alembic is a known to-do. `scripts/bundle.py` tolerates schema drift (section 4.7).
 
@@ -230,6 +241,74 @@ dHash near-duplicates (distance <= 4 by default; featureless sky images can over
 Downloads are SSRF-guarded (http/https only, public IPs only, re-checked per redirect, size cap, content-type check).
 The API key never appears in errors or logs. Jobs run on the in-process worker thread and can be cancelled per image.
 
+### 4.3b Collecting pictures from web pages (`collect.py`, `CollectPanel.tsx`, Add data > Web pages)
+The other front end of the scrape runner: instead of SerpAPI results, the candidates are the pictures found on pages the user
+lists (`POST /projects/{id}/jobs/collect-pages`, job type `collect_pages`, no SerpAPI key or search needed). `Collector.search`
+reads one page per call and `Collector.fetch` downloads a picture; everything after that (size filter, the four dedupe layers,
+the URL ledger, `scrape_records` provenance with the article as `page_url` and its `<title>`) is `run_scrape` unchanged.
+`run_scrape` got three hooks for this: `SearchDone` (a crawl says it is finished; an *empty* page just means "no pictures here",
+which for SerpAPI still ends the search), `log_searches=False` (page reads are not `search_logs` rows, those mean spent searches)
+and `extra_progress` (pages read, `pages_failed`, `robots_blocked`, `last_failure`, `queued_pages`).
+- **Manners.** robots.txt per site is read through the same guarded client (never `RobotFileParser.read()`): 404 = no rules, 5xx or
+  unreachable = the site is left alone; it applies to pages *and* pictures. One request per host per `MT_COLLECT_REQUEST_DELAY`
+  seconds (default 1.0), enforced in `Throttle` for page reads, robots files and picture downloads from the 8 download threads.
+  A job reads at most `max_pages` pages (default 30, max 300). Pages over `MT_COLLECT_PAGE_MAX_BYTES` (3 MB) are refused. Every
+  request and redirect hop passes `_check_public`; an address it refuses is reported as a failed page, not as a robots problem.
+  The job queue runs one job at a time, so a long throttled crawl holds up AI jobs; the UI says so.
+- **What counts as a picture** (`parse_page`, stdlib `HTMLParser`, no new dependency): `<img>` via `srcset` (only the largest entry),
+  `data-src`/`data-lazy-src`/`data-original`, a link around the thumbnail that points at the image file, `<picture><source>` when
+  the picture has no `<img>`, `<noscript>` fallbacks, `<base href>`; `data:` URIs, svg, gif, ico and `logo/sprite/avatar...` paths
+  dropped. Pictures inside `<article>`/`<main>` win when the page has any; `<nav>`, `<footer>`, `<aside>`, `<form>` are ignored. The
+  page's `og:image` is used only when nothing else was found (usually the same photo again, cropped). HTML `width`/`height` are NOT
+  passed on as the picture's size (they are display sizes); the real `min_side` check runs after the download.
+- **Following links** (`follow_links`): same website (`www.` ignored), one level, optional `link_contains` words, non-page files skipped,
+  the start pages are used only for finding links unless `include_start_pages`. The page cap counts every page.
+- **Who it says it is.** Every request (pages, robots.txt, pictures) carries `COLLECT_USER_AGENT`, an honest agent name with a link to the
+  repo, never a browser disguise. Wikimedia answers `Mozilla/5.0 (compatible; ...)` with HTTP 403 and accepts this one (found on the
+  first real crawl). The older SerpAPI picture downloads keep their old agent (`scrape.USER_AGENT`). Some sites still answer 403 to
+  any automated client (army-technology.com did on the first crawl, overtdefense.com did not answer robots.txt); that is respected, not worked around.
+- **Size.** Pictures with a longest side over `MT_COLLECT_MAX_SIDE` (default 2560) are scaled down and stored as JPEG (`shrink`), because
+  the agency originals found on Commons are 4000+ px / 5 MB and the detector sees 640 px. Smaller ones are stored byte for byte. WordPress
+  thumbnails named `photo-128x71.jpg` and tracking pixels are not downloaded at all (`usable_image_url`).
+- **Wikimedia Commons works through link following**: a category page lists `/wiki/File:Name.jpg` pages (they end like a picture but are web
+  pages, `PAGE_ABOUT_A_FILE`), and each file page links its full-size picture. Seed a category URL with `follow_links`, `link_contains=["/wiki/File:"]`,
+  `include_start_pages=false`. Links robots.txt forbids (`/w/index.php?...`) are not queued, so they do not use up the page cap. `link_contains`
+  matches the whole address, any word: "flight" also matches "flight_deck", so choose words with care.
+  Better for a big category: pick the files by *title* first (Commons API `list=categorymembers`, include words like flies/aerial/formation, exclude
+  words like deck/crane/hangar/maintenance/parade/wreck) and paste the resulting `File:` page URLs (up to 50 a job) with no link following;
+  `link_contains` can only include, which is how the first X-47B crawl let in crane and deck photos.
+- **Group by article / what a split really groups by.** `group_by` (`site` | `article`) sets `Image.group_key` (`site` = the host, the SerpAPI
+  default; `article` = `host/<sha1 of the page URL>[:16]`, the collector's default). **But `datasets.create_version` groups a scraped picture by
+  its scrape record's `page_url` first and uses `group_key` only when there is no page URL** (uploads, imports, pictures recovered without a
+  source page), so for scraped pictures a split always keeps *one page* together and `group_by` has no effect on it. (Found 2026-10-25; the
+  line predates the collector.) The one exception is a Wikimedia `File:` page, whose group is its photo *series* (`app/grouping.py`,
+  `series_group`, used by the scrapers *and* `create_version`): the title without trailing words that contain a digit
+  ("MQ-9 Takes Flight Over Central New York 161019-Z-QU230-002.jpg" and "...-014.jpg" share one group), so the near-identical frames of one
+  sortie cannot land in both training and testing. Other pages keep exactly the group string they always had, so old versions and their
+  comparisons are unaffected. Not covered: the same wire photo on two different sites is two groups (a dHash check at distance <= 6 found
+  38 such pairs among 4,214 new pictures, 0.9%; they are unmerged because no override exists).
+- Verified with a fake internet (`tests/test_collect.py`, MockTransport, mutation-checked) and once through the UI against a local
+  test website with a robots.txt (`MT_SCRAPE_ALLOW_PRIVATE_HOSTS=true` on a scratch backend). **No real site has been crawled yet**:
+  many news sites answer automated readers with HTTP 403, which shows up as "pages failed" with the reason.
+
+### 4.3c Still frames from videos (`video.py`, `VideoPanel.tsx`, Add data > Video frames)
+Small targets seen from the air are rare as photographs but common in video, so this is the third front end of `run_scrape`
+(`POST /projects/{id}/jobs/video-frames`, job type `video_frames`, no SerpAPI search). `VideoSource.search` takes one video per call:
+`resolve` (a Wikimedia `File:` page is looked up through the Commons API for the real file and checked to be a video; any other address
+is taken to be the video file), robots.txt, one request a second, `download` (streamed to disk, SSRF guard on every hop, over
+`MT_VIDEO_MAX_BYTES` = 400 MB is refused), `extract_frames` (ffmpeg at `frames_per_second` but never more than `max_frames_per_video`
+spread over the *whole* video, frames wider than 1920 px scaled down), and the frames are served to `run_scrape` through
+`VideoSource.fetch` (they never leave the temp dir; each video's files are deleted when the next video starts).
+- Each frame's address is `<video file>?mt_frame=<seconds>` (a fragment would be dropped by `url_key`), its `page_url` is the video's
+  page, so `group_by=article` gives **one group per video**: frames of one video stay in one train/val/test split. Title = `<file> @ 12.0s`.
+- Consecutive frames of a slow scene are near-duplicates; `near_dup_distance` (default 5) drops them, so a still scene adds one picture.
+- Needs `ffmpeg` and `ffprobe` on the backend machine (`brew install ffmpeg`); the endpoint answers 503 when they are missing. **YouTube and
+  yt-dlp are deliberately not supported** (terms of service; the plan made video "only with the user's yes"). Commons footage found so far
+  is thin: the Geran-2 category holds a wreckage video (ground, tier C) and a border-guard night shoot that is mostly soldiers; an FPV video
+  shows a hexacopter *from the interceptor* (those frames are `multirotor`, not `interceptor`: the class is the aircraft the camera sees).
+- Verified: `tests/test_video.py` (17 tests, a real ffmpeg-made video served by a fake internet, mutation-checked) and once against the real
+  Commons Shahed video (40 frames in 8 s). tsc and `next lint` clean; the UI tab itself is not yet clicked through.
+
 ### 4.4 Dataset versions (`datasets.py`, `yolo_export.py`)
 A version freezes the **reviewed** images and their boxes (only `reviewed`/`auto_exact` boxes) into a `manifest.json` in
 storage; later edits or deletions never change it. Split is **grouped** (images from the same source page/video stay
@@ -253,6 +332,16 @@ ones: keys must match `datasets/<project id>-<20 hex>.zip` exactly (422 otherwis
 may still need is refused (409), and a storage failure is a 502, never silent. The versions themselves stay; the next RunPod run on one uploads
 its zip again (slow from this Mac). The UI: a checkbox per copy, "Select all but the newest" (keeps the newest copy that still has a version),
 and an inline confirm. Tested with a fake bucket and in the browser against a throwaway backend; **never run against the real bucket**.
+
+**Treating classes as one** (`merge_classes` on `POST /projects/{id}/datasets`, "Treat classes as one" on the Datasets form,
+`datasets.build_labels`): a version can give several project classes one label and one index (the merged label takes its first
+member's place, default name = members joined with `+`, or a name the person gives). The project's own labels and boxes are never
+changed; the version's `config.classes` (and so `data.yaml`, the per-class stats and the trained model's labels) hold the merged
+class, and `config.merged` records what was merged (absent when nothing was). Splits are balanced by the merged label. Refused (422):
+fewer than two different classes, a hard-negative or foreign class, a class in two groups, a name that clashes with another class.
+Purpose: the planned experiment "delta-wing + fixed-wing merged vs split" on one real-only validation set (one RunPod run each, about
+$0.5; confirm the cost with the user first). A model trained on a merged class has a label no project class is called, so the AI check
+leaves its detections of that label unmapped.
 
 ### 4.5 Training pipeline (`training.py`, `api/workers.py`, `agents/`)
 ```
@@ -452,7 +541,7 @@ editor (unsaved) like drawing would; Save / Accept & next persists them and `put
   *Measured on 886 human-boxed drone images (scratch scripts, not kept):* one generic phrase **"drone aircraft"** finds 90% of drones of 32+ px
   at score 0.10 and 82% at 0.25, but only 25% / 15% of the smaller ones (median drone here is 26 px), with 0.06 extra boxes per image at
   0.25 (some are real unlabelled drones). **It cannot tell our classes apart by name**: "quadcopter drone" found 8% of the multirotors and
-  called most of them fixed-wing / interceptor / shahed. So a box is filed under the class its picture is filed in, and the person corrects
+  called most of them fixed-wing / interceptor / shahed (now `delta-wing`). So a box is filed under the class its picture is filed in, and the person corrects
   it in review. Scores run low (median 0.35 even for 64+ px drones), hence the 25% default (the trained detector's default is 50%).
   Two things use it: **AI labelling with words** (mode "Draw boxes", pick the detector; boxes are `auto`, images stay pending; on 5 real
   images the SAM-refined boxes had IoU 0.88-0.97 with the human labels) and **"Look inside the negatives"** (mode `negatives`): for each
@@ -496,7 +585,7 @@ editor (unsaved) like drawing would; Save / Accept & next persists them and `put
 
 ### Data added after the handover snapshot (2026-10-21)
 The snapshot above is what `handover-data/` holds. On the owner's machine the project has since grown: more scraped images (hundreds
-reviewed, boxes started for `fixed-wing`, `shahed`, `vtol`, `interceptor`) and the **Anti-UAV** dataset imported as
+reviewed, boxes started for `fixed-wing`, `shahed` (renamed `delta-wing`), `vtol`, `interceptor`) and the **Anti-UAV** dataset imported as
 `imported/anti-uav` (4,859 reviewed `multirotor` images across 2,065 scenes, ~190 MB; CC BY 4.0, see `DATA_LICENSES.md`).
 The committed `handover-data/` was re-exported with `--include-imported` after that import, so it holds the *later* state too: a
 fresh clone plus `python -m scripts.bundle import` restores Anti-UAV with no re-download (the raw Roboflow export, 826 MB with
@@ -505,6 +594,29 @@ On 2026-10-24 a second import followed: **uav-annotated** (GKh, CC BY 4.0), 2,18
 of the live Roboflow dataset because its published versions have one class only. It is **not** in `handover-data/` or git (datasets are
 gitignored from that date); the raw export is in `backend/data/imports/uav-annotated-v1/`, and a backup of the database from just
 before the import is `backend/data/backups/pre-import-uav-annotated-20261024-172828.db`. `python -m scripts.import_yolo rollback --dataset uav-annotated` undoes it.
+
+### Data added by the 2026-10-25 overnight crawl (all pending, none reviewed)
+About 4,200 new pictures to review, in three classes (images / boxes drawn by YOLOE "drone aircraft", unconfirmed `auto`): `delta-wing`
+~1,640 (X-47B, Anka-3, Shahed/Geran, Harop, Taranis, nEUROn, RQ-170, Okhotnik, GJ-11, Zohd...), `fixed-wing` ~2,200 more (MQ-9, Ikhana, Altair,
+Raven, TB2, Akinci, Orlan, Lancet, Ukrainian recce types), `interceptor` ~520 (Sting, Anvil, P1-Sun, Bullet, Octopus: mostly product shots).
+Sources: Wikimedia Commons (files picked by title, `commons_pick`-style: include words flies/aerial/formation, exclude deck/crane/hangar/maintenance),
+news pages (TWZ, Aviationist, Daily Sabah, ...), 59 SerpAPI searches (162 left of the month on 2026-10-25), nothing from YouTube. 119 pictures from
+3D-model marketplaces (cgtrader, turbosquid, cults3d, renderhub, ebay...) and 25 plainly non-aircraft ones (sunflower fields, logos, explosions) were
+put into the Trash (restorable: Trash > Restore). Estimated usable (tier A/B) pictures, from CLIP zero-shot triage that is only ~70% precise
+(CLIP "in flight" count times 55-75% judged airborne on contact sheets): delta-wing ~210-290 (14-19% of the pending ones), fixed-wing ~330-450
+(15-21%), interceptor ~40-80 (8-15%). Box sizes are large (median ~30-40% of the short side against 4% for multirotor): small-target coverage is
+still missing and only video frames can supply it.
+
+Things to know when reviewing these: (1) the YOLOE boxes carry the **folder's class**, not what the object is (the interceptor folder holds
+Shahed shots, delta-wing holds F-16s and helicopters): change the box class in the review screen (saving as reviewed re-files the picture) or
+Reject. (2) Flying wings filed under `fixed-wing`: ZALA 421-16E (~104 pictures, SerpAPI job 90 + Commons) and probably Eleron-3SV (~66, job 92 +
+Commons job 34; Wikipedia gives the flying-wing layout only to the 3SW), one NASA Pathfinder picture; Leleka-100 and Furia are tailed (stay
+fixed-wing); Valkyrie, Orbiter, PD-2 not verified. Per `CLASSES.md` flying wings are delta-wing; nothing was re-filed overnight. (3) 171 pictures
+that an over-loose `near_dup_distance` (8) dropped were re-fetched without their source page (ids in `backend/data/reports/recovered-neardup-ids.json`);
+about 21 of them are copies of another picture (same photo recoloured/cropped), so 39 of them were put into their twin's split group by CLIP
+similarity (`backend/data/reports/tools/merge_copy_groups.py`, ids in `merged-copy-groups-old-keys.json`, they had no group key before). The CLIP
+scene scores of all 4,239 new pictures are in `backend/data/reports/clip-triage-2026-10-25.csv` (nothing in the app uses them). The full
+morning report is `backend/data/reports/overnight-2026-10-25.md` (`backend/data/reports/` is gitignored).
 
 ## 6. What has and hasn't been verified
 
@@ -564,6 +676,11 @@ In rough priority order:
 
 ## 8. Gotchas (each cost the previous session time)
 
+- **`near_dup_distance` above 4 throws away real pictures.** dHash is 64 bits of coarse gradients; at distance 5-8 unrelated pictures
+  collide (aerial and sky scenes especially), and `run_scrape` compares every new picture with *every* hash in the project (about 9,000
+  multirotor and Anti-UAV frames, not only its own class). Night of 2026-10-25: 39 SerpAPI jobs ran with 8 and dropped 334 pictures as
+  "near-duplicates"; re-fetching them showed 53% were not within 4 bits of anything (171 were recovered by a one-off script, without a
+  source page because dropped pictures never stored one). Keep the default 4. Real copies sit at 0-4.
 - **Never run tests against real data.** `tests/conftest.py` sets `MT_DATABASE_URL`, storage, and blank API keys *before*
   importing the app. A real uvicorn server runs the app's lifespan (creates tables, fails running jobs, starts the job
   worker), which once nearly ran against the real database. Keep that guard and use `lifespan="off"` in test servers.

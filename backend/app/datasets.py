@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
+from .grouping import series_group
 from .models import AnnotationStatus, DatasetVersion, DetClass, Image, Project, ReviewStatus, ScrapeRecord, Source
 from .storage import get_storage
 from .yolo_export import SPLITS
@@ -128,12 +129,60 @@ def preview(db: Session, project: Project, selection: Selection | None = None) -
             "boxes_per_class": {c.name: boxes.get(c.name, 0) for c in project.classes if c.is_trainable}}
 
 
+@dataclass(frozen=True)
+class Label:
+    """One class of a dataset version: a project class, or several project classes the version treats as one."""
+
+    name: str
+    members: tuple[str, ...]  # the project classes' names; more than one for a merged class
+
+
+def build_labels(classes: list[DetClass], merges: list[tuple[list[int], str | None]] | None = None) -> tuple[list[Label], dict[int, int]]:
+    """The classes a version trains, numbered 0..N-1 (as YOLO requires), and which of them each project class belongs to.
+
+    `merges` = [(class ids, name or None)]: the classes in a group share one label and one index. The merged label takes the
+    place of its first member in the project's class order; its default name joins the member names with "+".
+    Raises ValueError (message safe to show) for a group that does not make sense.
+    """
+    group_of: dict[int, int] = {}
+    by_id = {c.id: c for c in classes}
+    for g, (ids, _) in enumerate(merges or []):
+        if len(set(ids)) < 2:
+            raise ValueError("Pick at least two different classes to treat as one.")
+        for cid in ids:
+            if cid not in by_id:
+                raise ValueError(f"Class {cid} is not a drone class of this project (hard negatives and 'mixed' cannot be merged).")
+            if group_of.setdefault(cid, g) != g:
+                raise ValueError(f"'{by_id[cid].name}' is in two merged groups; each class can be in only one.")
+    labels: list[Label] = []
+    class_idx: dict[int, int] = {}
+    label_of_group: dict[int, int] = {}
+    for c in classes:
+        g = group_of.get(c.id)
+        if g is None:
+            class_idx[c.id] = len(labels)
+            labels.append(Label(c.name, (c.name,)))
+        elif g in label_of_group:
+            class_idx[c.id] = label_of_group[g]
+        else:
+            members = tuple(m.name for m in classes if group_of.get(m.id) == g)
+            label_of_group[g] = class_idx[c.id] = len(labels)
+            labels.append(Label((merges[g][1] if merges and merges[g][1] else "+".join(members)), members))
+    names = [lb.name for lb in labels]
+    for n in names:
+        if names.count(n) > 1:
+            raise ValueError(f"Two classes of this version would both be called '{n}'. Give the merged class another name.")
+    return labels, class_idx
+
+
 def create_version(db: Session, project: Project, name: str | None, val_ratio: float, test_ratio: float, seed: int,
-                   include_negatives: bool, selection: Selection | None = None) -> DatasetVersion:
+                   include_negatives: bool, selection: Selection | None = None,
+                   merges: list[tuple[list[int], str | None]] | None = None) -> DatasetVersion:
     """Snapshot the project (only the data in `selection`, all of it if None).
+    `merges` makes the version treat groups of classes as one (the project's own labels are untouched).
     Raises ValueError (message safe to show) if there is nothing usable to train on."""
     classes = sorted((c for c in project.classes if c.is_trainable), key=lambda c: c.index)
-    class_idx = {c.id: i for i, c in enumerate(classes)}  # contiguous 0..N-1, as YOLO requires
+    labels, class_idx = build_labels(classes, merges)
     by_id = {c.id: c for c in project.classes}
 
     images = db.scalars(select(Image).where(Image.project_id == project.id, Image.review_status == ReviewStatus.reviewed)
@@ -149,14 +198,15 @@ def create_version(db: Session, project: Project, name: str | None, val_ratio: f
         if cls.is_negative and not include_negatives:
             continue
         rec: ScrapeRecord | None = img.scrape_record
-        group = (rec.page_url if rec and rec.page_url else None) or img.group_key or f"image-{img.id}"
+        # A page is its own group, except a Wikimedia File: page, whose group is its photo series (near-identical frames of one sortie).
+        group = ((series_group(rec.page_url) or rec.page_url) if rec and rec.page_url else None) or img.group_key or f"image-{img.id}"
         boxes = [[class_idx[a.class_id], a.cx, a.cy, a.w, a.h] for a in img.annotations
                  if a.status in KEPT_BOX_STATUSES and a.class_id in class_idx]
         # Balance the split by what the boxes say the image shows, not by the class it happened to be filed under: a mixed
         # search filed under one class would otherwise leave the other classes' images to chance in val and test.
         if boxes:
             top = sorted(Counter(b[0] for b in boxes).items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
-            stratum = classes[top].name
+            stratum = labels[top].name
         else:
             stratum = NEGATIVE if cls.is_negative else cls.name
         items.append({
@@ -175,7 +225,7 @@ def create_version(db: Session, project: Project, name: str | None, val_ratio: f
     assign_splits(items, val_ratio, test_ratio, seed)
     for it in items:
         del it["stratum"]
-    stats = _stats(items, classes, db, project, not_selected)
+    stats = _stats(items, labels, db, project, not_selected)
     if stats["images"]["train"] == 0:
         raise ValueError("The train split would be empty; review more images.")
 
@@ -184,7 +234,10 @@ def create_version(db: Session, project: Project, name: str | None, val_ratio: f
                              config={"val_ratio": val_ratio, "test_ratio": test_ratio, "seed": seed, "include_negatives": include_negatives,
                                      "sources": sorted(selection.sources) if selection and selection.sources is not None else None,
                                      "imported_datasets": sorted(selection.imported) if selection and selection.imported is not None else None,
-                                     "classes": [{"index": i, "name": c.name} for i, c in enumerate(classes)]})
+                                     "classes": [{"index": i, "name": lb.name} for i, lb in enumerate(labels)],
+                                     # only when something was merged, so versions made without it keep exactly the config they always had
+                                     **({"merged": [{"name": lb.name, "classes": list(lb.members)} for lb in labels if len(lb.members) > 1]}
+                                        if any(len(lb.members) > 1 for lb in labels) else {})})
     db.add(version)
     db.flush()  # assigns the id used in the manifest path
     version.manifest_key = f"projects/{project.id}/datasets/{version.id}/manifest.json"
@@ -236,8 +289,8 @@ def load_manifest(version: DatasetVersion) -> dict:
     return json.loads(get_storage().get(version.manifest_key))
 
 
-def _stats(items: list[dict], classes: list[DetClass], db: Session, project: Project, not_selected: int = 0) -> dict:
-    names = [c.name for c in classes]
+def _stats(items: list[dict], labels: list[Label], db: Session, project: Project, not_selected: int = 0) -> dict:
+    names = [lb.name for lb in labels]
     images = {s: 0 for s in SPLITS}
     boxes = {s: 0 for s in SPLITS}
     per_class = {n: {s: {"images": 0, "boxes": 0} for s in SPLITS} for n in names}

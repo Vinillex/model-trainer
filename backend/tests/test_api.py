@@ -4,7 +4,7 @@ from .helpers import png
 def test_project_seeds_classes(client):
     p = client.post("/projects", json={"name": "drones"}).json()
     names = {c["name"]: c for c in p["classes"]}
-    assert names["multirotor"]["index"] == 0 and names["shahed"]["index"] == 2
+    assert names["multirotor"]["index"] == 0 and names["delta-wing"]["index"] == 2
     assert names["birds"]["is_negative"] and names["birds"]["index"] is None
     assert client.post("/projects", json={"name": "drones"}).status_code == 409
 
@@ -29,7 +29,7 @@ def test_upload_dedup_reject_and_stats(client):
     assert client.get(f"/images/{imgs[0]['id']}/file").headers["content-type"] == "image/png"
 
     stats = {s["class_name"]: s for s in client.get(f"/projects/{p['id']}/stats").json()}
-    assert stats["multirotor"]["uploaded"] == 2 and stats["shahed"]["uploaded"] == 0
+    assert stats["multirotor"]["uploaded"] == 2 and stats["delta-wing"]["uploaded"] == 0
 
     assert client.delete(f"/images/{imgs[0]['id']}").status_code == 204
     assert client.get(f"/images/{imgs[0]['id']}/file").status_code == 404
@@ -72,7 +72,7 @@ def test_annotations_roundtrip_and_review_state(client):
     assert neg["review_status"] == "reviewed"  # negatives need no boxes
 
     boxes = [{"class_id": ids["multirotor"], "cx": 0.5, "cy": 0.4, "w": 0.2, "h": 0.1},
-             {"class_id": ids["shahed"], "cx": 0.1, "cy": 0.1, "w": 0.2, "h": 0.2}]  # another type than the folder's
+             {"class_id": ids["delta-wing"], "cx": 0.1, "cy": 0.1, "w": 0.2, "h": 0.2}]  # another type than the folder's
     r = client.put(f"/images/{img['id']}/annotations", json={"boxes": boxes, "review_status": "reviewed"})
     assert r.status_code == 200
     body = r.json()

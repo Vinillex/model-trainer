@@ -1,3 +1,5 @@
+from urllib.parse import urlsplit
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -6,8 +8,9 @@ from ..config import settings
 from ..db import get_db
 from ..models import DetClass, Job, JobStatus, SearchLog
 from ..runpod_client import RunPodError, fetch_account as fetch_runpod_account
-from ..schemas import JobOut, RunPodAccount, ScrapeJobCreate, SearchHistory, SerpApiAccount
+from ..schemas import CollectJobCreate, JobOut, RunPodAccount, ScrapeJobCreate, SearchHistory, SerpApiAccount, VideoJobCreate
 from ..scrape import SearchError, fetch_account, normalize_query
+from ..video import ffmpeg_tools
 from .projects import get_project
 
 router = APIRouter(tags=["jobs"])
@@ -25,6 +28,44 @@ def create_scrape_job(project_id: int, body: ScrapeJobCreate, db: Session = Depe
         # Fail now rather than queue a job that is certain to fail.
         raise HTTPException(503, "SerpAPI is not configured: set MT_SERPAPI_KEY in backend/.env and restart the backend")
     job = Job(project_id=project_id, type="scrape", params={**body.model_dump(), "query": body.query.strip()})
+    db.add(job)
+    db.commit()
+    return job
+
+
+@router.post("/projects/{project_id}/jobs/collect-pages", response_model=JobOut, status_code=201)
+def create_collect_job(project_id: int, body: CollectJobCreate, db: Session = Depends(get_db)):
+    """Read the pictures off web pages. Needs no SerpAPI key; the pages and pictures are fetched politely (app/collect.py)."""
+    get_project(db, project_id)
+    cls = db.get(DetClass, body.class_id)
+    if cls is None or cls.project_id != project_id:
+        raise HTTPException(404, "class not found")
+    if cls.is_mixed:
+        raise HTTPException(422, "'mixed' is filled automatically when a reviewed image shows several classes; pick another class")
+    first = urlsplit(body.urls[0]).hostname
+    # `query` is what the provenance record of each picture keeps ("where did this come from"), as for a search.
+    label = f"pages: {first}" + (f" (+{len(body.urls) - 1} more)" if len(body.urls) > 1 else "")
+    job = Job(project_id=project_id, type="collect_pages", params={**body.model_dump(), "query": label[:300], "start_page": 0})
+    db.add(job)
+    db.commit()
+    return job
+
+
+@router.post("/projects/{project_id}/jobs/video-frames", response_model=JobOut, status_code=201)
+def create_video_job(project_id: int, body: VideoJobCreate, db: Session = Depends(get_db)):
+    """Cut still frames out of videos (Wikimedia Commons File: pages or direct video files). Needs ffmpeg on the server."""
+    get_project(db, project_id)
+    cls = db.get(DetClass, body.class_id)
+    if cls is None or cls.project_id != project_id:
+        raise HTTPException(404, "class not found")
+    if cls.is_mixed:
+        raise HTTPException(422, "'mixed' is filled automatically when a reviewed image shows several classes; pick another class")
+    if ffmpeg_tools() is None:
+        raise HTTPException(503, "ffmpeg is not installed on this machine: run `brew install ffmpeg` and restart the backend")
+    first = urlsplit(body.urls[0]).hostname
+    label = f"video: {first}" + (f" (+{len(body.urls) - 1} more)" if len(body.urls) > 1 else "")
+    job = Job(project_id=project_id, type="video_frames",
+              params={**body.model_dump(), "query": label[:300], "start_page": 0, "max_pages": len(body.urls), "group_by": "article"})
     db.add(job)
     db.commit()
     return job

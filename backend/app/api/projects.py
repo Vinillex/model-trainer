@@ -5,14 +5,15 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .. import refile
 from ..db import get_db
 from ..models import MIXED, Annotation, DetClass, Image, Job, JobStatus, Project, ReviewStatus
-from ..schemas import (NAME_PATTERN, BulkClassCreate, BulkClassResult, ClassCreate, ClassOut, ProjectCreate,
-                       ProjectOut, StatRow)
+from ..schemas import (NAME_PATTERN, BulkClassCreate, BulkClassResult, ClassCreate, ClassOut, ClassRename, ClassRenameOut,
+                       ProjectCreate, ProjectOut, StatRow)
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
-DEFAULT_CLASSES = ["multirotor", "fixed-wing", "shahed"]
+DEFAULT_CLASSES = ["multirotor", "fixed-wing", "delta-wing"]
 DEFAULT_NEGATIVES = ["birds", "aircraft", "helicopters", "balloons", "empty-sky"]
 
 
@@ -110,6 +111,33 @@ def create_classes_bulk(project_id: int, body: BulkClassCreate, db: Session = De
 
 def _count(n: int, one: str, many: str) -> str:
     return f"{n} {one if n == 1 else many}"
+
+
+@router.patch("/{project_id}/classes/{class_id}", response_model=ClassRenameOut)
+def rename_class(project_id: int, class_id: int, body: ClassRename, db: Session = Depends(get_db)):
+    """Rename a class (a drone class or a hard-negative one). Its images' files move to the folder of the new name, so this waits for any running
+    job. Existing dataset versions and trained models keep the old name in their own labels. Returns how many images moved."""
+    get_project(db, project_id)
+    cls = db.get(DetClass, class_id)
+    if cls is None or cls.project_id != project_id:
+        raise HTTPException(404, "class not found")
+    if cls.is_mixed:
+        raise HTTPException(422, "The mixed folder cannot be renamed: it is made by the app.")
+    if body.name == MIXED:
+        raise HTTPException(422, "'mixed' is reserved: it is the folder for reviewed images whose boxes show several classes")
+    if body.name == cls.name:
+        return ClassRenameOut(**ClassOut.model_validate(cls).model_dump(), moved=0)
+    if db.scalar(select(DetClass.id).where(DetClass.project_id == project_id, DetClass.name == body.name)):
+        raise HTTPException(409, f"A class named '{body.name}' already exists in this project.")
+    if db.scalar(select(Job.id).where(Job.project_id == project_id, Job.status.in_((JobStatus.queued, JobStatus.running))).limit(1)):
+        raise HTTPException(409, "A job is queued or running. Renaming moves image files, so wait for it to finish or cancel it first.")
+    try:
+        moved = refile.rename_class(db, cls, body.name)
+    except IntegrityError:
+        raise HTTPException(409, f"A class named '{body.name}' already exists in this project.")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"Nothing was changed: {e}")
+    return ClassRenameOut(**ClassOut.model_validate(cls).model_dump(), moved=moved)
 
 
 @router.delete("/{project_id}/classes/{class_id}", status_code=204)

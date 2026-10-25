@@ -181,13 +181,13 @@ def test_an_image_a_person_labels_while_the_models_run_is_left_alone(client, pro
 
     class Busy(FakeModels):
         def detect(self, img):                                                     # the person saves a box in the review screen mid-run
-            r = client.put(f"/images/{image}/annotations", json={"boxes": [{"class_id": ids["shahed"], "cx": 0.2, "cy": 0.2, "w": 0.1, "h": 0.1}]})
+            r = client.put(f"/images/{image}/annotations", json={"boxes": [{"class_id": ids["delta-wing"], "cx": 0.2, "cy": 0.2, "w": 0.1, "h": 0.1}]})
             assert r.status_code == 200
             return super().detect(img)
 
     service.set_models(Busy([det(BOX)]))
     _, progress, _ = start(client, pid)
-    assert [b[0] for b in boxes_of(client, image)] == [ids["shahed"]] and boxes_of(client, image)[0][1] == AnnotationStatus.reviewed
+    assert [b[0] for b in boxes_of(client, image)] == [ids["delta-wing"]] and boxes_of(client, image)[0][1] == AnnotationStatus.reviewed
     assert progress["skipped"] == 1 and progress["labelled"] == 0
 
 

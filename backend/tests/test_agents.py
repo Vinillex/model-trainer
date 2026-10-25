@@ -87,7 +87,7 @@ class FakeBackend:
         if self.export_fails:
             raise self.export_fails
         (run_dir / "packerOut.zip").write_bytes(b"PK-packer")
-        (run_dir / "labels.txt").write_text("multirotor\nfixed-wing\nshahed\n")
+        (run_dir / "labels.txt").write_text("multirotor\nfixed-wing\ndelta-wing\n")
         return run_dir / "packerOut.zip", run_dir / "labels.txt"
 
 

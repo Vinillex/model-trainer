@@ -18,7 +18,7 @@ from ..db import get_db
 from .. import datasets, imagehash, refile as refile_mod
 from ..models import AiDismissal, Annotation, DetClass, Image, ImageHash, ImportRecord, ManualCheck, ReviewStatus, Source, UploadRecord
 from ..refile import storage_key_for
-from ..schemas import FOLDER_PATTERN, FolderOut, ImageDetail, ImageIdsIn, ImageOut, ImportedDatasetOut, PurgeResult, RestoreResult, TrashDeleteIn, UploadResult
+from ..schemas import FOLDER_PATTERN, FolderOut, ImageCount, ImageDetail, ImageIdsIn, ImageOut, ImportedDatasetOut, PurgeResult, RestoreResult, TrashDeleteIn, UploadResult
 from ..storage import get_storage
 from .annotations import set_doubts_aside
 from .projects import get_project
@@ -126,24 +126,8 @@ def refile_images(project_id: int, dry_run: bool = True, db: Session = Depends(g
     return refile_mod.refile_project(db, project_id, dry_run)
 
 
-@router.get("/projects/{project_id}/images", response_model=list[ImageOut])
-def list_images(project_id: int, class_id: int | None = None, box_class_id: int | None = None, source: Source | None = None,
-                dataset: str | None = Query(None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$"), folder: str | None = Query(None, pattern=FOLDER_PATTERN),
-                manually_checked: bool | None = None, exclude_rejected: bool = False,
-                ai: str | None = Query(None, pattern="^(" + "|".join(AI_FILTER_VALUES) + ")$"),
-                review_status: ReviewStatus | None = None, limit: int = Query(50, le=500), offset: int = 0, db: Session = Depends(get_db)):
-    """`dataset` keeps only the images imported from that public dataset, so each one can be reviewed on its own.
-    `class_id` is the folder an image is filed under; `box_class_id` keeps the images that have at least one box of that class, wherever they are
-    filed (an image in the `mixed` folder has boxes of several classes), which is how to find what still uses a class.
-    `folder` keeps only the images uploaded in that folder.
-    `exclude_rejected` leaves out the trash (rejected images): the Images page and the review queue ask for it unless a review status is chosen.
-    `manually_checked` is a tag only imported images have: true = opened in the review window, false = imported but not yet.
-    `ai` filters on the AI check: unchecked, stale (boxes edited since), ok, flagged (suspect/missing/adjust that nobody has dismissed),
-    dismissed (flagged, but a person reviewed those boxes anyway), too_small or autolabelled (boxes drawn by the auto-label job, not yet confirmed)."""
-    get_project(db, project_id)
-    q = select(Image).where(Image.project_id == project_id).options(
-        selectinload(Image.import_record), selectinload(Image.upload_record), selectinload(Image.manual_check), selectinload(Image.ai_check), selectinload(Image.ai_dismissal),
-        selectinload(Image.annotations))
+def _filtered(q, class_id, box_class_id, source, dataset, folder, manually_checked, ai, review_status, exclude_rejected):
+    """The filters the Images page offers, applied to any select over `Image`: the list and its count share them, so they can't disagree."""
     if class_id is not None:
         q = q.where(Image.class_id == class_id)
     if box_class_id is not None:
@@ -164,7 +148,42 @@ def list_images(project_id: int, class_id: int | None = None, box_class_id: int 
         q = q.where(Image.review_status == review_status)
     elif exclude_rejected:
         q = q.where(Image.review_status != ReviewStatus.rejected)
+    return q
+
+
+@router.get("/projects/{project_id}/images", response_model=list[ImageOut])
+def list_images(project_id: int, class_id: int | None = None, box_class_id: int | None = None, source: Source | None = None,
+                dataset: str | None = Query(None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$"), folder: str | None = Query(None, pattern=FOLDER_PATTERN),
+                manually_checked: bool | None = None, exclude_rejected: bool = False,
+                ai: str | None = Query(None, pattern="^(" + "|".join(AI_FILTER_VALUES) + ")$"),
+                review_status: ReviewStatus | None = None, limit: int = Query(50, le=500), offset: int = 0, db: Session = Depends(get_db)):
+    """`dataset` keeps only the images imported from that public dataset, so each one can be reviewed on its own.
+    `class_id` is the folder an image is filed under; `box_class_id` keeps the images that have at least one box of that class, wherever they are
+    filed (an image in the `mixed` folder has boxes of several classes), which is how to find what still uses a class.
+    `folder` keeps only the images uploaded in that folder.
+    `exclude_rejected` leaves out the trash (rejected images): the Images page and the review queue ask for it unless a review status is chosen.
+    `manually_checked` is a tag only imported images have: true = opened in the review window, false = imported but not yet.
+    `ai` filters on the AI check: unchecked, stale (boxes edited since), ok, flagged (suspect/missing/adjust that nobody has dismissed),
+    dismissed (flagged, but a person reviewed those boxes anyway), too_small or autolabelled (boxes drawn by the auto-label job, not yet confirmed)."""
+    get_project(db, project_id)
+    q = select(Image).where(Image.project_id == project_id).options(
+        selectinload(Image.import_record), selectinload(Image.upload_record), selectinload(Image.manual_check), selectinload(Image.ai_check), selectinload(Image.ai_dismissal),
+        selectinload(Image.annotations))
+    q = _filtered(q, class_id, box_class_id, source, dataset, folder, manually_checked, ai, review_status, exclude_rejected)
     return db.scalars(q.order_by(Image.id.desc()).limit(limit).offset(offset)).all()
+
+
+@router.get("/projects/{project_id}/images/count", response_model=ImageCount)
+def count_images(project_id: int, class_id: int | None = None, box_class_id: int | None = None, source: Source | None = None,
+                 dataset: str | None = Query(None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$"), folder: str | None = Query(None, pattern=FOLDER_PATTERN),
+                 manually_checked: bool | None = None, exclude_rejected: bool = False,
+                 ai: str | None = Query(None, pattern="^(" + "|".join(AI_FILTER_VALUES) + ")$"),
+                 review_status: ReviewStatus | None = None, db: Session = Depends(get_db)):
+    """How many images `GET .../images` would list with the same filters (it takes no `limit` or `offset`)."""
+    get_project(db, project_id)
+    q = select(func.count(Image.id)).select_from(Image).where(Image.project_id == project_id)
+    q = _filtered(q, class_id, box_class_id, source, dataset, folder, manually_checked, ai, review_status, exclude_rejected)
+    return ImageCount(count=db.scalar(q) or 0)
 
 
 @router.get("/projects/{project_id}/folders", response_model=list[FolderOut])
