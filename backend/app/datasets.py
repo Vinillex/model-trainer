@@ -10,7 +10,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from .grouping import series_group
-from .models import AnnotationStatus, DatasetVersion, DetClass, Image, Project, ReviewStatus, ScrapeRecord, Source
+from .models import AnnotationStatus, DatasetVersion, DetClass, Image, ImageHash, Project, ReviewStatus, ScrapeRecord, Source
+from .similar import HASH_BITS, scene_groups, similar_to_skip
 from .storage import get_storage
 from .yolo_export import SPLITS
 
@@ -97,8 +98,9 @@ def assign_splits(items: list[dict], val_ratio: float, test_ratio: float, seed: 
             it["split"] = split_of[name]
 
 
-def preview(db: Session, project: Project, selection: Selection | None = None) -> dict:
-    """What a new version would contain right now, for the data chosen in `selection` (all of it if None)."""
+def preview(db: Session, project: Project, selection: Selection | None = None, skip_similar_pct: float | None = None) -> dict:
+    """What a new version would contain right now, for the data chosen in `selection` (all of it if None).
+    With `skip_similar_pct`, also how many repeats it would leave out (boxes compared by project class, before any merge)."""
     by_status = dict(db.execute(select(Image.review_status, func.count()).where(Image.project_id == project.id)
                                 .group_by(Image.review_status)).all())
     reviewed_all = db.scalars(select(Image).where(Image.project_id == project.id, Image.review_status == ReviewStatus.reviewed)
@@ -118,7 +120,13 @@ def preview(db: Session, project: Project, selection: Selection | None = None) -
         else:
             empty += 1
         boxes.update(names[a.class_id] for a in kept)
-    return {"reviewed_images": len(reviewed), "reviewed_with_boxes": with_boxes, "reviewed_empty": empty,
+    similar = None
+    if skip_similar_pct is not None:
+        trainable = {c.id for c in project.classes if c.is_trainable}
+        similar = len(similar_to_skip(
+            [(img.id, [[a.class_id, a.cx, a.cy, a.w, a.h] for a in img.annotations if a.status in KEPT_BOX_STATUSES and a.class_id in trainable])
+             for img in sorted(reviewed, key=lambda i: i.id)], _hashes(db, project.id), skip_similar_pct))
+    return {"reviewed_images": len(reviewed), "reviewed_with_boxes": with_boxes, "reviewed_empty": empty, "similar": similar,
             "negative_images": neg, "pending": by_status.get(ReviewStatus.pending, 0),
             "rejected": by_status.get(ReviewStatus.rejected, 0),
             "reviewed_total": len(reviewed_all), "not_selected": len(reviewed_all) - len(reviewed),
@@ -175,11 +183,19 @@ def build_labels(classes: list[DetClass], merges: list[tuple[list[int], str | No
     return labels, class_idx
 
 
+def _hashes(db: Session, project_id: int) -> dict[int, int]:
+    return {iid: int(h, 16) for iid, h in db.execute(select(ImageHash.image_id, ImageHash.dhash).join(Image)
+                                                     .where(Image.project_id == project_id))}
+
+
 def create_version(db: Session, project: Project, name: str | None, val_ratio: float, test_ratio: float, seed: int,
                    include_negatives: bool, selection: Selection | None = None,
-                   merges: list[tuple[list[int], str | None]] | None = None) -> DatasetVersion:
+                   merges: list[tuple[list[int], str | None]] | None = None, skip_similar_pct: float | None = None,
+                   group_scenes: bool = False) -> DatasetVersion:
     """Snapshot the project (only the data in `selection`, all of it if None).
     `merges` makes the version treat groups of classes as one (the project's own labels are untouched).
+    `skip_similar_pct` leaves out repeats of a scene whose boxes moved less than that % of the picture (similar.py); None keeps all.
+    `group_scenes` keeps look-alike scenes in one split, also across imported datasets (similar.scene_groups).
     Raises ValueError (message safe to show) if there is nothing usable to train on."""
     classes = sorted((c for c in project.classes if c.is_trainable), key=lambda c: c.index)
     labels, class_idx = build_labels(classes, merges)
@@ -221,11 +237,28 @@ def create_version(db: Session, project: Project, name: str | None, val_ratio: f
         raise ValueError("No reviewed images yet. Review some images first (pending and rejected images are never exported).")
     if not any(it["boxes"] for it in items):
         raise ValueError("None of the reviewed images has a box. Draw boxes in the review screen first.")
+    similar = 0
+    if skip_similar_pct is not None:
+        skip = similar_to_skip([(it["image_id"], it["boxes"]) for it in items], _hashes(db, project.id), skip_similar_pct)
+        items = [it for it in items if it["image_id"] not in skip]
+        similar = len(skip)
+    joined = 0
+    if group_scenes:
+        before = len({it["group"] for it in items})
+        scene_of = scene_groups([(it["image_id"], it["group"], it["dataset"] or it["source"], it["source"] == "imported") for it in items],
+                                _hashes(db, project.id))
+        for it in items:
+            it["group"] = scene_of[it["image_id"]]
+        joined = before - len({it["group"] for it in items})
 
     assign_splits(items, val_ratio, test_ratio, seed)
     for it in items:
         del it["stratum"]
     stats = _stats(items, labels, db, project, not_selected)
+    if skip_similar_pct is not None:
+        stats["excluded"]["similar"] = similar
+    if group_scenes:
+        stats["scene_groups_joined"] = joined
     if stats["images"]["train"] == 0:
         raise ValueError("The train split would be empty; review more images.")
 
@@ -237,7 +270,10 @@ def create_version(db: Session, project: Project, name: str | None, val_ratio: f
                                      "classes": [{"index": i, "name": lb.name} for i, lb in enumerate(labels)],
                                      # only when something was merged, so versions made without it keep exactly the config they always had
                                      **({"merged": [{"name": lb.name, "classes": list(lb.members)} for lb in labels if len(lb.members) > 1]}
-                                        if any(len(lb.members) > 1 for lb in labels) else {})})
+                                        if any(len(lb.members) > 1 for lb in labels) else {}),
+                                     **({"skip_similar": {"box_pct": skip_similar_pct, "hash_bits": HASH_BITS}}
+                                        if skip_similar_pct is not None else {}),
+                                     **({"group_scenes": {"hash_bits": HASH_BITS}} if group_scenes else {})})
     db.add(version)
     db.flush()  # assigns the id used in the manifest path
     version.manifest_key = f"projects/{project.id}/datasets/{version.id}/manifest.json"

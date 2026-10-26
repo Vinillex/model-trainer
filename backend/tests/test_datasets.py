@@ -4,8 +4,8 @@ from collections import defaultdict
 
 import pytest
 
-from app.datasets import assign_splits, split_quota
-from app.models import Image, ScrapeRecord, Source
+from app.datasets import assign_splits, load_manifest, split_quota
+from app.models import DatasetVersion, Image, ScrapeRecord, Source
 from app.storage import get_storage
 from app.yolo_export import SPLITS, data_yaml, label_text
 
@@ -412,3 +412,114 @@ def test_merging_is_refused_when_it_does_not_make_sense(client, project):
         if why:
             assert why in r.json()["detail"], (merge, r.json())
     assert client.get(f"/projects/{pid}/datasets").json() == []  # nothing half-made
+
+
+# ---------- leaving out similar pictures (same scene, boxes barely moved) ----------
+
+def test_similar_keeps_one_of_each_run_of_repeats_and_anything_that_moved():
+    from app.similar import similar_to_skip
+    scene, other = 0x0F0F0F0F0F0F0F0F, 0xF0F0F0F0F0F0F0F0
+    b = lambda cx, cy=0.5, w=0.05, h=0.05, c=0: [[c, cx, cy, w, h]]
+    items = [(1, b(0.50)), (2, b(0.52)), (3, b(0.53)),   # a run of repeats: the first stays
+             (4, b(0.80)),                               # same scene, drone moved 30%: kept
+             (5, b(0.50, w=0.2, h=0.2)),                 # same place but four times the size (zoomed): kept
+             (6, b(0.50, c=1)),                          # same place, another class: kept
+             (7, b(0.50) + b(0.2)),                      # an extra drone: kept
+             (8, []),                                    # no boxes (a negative): never compared
+             (9, b(0.50)),                               # repeat of 1 but in another scene: kept
+             (10, b(0.50))]                              # no fingerprint: kept
+    hashes = {i: scene for i in range(1, 9)} | {9: other}
+    hashes[3] = scene ^ 0b1111                           # 4 bits off is still the same scene
+    assert similar_to_skip(items, hashes, 5) == {2, 3}
+    assert similar_to_skip(items, hashes, 1) == set()     # tighter: 2% and 3% moves are real moves
+    assert similar_to_skip(items, {**hashes, 3: scene ^ 0b11111}, 5) == {2}  # 5 bits off: another scene
+
+
+def test_similar_compares_with_kept_images_only():
+    """A slow drift (0.50 -> 0.54 -> 0.58) must not erase the whole run: each image is compared with what was kept."""
+    from app.similar import similar_to_skip
+    items = [(i, [[0, 0.50 + 0.04 * (i - 1), 0.5, 0.05, 0.05]]) for i in (1, 2, 3)]
+    assert similar_to_skip(items, {1: 7, 2: 7, 3: 7}, 5) == {2}  # 3 is 8% from 1, the image it would repeat
+
+
+def _same_scene(client, image_ids, value=0x0123456789ABCDEF):
+    from app.models import ImageHash
+    with client.session_factory() as s:
+        for iid in image_ids:
+            s.get(ImageHash, iid).dhash = f"{value:016x}"
+        s.commit()
+
+
+def test_a_version_can_leave_out_similar_pictures(client, project):
+    pid, ids = project
+    mr = ids["multirotor"]
+    run = [add(client, pid, mr, [box(mr, 0.5 + d, 0.5)])["id"] for d in (0, 0.01, 0.02, 0.3)]  # three repeats, then a move
+    others = [add(client, pid, mr, [box(mr)])["id"] for _ in range(6)]
+    _same_scene(client, run)
+    assert client.get(f"/projects/{pid}/datasets/preview", params={"skip_similar_pct": 5}).json()["similar"] == 2
+    assert client.get(f"/projects/{pid}/datasets/preview").json()["similar"] is None
+
+    v = client.post(f"/projects/{pid}/datasets", json={"skip_similar": True, "similar_box_pct": 5}).json()
+    assert v["config"]["skip_similar"] == {"box_pct": 5.0, "hash_bits": 4}
+    assert v["stats"]["excluded"]["similar"] == 2
+    with client.session_factory() as s:
+        manifest = load_manifest(s.get(DatasetVersion, v["id"]))
+    assert {it["image_id"] for it in manifest["images"]} == {run[0], run[3], *others}
+    assert sum(v["stats"]["images"].values()) == 8
+    with client.session_factory() as s:  # nothing in the project changed
+        assert all(s.get(Image, i).review_status.value == "reviewed" for i in run)
+
+
+def test_versions_without_the_option_are_unchanged(client, project):
+    pid, ids = project
+    run = [add(client, pid, ids["multirotor"], [box(ids["multirotor"])])["id"] for _ in range(4)]
+    _same_scene(client, run)
+    v = client.post(f"/projects/{pid}/datasets", json={"similar_box_pct": 5}).json()  # the box alone does nothing
+    assert "skip_similar" not in v["config"] and "similar" not in v["stats"]["excluded"]
+    assert sum(v["stats"]["images"].values()) == 4
+
+
+@pytest.mark.parametrize("pct", [0, 0.4, 25.1, -1])
+def test_similar_distance_must_be_sensible(client, project, pct):
+    pid, ids = project
+    add(client, pid, ids["multirotor"], [box(ids["multirotor"])])
+    assert client.post(f"/projects/{pid}/datasets", json={"skip_similar": True, "similar_box_pct": pct}).status_code == 422
+    assert client.get(f"/projects/{pid}/datasets/preview", params={"skip_similar_pct": pct}).status_code == 422
+
+
+# ---------- keeping look-alike scenes in one split ----------
+
+def test_scene_groups_join_frames_of_one_scene_also_across_imported_datasets():
+    from app.similar import scene_groups
+    a, far = 0x00FF00FF00FF00FF, 0xFFFFFFFF00000000
+    items = [(1, "imported:anti-uav:scene-1", "anti-uav", True),
+             (2, "imported:cmy-uav:scene-9", "cmy-uav", True),     # the same video copied into another dataset
+             (3, "imported:anti-uav:scene-2", "anti-uav", True),   # drifted 3 bits from 2, 6 from 1: chains in through 2
+             (4, "scraped:page-a", "scraped", False),               # a look-alike sky on a web page: never joined with imports
+             (5, "scraped:page-b", "scraped", False),               # but joined with a scraped look-alike
+             (6, "imported:anti-uav:scene-7", "anti-uav", True),   # another scene
+             (7, "imported:anti-uav:scene-8", "anti-uav", True)]   # no hash: untouched
+    hashes = {1: a, 2: a ^ 0b111, 3: a ^ 0b111000, 4: a, 5: a ^ 0b1, 6: far}
+    g = scene_groups(items, hashes)
+    assert g[1] == g[2] == g[3]
+    assert g[4] == g[5] != g[1]
+    assert g[6] == "imported:anti-uav:scene-7" and g[7] == "imported:anti-uav:scene-8"
+    assert scene_groups(items, {**hashes, 2: a ^ (0b11111 << 20)})[2] != g[1]  # 5 bits from 1 (and 8 from 3): another scene
+
+
+def test_a_version_can_keep_look_alike_scenes_in_one_split(client, project):
+    pid, ids = project
+    mr = ids["multirotor"]
+    clip = [add(client, pid, mr, [box(mr, 0.2 + 0.1 * k)])["id"] for k in range(6)]  # six frames, each its own upload group
+    for _ in range(14):
+        add(client, pid, mr, [box(mr)])
+    _same_scene(client, clip)
+    v = client.post(f"/projects/{pid}/datasets", json={"group_scenes": True, "seed": 3}).json()
+    assert v["config"]["group_scenes"] == {"hash_bits": 4} and v["stats"]["scene_groups_joined"] == 5
+    with client.session_factory() as s:
+        manifest = load_manifest(s.get(DatasetVersion, v["id"]))
+    split = {it["image_id"]: it["split"] for it in manifest["images"]}
+    assert len({split[i] for i in clip}) == 1                       # the whole clip on one side
+    assert len({it["group"] for it in manifest["images"] if it["image_id"] in clip}) == 1
+    plain = client.post(f"/projects/{pid}/datasets", json={"seed": 3}).json()
+    assert "group_scenes" not in plain["config"] and "scene_groups_joined" not in plain["stats"]

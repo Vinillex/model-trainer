@@ -7,6 +7,8 @@ import {
   parseUtc,
   type ArtifactName,
   type DatasetVersion,
+  type ExportWhere,
+  type ImxTools,
   type RunStage,
   type TrainingRun,
   type WorkerInfo,
@@ -14,11 +16,12 @@ import {
 import { PiDisplayBar, usePiDisplay } from "@/components/PiDisplayBar";
 import { RunPodDialog, RunPodPanel } from "@/components/RunPodPanel";
 
-const ACTIVE: RunStage[] = ["queued", "training", "exporting", "awaiting_package", "packaging"];
+const ACTIVE: RunStage[] = ["queued", "training", "exporting", "awaiting_export", "awaiting_package", "packaging"];
 const STAGE_LABEL: Record<RunStage, string> = {
   queued: "Queued",
   training: "Training",
   exporting: "Exporting",
+  awaiting_export: "Export on Mac",
   awaiting_package: "Waiting for Pi",
   packaging: "Packaging",
   done: "Done",
@@ -29,6 +32,7 @@ const STAGE_COLOR: Record<RunStage, string> = {
   queued: "bg-neutral-500/20",
   training: "bg-blue-500/30",
   exporting: "bg-blue-500/30",
+  awaiting_export: "bg-blue-500/30",
   awaiting_package: "bg-neutral-500/20",
   packaging: "bg-blue-500/30",
   done: "bg-green-600/30",
@@ -46,20 +50,23 @@ const pct = (x: number | null | undefined) => (x == null ? "–" : (x * 100).toF
 const size = (n: number | null | undefined) => (n == null ? "" : n < 2 ** 20 ? ` (${Math.max(1, Math.round(n / 1024))} KB)` : ` (${(n / 2 ** 20).toFixed(1)} MB)`);
 
 /** The steps a run goes through, for the little progress trail. */
-function steps(exportImx: boolean): { stage: RunStage[]; label: string }[] {
+function steps(exportImx: boolean, onMac: boolean): { stage: RunStage[]; label: string }[] {
   const trail = [
     { stage: ["queued"] as RunStage[], label: "Queued" },
     { stage: ["training"] as RunStage[], label: "Train" },
   ];
   if (exportImx) {
-    trail.push({ stage: ["exporting"], label: "Export" }, { stage: ["awaiting_package", "packaging"], label: "Package (Pi)" });
+    trail.push(
+      { stage: ["exporting", "awaiting_export"], label: onMac ? "Export (Mac)" : "Export" },
+      { stage: ["awaiting_package", "packaging"], label: "Package (Pi)" },
+    );
   }
   trail.push({ stage: ["done"], label: "Done" });
   return trail;
 }
 
 function Trail({ run }: { run: TrainingRun }) {
-  const trail = steps(run.config.export_imx);
+  const trail = steps(run.config.export_imx, run.config.export_where === "mac");
   const current = trail.findIndex((s) => s.stage.includes(run.stage));
   return (
     <ol className="flex flex-wrap items-center gap-1 text-xs" aria-label="progress">
@@ -129,6 +136,69 @@ function WorkersBar({ workers }: { workers: WorkerInfo[] }) {
   );
 }
 
+/** The IMX500 export on this Mac needs its own Python with Sony's tools: set up once, after the person agrees to the download. */
+function ImxToolsBar({ projectId, needed }: { projectId: number; needed: boolean }) {
+  const [tools, setTools] = useState<ImxTools | null>(null);
+  const [asking, setAsking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(() => {
+    api.imxTools().then(setTools).catch((e) => setError(e.message));
+  }, []);
+  useEffect(load, [load]);
+  const running = tools?.setup && (tools.setup.status === "queued" || tools.setup.status === "running");
+  useEffect(() => {
+    if (!running) return;
+    const t = setInterval(load, 3000);
+    return () => clearInterval(t);
+  }, [running, load]);
+
+  async function setUp() {
+    setAsking(false);
+    setError(null);
+    try {
+      await api.setUpImxTools(projectId);
+      load();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  if (!tools || (tools.ready && !needed)) return null;
+  return (
+    <div className="space-y-1 text-sm text-neutral-500" data-testid="imx-tools">
+      {tools.ready ? (
+        <p>IMX500 export on this Mac: ready.</p>
+      ) : running ? (
+        <p>Setting up the IMX export tools… {tools.setup?.message}</p>
+      ) : (
+        <div className="flex flex-wrap items-center gap-3">
+          <span>
+            IMX500 export on this Mac: the export tools aren&apos;t set up yet.
+            {tools.setup?.status === "failed" && <span className="text-red-600"> The last setup failed: {tools.setup.error}</span>}
+          </span>
+          {asking ? (
+            <>
+              <span>Downloads about 1 GB (Python 3.11, PyTorch, Sony&apos;s converter) into {tools.path}. Continue?</span>
+              <button className="btn" onClick={setUp} data-testid="imx-tools-confirm">
+                Download and set up
+              </button>
+              <button className="btn" onClick={() => setAsking(false)}>
+                Not now
+              </button>
+            </>
+          ) : (
+            <button className="btn" onClick={() => setAsking(true)} data-testid="imx-tools-setup">
+              Set up the IMX export tools…
+            </button>
+          )}
+        </div>
+      )}
+      {tools.java == null || tools.java < 17 ? <p className="text-amber-500">Java 17 or newer is needed for the export (brew install openjdk@17).</p> : null}
+      {error && <p className="text-red-600">{error}</p>}
+    </div>
+  );
+}
+
 /** On every finished run: show its model live on the Pi's own screen (and stop it again). */
 function RunOnPiButton({ run, pi }: { run: TrainingRun; pi: ReturnType<typeof usePiDisplay> }) {
   const d = pi.display;
@@ -164,9 +234,21 @@ function RunCard({ run, datasetName, workers, onChanged, onRunPod, pi }: { run: 
   let note: string | null = null;
   if (run.cancel_requested && active) note = "Cancelling… the worker stops at its next check-in.";
   else if (run.stage === "queued") note = online("gpu") ? "Waiting for the GPU worker to pick it up." : "No GPU worker is online. Press Train on RunPod to rent one for this run.";
+  else if (run.stage === "awaiting_export")
+    note = run.error ? "Training is done and best.pt is safe. Fix the problem below, then press Export on this Mac." : "Training is done. Exporting for the IMX500 on this Mac (quantizing takes about 8 minutes)…";
   else if (run.stage === "awaiting_package") note = online("pi") ? "Waiting for the Raspberry Pi to pick it up." : "Training is done. Switch the Raspberry Pi on: it builds the .rpk by itself as soon as it connects.";
   else if (active && message && message !== "training") note = message; // the stage badge already says "Training"
   if (run.attempts > 0 && active) note = `${note ?? ""} (a worker was lost ${run.attempts}×; this run was re-queued)`.trim();
+
+  async function exportHere() {
+    setError(null);
+    try {
+      await api.exportOnMac(run.id);
+      onChanged();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
 
   async function act(kind: "cancel" | "delete") {
     setError(null);
@@ -207,6 +289,11 @@ function RunCard({ run, datasetName, workers, onChanged, onRunPod, pi }: { run: 
           ) : active ? (
             !run.cancel_requested && (
               <>
+                {run.stage === "awaiting_export" && run.error && (
+                  <button className="btn" onClick={exportHere} data-testid={`run-${run.id}-export`}>
+                    Export on this Mac
+                  </button>
+                )}
                 {run.stage === "queued" && !online("gpu") && (
                   <button className="btn" onClick={() => onRunPod(run)} data-testid={`run-${run.id}-runpod`}>
                     Train on RunPod…
@@ -220,6 +307,11 @@ function RunCard({ run, datasetName, workers, onChanged, onRunPod, pi }: { run: 
           ) : (
             <>
               {run.stage === "done" && <RunOnPiButton run={run} pi={pi} />}
+              {run.stage === "done" && run.artifacts.best_pt && (
+                <button className="btn" onClick={exportHere} title="Quantize best.pt for the IMX500 again on this Mac; the Pi then packages the new export" data-testid={`run-${run.id}-export`}>
+                  Export again on Mac
+                </button>
+              )}
               <button className="btn" onClick={() => setConfirm("delete")}>
                 Delete
               </button>
@@ -294,7 +386,7 @@ export default function TrainingPanel({ projectId, refreshKey }: { projectId: nu
   const [epochs, setEpochs] = useState(100);
   const [imgsz, setImgsz] = useState(640);
   const [batch, setBatch] = useState(16);
-  const [exportImx, setExportImx] = useState(true);
+  const [exportTo, setExportTo] = useState<ExportWhere | "none">("mac");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [runpodRun, setRunpodRun] = useState<TrainingRun | null>(null); // the run the RunPod dialog is open for
@@ -340,7 +432,15 @@ export default function TrainingPanel({ projectId, refreshKey }: { projectId: nu
     setBusy(true);
     setError(null);
     try {
-      await api.createTrainingRun(projectId, { dataset_id: datasetId, model, epochs, imgsz, batch, export_imx: exportImx });
+      await api.createTrainingRun(projectId, {
+        dataset_id: datasetId,
+        model,
+        epochs,
+        imgsz,
+        batch,
+        export_imx: exportTo !== "none",
+        export_where: exportTo === "pod" ? "pod" : "mac",
+      });
       await refresh();
     } catch (err) {
       setError((err as Error).message);
@@ -357,6 +457,7 @@ export default function TrainingPanel({ projectId, refreshKey }: { projectId: nu
       <WorkersBar workers={workers} />
       <PiDisplayBar pi={pi} />
       <RunPodPanel tick={runpodTick} onChanged={refresh} />
+      <ImxToolsBar projectId={projectId} needed={exportTo === "mac" || runs.some((r) => r.stage === "awaiting_export")} />
 
       {versions.length === 0 ? (
         <p className="text-sm text-neutral-500">Create a dataset version above first; a training run uses one frozen version.</p>
@@ -397,8 +498,13 @@ export default function TrainingPanel({ projectId, refreshKey }: { projectId: nu
             <span className="mb-1 block text-neutral-500">Batch</span>
             <input type="number" className={num} min={1} max={128} value={batch} onChange={(e) => setBatch(Number(e.target.value))} />
           </label>
-          <label className="flex items-center gap-1 pb-2">
-            <input type="checkbox" checked={exportImx} onChange={(e) => setExportImx(e.target.checked)} /> Export for IMX500 (.rpk)
+          <label>
+            <span className="mb-1 block text-neutral-500">Export for IMX500 (.rpk)</span>
+            <select className="input" value={exportTo} onChange={(e) => setExportTo(e.target.value as ExportWhere | "none")} data-testid="export-where">
+              <option value="mac">on this Mac, after training</option>
+              <option value="pod">on the GPU pod</option>
+              <option value="none">no export (best.pt only)</option>
+            </select>
           </label>
           <button className="btn" disabled={busy || datasetId === ""}>
             {busy ? "Starting…" : "Start training"}

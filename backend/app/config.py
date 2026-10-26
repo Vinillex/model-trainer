@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     # What the Pi's screen should show (app/pi_display.py): one small file, so it survives a backend restart.
     pi_display_file: str = "./data/pi_display.json"
 
+    # The IMX500 export on this Mac (app/imx_export.py): its own Python with the pinned export tools (env/), the uv that built it, and
+    # a work folder per export. About 1 GB, git-ignored with the rest of data/.
+    imx_export_dir: str = "./data/imx-export"
+
     # AI check (app/ai/): SAM 2.1 refines boxes, the trained YOLO is the detector. Needs `pip install -r requirements-ai.txt`; the weights live
     # under ai_dir (git-ignored with the rest of data/). Official weights names are downloaded there on first use: sam2.1_t.pt, _s.pt, _b.pt, _l.pt.
     ai_dir: str = "./data/ai"

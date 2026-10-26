@@ -38,7 +38,7 @@ CLAIM_TIMEOUT = 20 * 60  # seconds the pod gets to start up and pick the run up 
 POLL = 15  # seconds between looks at the pod and the run
 DELETE_TRIES = 8  # attempts to delete the pod, about a minute and a half in all
 API_PATIENCE = 10 * 60  # how long RunPod may be unreachable from this Mac before the pod is ended unseen
-ENDED = (RunStage.awaiting_package, RunStage.done, RunStage.failed, RunStage.cancelled)  # stages in which the GPU part is over
+ENDED = (RunStage.awaiting_export, RunStage.awaiting_package, RunStage.done, RunStage.failed, RunStage.cancelled)  # the GPU part is over
 STALL_TIMEOUT = 12 * 60  # a pod that has reported setup steps but then says nothing for this long is stuck in one
 CLAIM_CAP = 40 * 60  # the longest a pod may take to set up, however steadily it reports
 GRACE = 10 * 60  # how far past --max-hours this watcher waits for the pod's own time limit before ending it
@@ -232,7 +232,7 @@ def make_plan(args, d: Deps) -> Plan:
         version = db.get(DatasetVersion, run.dataset_id)
         images = sum((version.stats or {}).get("images", {}).values()) if version else 0
         run_id, run_name, dataset_id = run.id, run.name, run.dataset_id
-        export_imx = bool((run.config or {}).get("export_imx", True))
+        export_imx = bool(training.worker_config(run.config or {}).get("export_imx", True))  # False when the Mac exports
 
     cloud = args.cloud.upper()
     price_key = "secure_price" if cloud == "SECURE" else "community_price"

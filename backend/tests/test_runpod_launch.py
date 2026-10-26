@@ -427,6 +427,29 @@ def test_a_pod_that_vanishes_just_after_finishing_its_run_is_a_success(client, c
     assert "The GPU part of the run is over" in h.said and "did not finish" not in h.said
 
 
+def test_a_run_exported_on_the_mac_is_a_success_when_the_pod_has_only_trained(client, configured, ready, lan):  # noqa: F811
+    """Its pod ends at awaiting_export (the Mac exports next). Run 9's launcher said "did not finish" there: a false alarm."""
+    run_id = new_run(client, ready, export_where="mac")["id"]
+    claimed = []
+
+    def hook(_h):
+        if not claimed:
+            claimed.append(1)
+            assert claim(lan, name="runpod-pod").status_code == 200
+    h = Harness(client, on_sleep=hook)
+    look = h.api.get_pod
+
+    def get_pod(pod_id):
+        if claimed and h.api.pods:
+            assert lan.put(f"/workers/runs/{run_id}/artifacts/best_pt", content=b"weights", headers=hdr("runpod-pod")).status_code == 200
+            assert lan.post(f"/workers/runs/{run_id}/complete", json={}, headers=hdr("runpod-pod")).json()["stage"] == "awaiting_export"
+            h.api.pods.clear()
+        return look(pod_id)
+    h.api.get_pod = get_pod
+    assert cli.main(["launch", "--yes"], deps=h.deps) == 0
+    assert "The GPU part of the run is over" in h.said and "did not finish" not in h.said
+
+
 def test_the_time_limit_ends_a_run_that_never_finishes(client, configured, queued, lan):
     h = Harness(client, on_sleep=moves(lan, queued, {1: "claim"}))                          # claimed, then silence
     assert cli.main(["launch", "--yes", "--max-hours", "1"], deps=h.deps) == 1
@@ -781,8 +804,9 @@ def test_a_missing_converter_or_java_stops_the_pod_before_any_training_time_is_s
 
 
 def test_the_pod_is_told_whether_the_run_exports(client, configured, ready):
-    for export, flag in ((True, "1"), (False, "0")):
-        new_run(client, ready, export_imx=export)
+    # A run exported on this Mac afterwards must not make the pod install the export tools (minutes of paid setup for nothing).
+    for cfg, flag in (({"export_imx": True}, "1"), ({"export_imx": False}, "0"), ({"export_imx": True, "export_where": "mac"}, "0")):
+        new_run(client, ready, **cfg)
         h = Harness(client)
         assert cli.main(["launch", "--yes"], deps=h.deps) == 1                       # nobody claims it here; only the request matters
         assert h.api.created[0]["env"]["MT_PREP_IMX"] == flag

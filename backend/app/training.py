@@ -1,7 +1,8 @@
 """Training runs: the rules for who may do what to a run, and when.
 
 Stages: queued -> training -> exporting -> awaiting_package -> packaging -> done (or failed / cancelled).
-GPU workers do the first three; the Raspberry Pi does packaging. A worker holds a *lease* on its run and
+GPU workers do the first three; the Raspberry Pi does packaging. A run exported on this Mac (export_where "mac") goes
+queued -> training -> awaiting_export -> awaiting_package -> ...: the pod only trains, the backend's imx_export job exports. A worker holds a *lease* on its run and
 renews it with heartbeats; if it goes silent the run goes back in the queue (after MAX_ATTEMPTS it fails).
 """
 
@@ -47,6 +48,16 @@ def kind_of(stage: RunStage) -> str:
     return "gpu" if stage in GPU_STAGES else "pi"
 
 
+def exports_on_mac(config: dict) -> bool:
+    """The run's IMX export happens on this Mac after training (not on the GPU worker). Old runs have no export_where: pod."""
+    return bool(config.get("export_imx", True)) and config.get("export_where", "pod") == "mac"
+
+
+def worker_config(config: dict) -> dict:
+    """The run settings a GPU worker sees: a run exported on the Mac must not export (or install the export tools) on the pod."""
+    return {**config, "export_imx": False} if exports_on_mac(config) else config
+
+
 # ---------- creating, cancelling, deleting (the person using the UI) ----------
 
 def create_run(db: Session, project: Project, body: TrainingRunCreate) -> TrainingRun:
@@ -72,7 +83,7 @@ def create_run(db: Session, project: Project, body: TrainingRunCreate) -> Traini
 def cancel_run(db: Session, run: TrainingRun) -> TrainingRun:
     if run.stage in TERMINAL:
         raise ValueError(f"The run is already {run.stage.value}.")
-    if run.stage in (RunStage.queued, RunStage.awaiting_package):
+    if run.stage in (RunStage.queued, RunStage.awaiting_export, RunStage.awaiting_package):
         run.stage, run.finished_at = RunStage.cancelled, _now()  # nobody is working on it
     else:
         run.cancel_requested = True  # the worker learns on its next heartbeat
@@ -188,9 +199,9 @@ def store_artifact(db: Session, run_id: int, worker: str, name: str, data: bytes
 def complete(db: Session, run_id: int, worker: str, metrics: dict | None) -> TrainingRun:
     run = owned(db, run_id, worker)
     if run.stage in GPU_STAGES:
-        export = run.config.get("export_imx", True)
-        need = ["best_pt"] + (["imx_zip", "labels"] if export else [])
-        nxt = RunStage.awaiting_package if export else RunStage.done
+        export, on_mac = run.config.get("export_imx", True), exports_on_mac(run.config)
+        need = ["best_pt"] + (["imx_zip", "labels"] if export and not on_mac else [])
+        nxt = RunStage.awaiting_export if on_mac else RunStage.awaiting_package if export else RunStage.done
         run.metrics = metrics or {}
     else:
         need, nxt = ["rpk"], RunStage.done

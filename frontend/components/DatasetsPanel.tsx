@@ -5,6 +5,11 @@ import CloudCopies from "@/components/CloudCopies";
 import { SELECTABLE_SOURCES, api, datasetDownloadUrl, parseUtc, type DataSelection, type DatasetPreview, type DatasetVersion, type DetClass } from "@/lib/api";
 
 const SPLITS = ["train", "val", "test"] as const;
+const MAX_MERGE_ROWS = 5; // the backend allows up to 5 groups; each needs two classes, so the form shows (drone classes / 2) of them
+const SIMILAR_MIN = 0.5; // the backend's limits for "leave out similar pictures" (schemas.SIMILAR_PCT_MIN / MAX)
+const SIMILAR_MAX = 25;
+
+type MergeRow = { ids: Set<number>; name: string };
 
 function VersionCard({ v, onDeleted }: { v: DatasetVersion; onDeleted: () => void }) {
   const [confirming, setConfirming] = useState(false);
@@ -98,9 +103,20 @@ function VersionCard({ v, onDeleted }: { v: DatasetVersion; onDeleted: () => voi
       )}
       <p className="text-xs text-neutral-500">
         Left out: {st.excluded.pending} pending, {st.excluded.rejected} rejected
-        {(st.excluded.not_selected ?? 0) > 0 && <>, {st.excluded.not_selected!.toLocaleString()} reviewed but not selected</>}. Images from the same
+        {(st.excluded.not_selected ?? 0) > 0 && <>, {st.excluded.not_selected!.toLocaleString()} reviewed but not selected</>}
+        {v.config.skip_similar && (
+          <span data-testid={`dataset-${v.id}-similar`}>
+            , {(st.excluded.similar ?? 0).toLocaleString()} similar pictures (box moved under {v.config.skip_similar.box_pct} %)
+          </span>
+        )}
+        . Images from the same
         source page or scene always share a split.
       </p>
+      {v.config.group_scenes && (
+        <p className="text-xs text-neutral-500" data-testid={`dataset-${v.id}-scenes`}>
+          Look-alike scenes kept in one split ({(st.scene_groups_joined ?? 0).toLocaleString()} groups joined), so no test picture is a near-copy of a training one.
+        </p>
+      )}
       {st.warnings.length > 0 && (
         <ul className="list-disc space-y-0.5 pl-5 text-xs text-amber-500" data-testid="dataset-warnings">
           {st.warnings.map((w, i) => (
@@ -121,8 +137,11 @@ export default function DatasetsPanel({ projectId, classes, refreshKey }: { proj
   const [testPct, setTestPct] = useState(10);
   const [negatives, setNegatives] = useState(true);
   const [off, setOff] = useState<Set<string>>(new Set()); // data the person unticked: "source:scraped", "imported:anti-uav"
-  const [merge, setMerge] = useState<Set<number>>(new Set()); // classes this version should treat as one
-  const [mergeName, setMergeName] = useState("");
+  // Groups of classes this version should treat as one, each with its own (optional) new name; `rows` below shows the usable ones
+  const [merges, setMerges] = useState<MergeRow[]>(() => Array.from({ length: MAX_MERGE_ROWS }, () => ({ ids: new Set<number>(), name: "" })));
+  const [skipSimilar, setSkipSimilar] = useState(false);
+  const [similarPct, setSimilarPct] = useState(5);
+  const [groupScenes, setGroupScenes] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -133,12 +152,14 @@ export default function DatasetsPanel({ projectId, classes, refreshKey }: { proj
         imported: preview.available.imported_datasets.map((d) => d.name).filter((n) => !off.has(`imported:${n}`)),
       }
     : undefined;
-  const selectionKey = JSON.stringify(selection ?? null);
-  const selectionRef = useRef(selection);
-  selectionRef.current = selection;
+  const similarOk = similarPct >= SIMILAR_MIN && similarPct <= SIMILAR_MAX;
+  const similarAsked = skipSimilar && similarOk ? similarPct : undefined;
+  const selectionKey = JSON.stringify([selection ?? null, similarAsked ?? null]);
+  const selectionRef = useRef({ selection, similarAsked });
+  selectionRef.current = { selection, similarAsked };
 
   const loadPreview = useCallback(() => {
-    api.datasetPreview(projectId, selectionRef.current).then(setPreview).catch((e) => setError(e.message));
+    api.datasetPreview(projectId, selectionRef.current.selection, selectionRef.current.similarAsked).then(setPreview).catch((e) => setError(e.message));
   }, [projectId]);
   const loadVersions = useCallback(() => {
     api.listDatasets(projectId).then(setVersions).catch((e) => setError(e.message));
@@ -157,20 +178,29 @@ export default function DatasetsPanel({ projectId, classes, refreshKey }: { proj
       return next;
     });
 
-  const toggleMerge = (id: number) =>
-    setMerge((prev) => {
-      const next = new Set(prev);
-      if (!next.delete(id)) next.add(id);
-      return next;
+  const updateMerge = (row: number, change: (m: MergeRow) => MergeRow) => setMerges((prev) => prev.map((m, i) => (i === row ? change(m) : m)));
+  const toggleMerge = (row: number, id: number) =>
+    updateMerge(row, (m) => {
+      const ids = new Set(m.ids);
+      if (!ids.delete(id)) ids.add(id);
+      return { ...m, ids };
     });
   const drone = classes.filter((c) => !c.is_negative && !c.is_mixed);
-  const picked = drone.filter((c) => merge.has(c.id));
-  const mergeNameOk = mergeName.trim() === "" || /^[a-z0-9][a-z0-9_-]*$/.test(mergeName.trim());
+  const rows = merges.slice(0, Math.min(MAX_MERGE_ROWS, Math.floor(drone.length / 2))); // 4 classes: 2 groups, 6: 3, ...
+  const picked = rows.map((m) => drone.filter((c) => m.ids.has(c.id)));
+  const nameOk = (n: string) => n.trim() === "" || /^[a-z0-9][a-z0-9_-]*$/.test(n.trim());
 
   async function create(e: React.FormEvent) {
     e.preventDefault();
-    if (picked.length === 1 || !mergeNameOk) {
-      setError(picked.length === 1 ? "Tick at least two classes to treat as one, or none." : "The merged class name uses lowercase letters, digits, - and _.");
+    const problem = picked.some((p) => p.length === 1)
+      ? "Tick at least two classes in a “treat as one” row, or none."
+      : rows.some((m) => !nameOk(m.name))
+        ? "A merged class name uses lowercase letters, digits, - and _."
+        : skipSimilar && !similarOk
+          ? `The distance for similar pictures must be between ${SIMILAR_MIN} and ${SIMILAR_MAX} %.`
+          : null;
+    if (problem) {
+      setError(problem);
       return;
     }
     setBusy(true);
@@ -183,7 +213,11 @@ export default function DatasetsPanel({ projectId, classes, refreshKey }: { proj
         include_negatives: negatives,
         sources: selection?.sources,
         imported_datasets: selection?.imported,
-        merge_classes: picked.length >= 2 ? [{ class_ids: picked.map((c) => c.id), name: mergeName.trim() || undefined }] : undefined,
+        merge_classes: rows
+          .map((m, i) => ({ class_ids: picked[i].map((c) => c.id), name: m.name.trim() || undefined }))
+          .filter((m) => m.class_ids.length >= 2),
+        ...(skipSimilar ? { skip_similar: true, similar_box_pct: similarPct } : {}),
+        group_scenes: groupScenes,
       });
       setName("");
       load();
@@ -256,24 +290,81 @@ export default function DatasetsPanel({ projectId, classes, refreshKey }: { proj
             )}
           </fieldset>
         )}
+        <fieldset className="basis-full space-y-1" data-testid="scene-picker">
+          <legend className="mb-1 text-neutral-500">Train / test separation</legend>
+          <label className="flex items-center gap-1">
+            <input type="checkbox" checked={groupScenes} onChange={(e) => setGroupScenes(e.target.checked)} data-testid="group-scenes" /> Keep look-alike scenes in
+            the same split (recommended)
+          </label>
+          <p className="text-xs text-neutral-500">
+            Frames of one video can sit in two imported datasets (cmy-uav copies Anti-UAV&apos;s videos) or in different scene groups. Without this, a test picture
+            can be a near-copy of a training picture and the scores look better than they are. Your scraped pictures are only joined with each other.
+          </p>
+        </fieldset>
+        <fieldset className="basis-full space-y-1" data-testid="similar-picker">
+          <legend className="mb-1 text-neutral-500">Similar pictures (optional)</legend>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <label className="flex items-center gap-1">
+              <input type="checkbox" checked={skipSimilar} onChange={(e) => setSkipSimilar(e.target.checked)} data-testid="skip-similar" /> Leave out similar pictures: same scene, drone
+              box moved less than
+            </label>
+            <label className="flex items-center gap-1">
+              <input
+                type="number"
+                className={`input w-20 ${skipSimilar && !similarOk ? "border-red-500" : ""}`}
+                min={SIMILAR_MIN}
+                max={SIMILAR_MAX}
+                step={0.5}
+                value={similarPct}
+                onChange={(e) => setSimilarPct(Number(e.target.value))}
+                disabled={!skipSimilar}
+                data-testid="similar-pct"
+              />
+              % of the picture
+            </label>
+            {skipSimilar && preview?.similar != null && (
+              <span className="font-medium" data-testid="similar-count">
+                {preview.similar.toLocaleString()} pictures would be left out
+              </span>
+            )}
+          </div>
+          <p className="text-xs text-neutral-500">
+            One picture of each run of repeats is kept (the first). Compared by the picture&apos;s fingerprint and where its boxes are, so the same scene with the
+            drone somewhere else stays in. Pictures without boxes are always kept. Nothing in your project changes.
+          </p>
+        </fieldset>
         {drone.length >= 2 && (
           <fieldset className="basis-full space-y-1" data-testid="merge-picker">
             <legend className="mb-1 text-neutral-500">Treat classes as one (optional)</legend>
-            <div className="flex flex-wrap items-center gap-x-5 gap-y-1">
-              {drone.map((c) => (
-                <label key={c.id} className="flex items-center gap-1">
-                  <input type="checkbox" checked={merge.has(c.id)} onChange={() => toggleMerge(c.id)} data-testid={`merge-${c.name}`} /> {c.name}
-                </label>
-              ))}
-              {picked.length >= 2 && (
-                <label className="flex items-center gap-1">
-                  <span className="text-neutral-500">called</span>
-                  <input className="input w-44" placeholder={picked.map((c) => c.name).join("+")} value={mergeName} onChange={(e) => setMergeName(e.target.value)} maxLength={64} data-testid="merge-name" />
-                </label>
-              )}
-            </div>
+            {rows.map((m, row) => (
+              <div key={row} className="flex flex-wrap items-center gap-x-5 gap-y-1" data-testid={`merge-row-${row}`}>
+                <span className="w-16 text-neutral-500">Group {row + 1}</span>
+                {drone.map((c) => {
+                  const elsewhere = rows.some((o, j) => j !== row && o.ids.has(c.id)); // a class can be in one group only
+                  return (
+                    <label key={c.id} className={`flex items-center gap-1 ${elsewhere ? "text-neutral-500" : ""}`}>
+                      <input type="checkbox" checked={m.ids.has(c.id)} disabled={elsewhere} onChange={() => toggleMerge(row, c.id)} data-testid={`merge-${row}-${c.name}`} /> {c.name}
+                    </label>
+                  );
+                })}
+                {picked[row].length >= 2 && (
+                  <label className="flex items-center gap-1">
+                    <span className="text-neutral-500">new label</span>
+                    <input
+                      className={`input w-44 ${nameOk(m.name) ? "" : "border-red-500"}`}
+                      placeholder={picked[row].map((c) => c.name).join("+")}
+                      value={m.name}
+                      onChange={(e) => updateMerge(row, (x) => ({ ...x, name: e.target.value }))}
+                      maxLength={64}
+                      data-testid={`merge-name-${row}`}
+                    />
+                  </label>
+                )}
+              </div>
+            ))}
             <p className="text-xs text-neutral-500">
-              This version trains one class for the ticked ones, e.g. fixed-wing and delta-wing as one. Your labels and boxes are not changed; make another version without it to compare the two.
+              Each group trains as one class under its new label, e.g. multirotor + interceptor as “rotor” and fixed-wing + delta-wing as “wing”. Your labels
+              and boxes are not changed; make another version without it to compare.
             </p>
           </fieldset>
         )}

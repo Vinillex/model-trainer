@@ -411,6 +411,9 @@ class RunPodAccount(BaseModel):
     pod_count: int
 
 
+SIMILAR_PCT_MIN, SIMILAR_PCT_MAX = 0.5, 25.0  # "leave out similar pictures": how far a box may move, % of the picture
+
+
 class ClassMerge(BaseModel):
     """Classes a dataset version treats as one: its labels use a single class (and index) for all of them."""
 
@@ -428,6 +431,9 @@ class DatasetCreate(BaseModel):
     sources: list[Literal["uploaded", "scraped", "generated"]] | None = None
     imported_datasets: list[str] | None = Field(None, max_length=100)
     merge_classes: list[ClassMerge] = Field(default_factory=list, max_length=5)  # the project's own labels are not changed
+    skip_similar: bool = False  # leave out repeats: same scene (dHash) with the boxes nearly where they were (similar.py)
+    similar_box_pct: float = Field(5.0, ge=SIMILAR_PCT_MIN, le=SIMILAR_PCT_MAX)  # how far a box may move, % of the picture
+    group_scenes: bool = False  # keep look-alike scenes (also across imported datasets) in one split: no train/test leak
 
     @field_validator("imported_datasets")
     @classmethod
@@ -486,6 +492,9 @@ class TrainingRunCreate(BaseModel):
     imgsz: int = Field(640, ge=320, le=640, multiple_of=32)  # the IMX500 takes up to 640x640
     batch: int = Field(16, ge=1, le=128)
     export_imx: bool = True  # False: stop after training and keep best.pt only
+    # Where the IMX export runs: on this Mac after the pod has gone (the default), or on the pod as before. Runs created
+    # before this setting existed have no key and export on the pod (training.exports_on_mac).
+    export_where: Literal["mac", "pod"] = "mac"
 
 
 class TrainingRunOut(BaseModel):

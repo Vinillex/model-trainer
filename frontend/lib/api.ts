@@ -293,6 +293,7 @@ export interface DatasetPreview {
   /** Everything that can be chosen, with its number of reviewed images. */
   available: { sources: Record<SelectableSource, number>; imported_datasets: { name: string; reviewed: number }[] };
   boxes_per_class: Record<string, number>;
+  similar: number | null; // repeats "leave out similar pictures" would drop; null when it wasn't asked for
 }
 
 type SplitName = "train" | "val" | "test";
@@ -327,19 +328,25 @@ export interface DatasetVersion {
     imported_datasets?: string[] | null;
     classes: { index: number; name: string }[];
     merged?: { name: string; classes: string[] }[]; // classes this version treats as one (absent when nothing was merged)
+    skip_similar?: { box_pct: number; hash_bits: number }; // absent when similar pictures were kept
+    group_scenes?: { hash_bits: number }; // look-alike scenes kept in one split (absent when off)
   };
   stats: {
     images: Record<SplitName, number>;
     boxes: Record<SplitName, number>;
     background_images: Partial<Record<SplitName, number>>;
     per_class: Record<string, Record<SplitName, { images: number; boxes: number }>>;
-    excluded: { pending: number; rejected: number; not_selected?: number };
+    excluded: { pending: number; rejected: number; not_selected?: number; similar?: number };
     by_source?: Record<string, number>; // "scraped", "uploaded", "imported:<dataset>"
+    scene_groups_joined?: number;
     warnings: string[];
   };
 }
 
-export type RunStage = "queued" | "training" | "exporting" | "awaiting_package" | "packaging" | "done" | "failed" | "cancelled";
+export type RunStage = "queued" | "training" | "exporting" | "awaiting_export" | "awaiting_package" | "packaging" | "done" | "failed" | "cancelled";
+
+/** Where a run's IMX500 export happens: on this Mac after the pod has gone, or on the pod. Runs made before the choice existed have none (pod). */
+export type ExportWhere = "mac" | "pod";
 
 export interface RunMetrics {
   precision?: number | null;
@@ -353,7 +360,7 @@ export interface TrainingRun {
   project_id: number;
   dataset_id: number;
   name: string;
-  config: { model: string; epochs: number; imgsz: number; batch: number; export_imx: boolean };
+  config: { model: string; epochs: number; imgsz: number; batch: number; export_imx: boolean; export_where?: ExportWhere };
   stage: RunStage;
   progress: RunMetrics & { message?: string; epoch?: number; epochs?: number };
   metrics: RunMetrics & { per_class?: Record<string, { ap50: number | null; ap50_95: number | null }> };
@@ -376,6 +383,15 @@ export interface TrainingParams {
   imgsz: number;
   batch: number;
   export_imx: boolean;
+  export_where: ExportWhere;
+}
+
+/** The IMX500 export tools on this Mac (their own Python, set up once by a button) and how the latest setup went. */
+export interface ImxTools {
+  ready: boolean;
+  java: number | null; // Java's major version; Sony's converter needs 17+
+  path: string;
+  setup: { job_id: number; status: JobStatus; message: string | null; error: string | null } | null;
 }
 
 export interface WorkerInfo {
@@ -577,11 +593,12 @@ export const api = {
   aiPreview: (projectId: number, p: AiJobParams) => req<{ count: number }>(`/projects/${projectId}/jobs/ai-check/preview`, json("POST", p)),
   createAiJob: (projectId: number, p: AiJobParams) => req<Job>(`/projects/${projectId}/jobs/ai-check`, json("POST", p)),
   cancelJob: (id: number) => req<Job>(`/jobs/${id}/cancel`, { method: "POST" }),
-  datasetPreview: (projectId: number, sel?: DataSelection) =>
-    req<DatasetPreview>(
-      `/projects/${projectId}/datasets/preview` +
-        (sel ? `?${new URLSearchParams({ sources: sel.sources.join(","), imported: sel.imported.join(",") })}` : ""),
-    ),
+  datasetPreview: (projectId: number, sel?: DataSelection, skipSimilarPct?: number) => {
+    const q = new URLSearchParams(sel ? { sources: sel.sources.join(","), imported: sel.imported.join(",") } : {});
+    if (skipSimilarPct !== undefined) q.set("skip_similar_pct", String(skipSimilarPct));
+    const qs = q.toString();
+    return req<DatasetPreview>(`/projects/${projectId}/datasets/preview${qs ? `?${qs}` : ""}`);
+  },
   listDatasets: (projectId: number) => req<DatasetVersion[]>(`/projects/${projectId}/datasets`),
   createDataset: (
     projectId: number,
@@ -593,6 +610,9 @@ export const api = {
       sources?: SelectableSource[];
       imported_datasets?: string[];
       merge_classes?: { class_ids: number[]; name?: string }[]; // the version treats each group as one class; the project's labels are unchanged
+      skip_similar?: boolean; // leave out repeats: same scene, boxes moved less than similar_box_pct % of the picture
+      similar_box_pct?: number;
+      group_scenes?: boolean; // keep look-alike scenes (also across imported datasets) in one split
     },
   ) =>
     req<DatasetVersion>(`/projects/${projectId}/datasets`, json("POST", body)),
@@ -605,6 +625,11 @@ export const api = {
   listTrainingRuns: (projectId: number) => req<TrainingRun[]>(`/projects/${projectId}/training-runs`),
   cancelTrainingRun: (id: number) => req<TrainingRun>(`/training-runs/${id}/cancel`, { method: "POST" }),
   deleteTrainingRun: (id: number) => req<void>(`/training-runs/${id}`, { method: "DELETE" }),
+  /** Export a trained run for the IMX500 on this Mac (a job); also the retry after a failed export. */
+  exportOnMac: (id: number) => req<Job>(`/training-runs/${id}/export-imx`, { method: "POST" }),
+  imxTools: () => req<ImxTools>("/imx-tools"),
+  /** Downloads about 1 GB: only after the person has confirmed. */
+  setUpImxTools: (projectId: number) => req<Job>(`/projects/${projectId}/imx-tools/setup`, { method: "POST" }),
   trainingWorkers: () => req<WorkerInfo[]>("/training-workers"),
   piDisplay: () => req<PiDisplay>("/pi-display"),
   // These switch the Pi's camera and screen on: the header makes the browser ask the backend's CORS allow-list first.

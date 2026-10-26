@@ -337,6 +337,7 @@ class RunStage(str, enum.Enum):
     queued = "queued"  # waiting for a GPU worker
     training = "training"
     exporting = "exporting"  # Ultralytics format="imx": quantize + convert
+    awaiting_export = "awaiting_export"  # trained on a pod; the IMX export runs on this Mac (job imx_export, app/imx_export.py)
     awaiting_package = "awaiting_package"  # waiting for the Raspberry Pi to build the .rpk
     packaging = "packaging"
     done = "done"

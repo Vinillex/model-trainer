@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .ai.job import handle_ai_check
 from .db import SessionLocal
+from .imx_export import handle_export, handle_tools_setup
 from .models import Job, JobStatus
 from .collect import handle_collect
 from .scrape import handle_scrape
@@ -22,6 +23,8 @@ HANDLERS: dict[str, Callable[[Session, Job], None]] = {
     "collect_pages": handle_collect,
     "video_frames": handle_video,
     "ai_check": handle_ai_check,
+    "imx_tools_setup": handle_tools_setup,  # the IMX export on this Mac (app/imx_export.py)
+    "imx_export": handle_export,
 }
 
 

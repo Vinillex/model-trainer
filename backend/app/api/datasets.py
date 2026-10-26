@@ -1,7 +1,7 @@
 import os
 import re
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -11,7 +11,7 @@ from starlette.background import BackgroundTask
 from .. import dataset_bucket, datasets
 from ..db import get_db
 from ..models import DatasetVersion, RunStage, TrainingRun
-from ..schemas import CloudCopiesOut, CloudCopyOut, CloudDeleteIn, CloudDeleteOut, DatasetCreate, DatasetOut
+from ..schemas import SIMILAR_PCT_MAX, SIMILAR_PCT_MIN, CloudCopiesOut, CloudCopyOut, CloudDeleteIn, CloudDeleteOut, DatasetCreate, DatasetOut
 from ..storage import get_storage
 from ..yolo_export import MissingImages, make_zip_file
 from .projects import get_project
@@ -37,13 +37,15 @@ def _csv(value: str | None, allowed: tuple[str, ...] | None = None) -> frozenset
 
 
 @router.get("/projects/{project_id}/datasets/preview")
-def dataset_preview(project_id: int, sources: str | None = None, imported: str | None = None, db: Session = Depends(get_db)):
+def dataset_preview(project_id: int, sources: str | None = None, imported: str | None = None,
+                    skip_similar_pct: float | None = Query(None, ge=SIMILAR_PCT_MIN, le=SIMILAR_PCT_MAX), db: Session = Depends(get_db)):
     """What a dataset created right now would contain, and what would be left out.
 
     `sources` (comma-separated: uploaded, scraped, generated) and `imported` (comma-separated imported dataset names)
-    choose the data; leave one out for "all of it", pass it empty for "none of it"."""
+    choose the data; leave one out for "all of it", pass it empty for "none of it". `skip_similar_pct` also counts the
+    repeats that "leave out similar pictures" would drop."""
     selection = datasets.Selection(_csv(sources, datasets.SELECTABLE_SOURCES), _csv(imported))
-    return datasets.preview(db, get_project(db, project_id), selection)
+    return datasets.preview(db, get_project(db, project_id), selection, skip_similar_pct)
 
 
 @router.post("/projects/{project_id}/datasets", response_model=DatasetOut, status_code=201)
@@ -53,7 +55,8 @@ def create_dataset(project_id: int, body: DatasetCreate, db: Session = Depends(g
         selection = datasets.Selection(frozenset(body.sources) if body.sources is not None else None,
                                        frozenset(body.imported_datasets) if body.imported_datasets is not None else None)
         version = datasets.create_version(db, project, body.name, body.val_ratio, body.test_ratio, body.seed, body.include_negatives,
-                                          selection, [(m.class_ids, m.name) for m in body.merge_classes])
+                                          selection, [(m.class_ids, m.name) for m in body.merge_classes],
+                                          body.similar_box_pct if body.skip_similar else None, body.group_scenes)
         db.commit()
     except ValueError as e:
         db.rollback()

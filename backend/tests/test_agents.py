@@ -56,7 +56,7 @@ def run_id(client):
     p = client.post("/projects", json={"name": "drones"}).json()
     populate(client, p["id"], {c["name"]: c["id"] for c in p["classes"]})
     did = client.post(f"/projects/{p['id']}/datasets", json={}).json()["id"]
-    return client.post(f"/projects/{p['id']}/training-runs", json={"dataset_id": did, "epochs": 3}).json()["id"]
+    return client.post(f"/projects/{p['id']}/training-runs", json={"dataset_id": did, "epochs": 3, "export_where": "pod"}).json()["id"]
 
 
 class FakeBackend:

@@ -341,12 +341,33 @@ class, and `config.merged` records what was merged (absent when nothing was). Sp
 fewer than two different classes, a hard-negative or foreign class, a class in two groups, a name that clashes with another class.
 Purpose: the planned experiment "delta-wing + fixed-wing merged vs split" on one real-only validation set (one RunPod run each, about
 $0.5; confirm the cost with the user first). A model trained on a merged class has a label no project class is called, so the AI check
-leaves its detections of that label unmapped.
+leaves its detections of that label unmapped. The Datasets form offers two groups, each with its own new label (e.g. multirotor +
+interceptor as `rotor`, fixed-wing + delta-wing as `wing`); the backend takes up to five.
+
+**Leaving out similar pictures** (`skip_similar` + `similar_box_pct` on `POST /projects/{id}/datasets`, `skip_similar_pct` on the
+preview, `app/similar.py`, a checkbox and a % box on the Datasets form, default 5 %): video datasets hold runs of frames where only the
+drone moves a few pixels. Two images count as similar when their dHashes are at most 4 bits apart (same scene) **and** their boxes pair
+up one to one (same class, centre within the given % of the picture, width and height within 1.5x). The dHash alone is not enough: a
+small drone vanishes in its 9x8 thumbnail. Images are visited in id order and one per run of repeats is kept (each image is compared
+with images already kept, so a slow drift is not erased). Box-less images (negatives) and images without a hash are always kept. The
+pictures stay reviewed in the project; only the version skips them (`config.skip_similar`, `stats.excluded.similar`, both absent when
+off). On the real data (2026-10-26): 2 % leaves out 651, 5 % 1,504, 10 % 2,487 of 11,971; none of them scraped pictures.
+
+**Keeping look-alike scenes in one split** (`group_scenes` on `POST /projects/{id}/datasets`, `similar.scene_groups`, checkbox "Keep
+look-alike scenes in the same split", ticked by default on the form): **cmy-uav holds frames of the very videos in Anti-UAV** (checked by
+eye 2026-10-26: the same tree-lined building, the same skyline a moment apart), and the two imports were split independently: v3 has
+about 9,400 near-identical (dHash <= 4) pairs across train/val/test, 5,331 of the <= 2-bit ones cmy-uav vs Anti-UAV. The option joins
+the split groups of images within 4 bits of each other, transitively, when they come from the same source or both from imported
+datasets; scraped pictures join only each other (they already group by page). Measured on v3's images: leak pairs 9,368 -> 1, largest
+group 320, val/test 1,020 / 1,224 images, 0.4 s. 6 bits or joining scraped with imported lets plain skies clump into groups of 1,000+.
+**Runs 5-8 were measured with that leak, so their multirotor numbers are optimistic.** Recorded as `config.group_scenes`,
+`stats.scene_groups_joined`.
 
 ### 4.5 Training pipeline (`training.py`, `api/workers.py`, `agents/`)
 ```
 UI "Train & export" -> POST /projects/{id}/training-runs   (refused if the version has no val images or no train boxes)
    queued -> training -> exporting -> awaiting_package -> packaging -> done     (or failed / cancelled)
+   queued -> training -> awaiting_export (Mac job imx_export) -> awaiting_package -> ...   (export_where "mac", the default)
             GPU agent (Linux/WSL2)                   Raspberry Pi agent
 ```
 - **Workers pull** over HTTP, so no inbound ports are needed on the PC or the Pi. They authenticate with the
@@ -362,6 +383,19 @@ UI "Train & export" -> POST /projects/{id}/training-runs   (refused if the versi
 - The GPU agent checks **Linux and Java first** (fail in seconds, not after hours), trains, exports with
   `format="imx"`, and uploads `best.pt`, `packerOut.zip`, `labels.txt`. The Pi agent runs
   `imx500-package -i packerOut.zip -o out` and uploads `network.rpk`. A run with "Export for IMX500" off stops after training.
+- **IMX export on this Mac** (`app/imx_export.py`, `agents/imx_export_mac.py`, default for new runs: `export_where: "mac"`). The pod
+  is told `export_imx: false` (`training.worker_config`, so it also skips installing the export tools), trains, uploads `best.pt` and
+  completes; the run goes to **`awaiting_export`** and an `imx_export` job is queued here. The job copies `best.pt`, writes up to 150
+  calibration images of the run's version (val first, seeded by the run id), and runs `agents/imx_export_mac.py` in the export tools'
+  own Python (`backend/data/imx-export/env`, Python 3.11 + the pod's pinned packages). That script lifts Ultralytics' one
+  `assert LINUX` in `export_imx` (tied to ultralytics 8.4.183; check it when changing the pin). It stores `packerOut.zip` + `labels.txt`
+  and moves the run to `awaiting_package` for the Pi. A failed export keeps `best.pt`, leaves the run in `awaiting_export` with the
+  error, and "Export on this Mac" retries; "Export again on Mac" on a done run re-exports and drops the old `.rpk` so the Pi packages
+  the new one. The tools are set up once by "Set up the IMX export tools…" on the Training page (asks first: about 1 GB download,
+  job `imx_tools_setup`, needs Java 17+). Runs made before this existed have no `export_where` and export on the pod as before.
+  **Versions are locked**: `backend/imx-export.lock.txt` (committed) holds every package at the exact version that worked (85 packages:
+  torch 2.9.1, ultralytics 8.4.183, model-compression-toolkit 2.4.5, imx500-converter 3.17.3, ...); setup runs `uv pip sync` on it, so
+  nothing newer ever comes in. Never upgrade those tools in place: change TOOLS, delete the lock, set up again, test an export, commit.
 - `scripts/seed_synthetic.py` exists so all of this can be tested with no real data.
 
 ### 4.6 Security model (`security.py`)

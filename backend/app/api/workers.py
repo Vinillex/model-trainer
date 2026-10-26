@@ -11,9 +11,9 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
-from .. import dataset_bucket, pi_display, training
+from .. import dataset_bucket, imx_export, pi_display, training
 from ..db import get_db
-from ..models import DatasetVersion, TrainingRun
+from ..models import DatasetVersion, RunStage, TrainingRun
 from ..schemas import ClaimIn, CompleteIn, DisplayStatusIn, FailIn, HeartbeatIn, TrainingRunOut
 from ..security import require_token, worker_name
 from ..storage import get_storage
@@ -126,7 +126,7 @@ def claim(body: ClaimIn, worker: str = Depends(worker_name), db: Session = Depen
     training.touch_worker(worker, body.kind, run.id)
     # dataset_link: a signed link to the bucket's copy, tried first; dataset_url (through this backend) stays the fallback.
     link = dataset_bucket.link_if_stored(db.get(DatasetVersion, run.dataset_id)) if body.kind == "gpu" else None
-    return {"run_id": run.id, "kind": body.kind, "stage": run.stage.value, "name": run.name, "config": run.config,
+    return {"run_id": run.id, "kind": body.kind, "stage": run.stage.value, "name": run.name, "config": training.worker_config(run.config),
             "dataset_url": f"/workers/runs/{run.id}/dataset", "dataset_link": link, "artifacts": sorted(run.artifacts),
             "lease_seconds": training.settings.worker_lease_seconds}
 
@@ -170,7 +170,11 @@ async def upload_artifact(run_id: int, name: str, request: Request, worker: str 
 
 @router.post("/runs/{run_id}/complete", response_model=TrainingRunOut)
 def complete(run_id: int, body: CompleteIn, worker: str = Depends(worker_name), db: Session = Depends(get_db)):
-    return guarded(training.complete, db, run_id, worker, body.metrics)
+    run = guarded(training.complete, db, run_id, worker, body.metrics)
+    if run.stage == RunStage.awaiting_export:  # trained on the pod, exported here: start the export right away
+        imx_export.queue_export(db, run)
+        db.commit()
+    return run
 
 
 @router.post("/runs/{run_id}/fail", response_model=TrainingRunOut)

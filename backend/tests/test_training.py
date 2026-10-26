@@ -40,8 +40,9 @@ def ready(client):
 
 
 def new_run(client, ready, **cfg):
+    """A run whose IMX export happens on the GPU worker (the pod path these tests cover); pass export_where="mac" for the Mac path."""
     pid, did = ready
-    r = client.post(f"/projects/{pid}/training-runs", json={"dataset_id": did, **cfg})
+    r = client.post(f"/projects/{pid}/training-runs", json={"dataset_id": did, "export_where": "pod", **cfg})
     assert r.status_code == 201, r.text
     return r.json()
 
@@ -128,10 +129,10 @@ def test_worker_api_is_disabled_without_a_token(client, monkeypatch):
 # ---------- creating runs ----------
 
 def test_create_run_defaults_and_validation(client, ready):
-    run = new_run(client, ready)
-    assert run["stage"] == "queued" and run["name"] == f"run-{run['id']}"
-    assert run["config"] == {"model": "yolo11n", "epochs": 100, "imgsz": 640, "batch": 16, "export_imx": True}
     pid, did = ready
+    run = client.post(f"/projects/{pid}/training-runs", json={"dataset_id": did}).json()
+    assert run["stage"] == "queued" and run["name"] == f"run-{run['id']}"
+    assert run["config"] == {"model": "yolo11n", "epochs": 100, "imgsz": 640, "batch": 16, "export_imx": True, "export_where": "mac"}
     for bad in ({"model": "yolo11x"}, {"imgsz": 650}, {"imgsz": 1280}, {"epochs": 0}, {"batch": 0}):
         assert client.post(f"/projects/{pid}/training-runs", json={"dataset_id": did, **bad}).status_code == 422, bad
     assert client.post(f"/projects/{pid}/training-runs", json={"dataset_id": 9999}).status_code == 404

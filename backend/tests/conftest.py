@@ -7,6 +7,7 @@ os.environ.update(MT_DATABASE_URL="sqlite://", MT_LOCAL_STORAGE_DIR=tempfile.mkd
                   MT_WORKER_LOG_DIR=tempfile.mkdtemp(prefix="mt-test-worker-logs-"),
                   MT_RUNPOD_LAUNCH_DIR=tempfile.mkdtemp(prefix="mt-test-runpod-"),
                   MT_PI_DISPLAY_FILE=os.path.join(tempfile.mkdtemp(prefix="mt-test-pi-display-"), "pi_display.json"),
+                  MT_IMX_EXPORT_DIR=tempfile.mkdtemp(prefix="mt-test-imx-export-"),  # never the real export tools
                   MT_SERPAPI_KEY="", MT_RUNPOD_API_KEY="", MT_WORKER_TOKEN="",
                   # the real dataset bucket: a launcher test with --yes would otherwise upload its zip to it
                   MT_DATASET_BUCKET="", MT_DATASET_BUCKET_ENDPOINT="", MT_DATASET_BUCKET_ACCESS_KEY="", MT_DATASET_BUCKET_SECRET_KEY="")
